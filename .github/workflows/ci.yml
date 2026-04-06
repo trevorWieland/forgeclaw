@@ -65,7 +65,7 @@ jobs:
           tool: cargo-nextest
 
       - name: Run tests
-        run: cargo nextest run --workspace --profile ci
+        run: cargo nextest run --workspace --profile ci --no-tests=pass
 
   # ============================================================
   # Coverage (Linux only)
@@ -87,10 +87,10 @@ jobs:
           tool: cargo-nextest,cargo-llvm-cov
 
       - name: Generate coverage
-        run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info
+        run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         with:
           files: lcov.info
           fail_ci_if_error: false

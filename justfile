@@ -154,11 +154,11 @@ check:
 
 # Run all tests via nextest (pass extra args after --)
 test *args:
-    {{ cargo }} nextest run --workspace {{ args }}
+    {{ cargo }} nextest run --workspace --no-tests=pass {{ args }}
 
 # Generate code coverage report (lcov)
 coverage:
-    {{ cargo }} llvm-cov nextest --workspace --lcov --output-path lcov.info
+    {{ cargo }} llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass
     @echo "Coverage report: lcov.info"
 
 # ============================================================================
