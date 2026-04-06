@@ -1,0 +1,99 @@
+[workspace]
+members = [
+  "crates/core",
+  "crates/providers",
+  "crates/channels",
+  "crates/container",
+  "crates/ipc",
+  "crates/auth",
+  "crates/store",
+  "crates/scheduler",
+  "crates/router",
+  "crates/queue",
+  "crates/tanren",
+  "crates/health",
+  "crates/forgeclaw",
+  "crates/agent-runner",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/trevorWieland/forgeclaw"
+
+# ============================================================================
+# WORKSPACE LINTS — the quality gate
+# ============================================================================
+# All crates inherit these via `[lints] workspace = true` in their Cargo.toml.
+# To relax a lint for a specific crate, add it to that crate's [lints.clippy]
+# section — never use inline #[allow()] or #[expect()].
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+# Strict lint groups
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# Strict individual lints
+unwrap_used = "deny"
+panic = "deny"
+todo = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+unimplemented = "deny"
+
+# Inline suppression prohibition
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+
+# Pedantic overrides (too noisy for practical use)
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+# ============================================================================
+# WORKSPACE DEPENDENCIES — centralized version pinning
+# ============================================================================
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "signal",
+  "sync",
+  "time",
+  "io-util",
+] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Testing (dev)
+insta = { version = "1", features = ["yaml"] }
+proptest = "1"
+wiremock = "0.6"

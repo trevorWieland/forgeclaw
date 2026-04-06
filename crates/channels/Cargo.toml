@@ -1,0 +1,16 @@
+[package]
+name = "forgeclaw-channels"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Channel trait, registry, and message type normalization"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Added as crate develops
+
+[dev-dependencies]

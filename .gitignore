@@ -1,0 +1,27 @@
+# Build artifacts
+/target/
+
+# Coverage artifacts
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html
+
+# Environment / secrets
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Temporary files
+*.tmp
+*.bak

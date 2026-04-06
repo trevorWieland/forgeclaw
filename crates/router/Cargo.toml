@@ -1,0 +1,16 @@
+[package]
+name = "forgeclaw-router"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Message pipeline: ingest, trigger detection, context window building, dispatch"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Added as crate develops
+
+[dev-dependencies]

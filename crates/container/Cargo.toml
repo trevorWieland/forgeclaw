@@ -1,0 +1,16 @@
+[package]
+name = "forgeclaw-container"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Container lifecycle state machine, runtime abstraction, mount security, warm pool"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Added as crate develops
+
+[dev-dependencies]

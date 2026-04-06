@@ -1,0 +1,16 @@
+[package]
+name = "forgeclaw-tanren"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Tanren API client, dispatch builder, event polling, self-improvement dispatch"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Added as crate develops
+
+[dev-dependencies]

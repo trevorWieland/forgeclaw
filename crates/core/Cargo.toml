@@ -1,0 +1,15 @@
+[package]
+name = "forgeclaw-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Shared types, event bus, error taxonomy, and configuration"
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]

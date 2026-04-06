@@ -1,0 +1,20 @@
+[package]
+name = "forgeclaw"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Forgeclaw main binary — composition root"
+
+[[bin]]
+name = "forgeclaw"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Added as crate develops
+
+[dev-dependencies]
