@@ -93,6 +93,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
+# TOML parsing
+toml = "0.8"
+
 # Testing (dev)
 insta = { version = "1", features = ["yaml"] }
 proptest = "1"

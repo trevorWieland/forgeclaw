@@ -1,0 +1,55 @@
+# Forgeclaw — Example Configuration
+# Copy this file to `forgeclaw.toml` and adjust for your deployment.
+
+[runtime]
+data_dir = "/data"
+log_level = "info"
+max_concurrent_containers = 5
+warm_pool_size = 2
+
+[store]
+backend = "sqlite"
+url = "sqlite:///data/forgeclaw.db"
+
+[providers.anthropic]
+type = "anthropic"
+# Credentials loaded from environment: FORGECLAW_ANTHROPIC_API_KEY
+
+[providers.ollama]
+type = "openai_compat"
+base_url = "http://ollama:11434/v1"
+
+[budget_pools.shared]
+daily_limit = 2_000_000
+monthly_limit = 40_000_000
+action_on_exhaust = "fallback"
+alert_thresholds = [0.8, 0.95]
+
+[groups.main]
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+fallback = [{ provider = "ollama", model = "llama3" }]
+channel = "discord"
+is_main = true
+token_budget = { daily = 1_000_000, monthly = 20_000_000 }
+budget_pool = "shared"
+allowed_compose_services = ["postgres", "tanren", "redis"]
+
+[groups.guest]
+provider = "ollama"
+model = "llama3"
+channel = "discord"
+is_main = false
+allowed_compose_services = []
+
+[container]
+image = "ghcr.io/you/forgeclaw-agent:latest"
+timeout = "30m"
+idle_ttl = "5m"
+memory_limit = "4g"
+cpu_limit = 2
+
+[tanren]
+api_url = "http://tanren:8000"
+poll_interval = "10s"
+max_concurrent_dispatches = 4

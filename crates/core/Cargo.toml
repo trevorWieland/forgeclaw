@@ -11,5 +11,14 @@ description = "Shared types, event bus, error taxonomy, and configuration"
 workspace = true
 
 [dependencies]
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
+insta = { workspace = true }
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
