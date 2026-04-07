@@ -54,10 +54,12 @@ bootstrap:
     echo "==> Installing cargo tools (skipping already-installed)..."
     failed=""
 
-    # cargo-nextest: use official installer (binstall often fails to find binaries)
+    # cargo-nextest: use official installer (binstall often fails to compile from source)
     if ! command -v cargo-nextest &>/dev/null; then
         echo "  Installing cargo-nextest..."
-        if ! curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin" 2>/dev/null; then
+        nextest_platform="linux"
+        [[ "$(uname -s)" == "Darwin" ]] && nextest_platform="mac"
+        if ! curl -LsSf "https://get.nexte.st/latest/${nextest_platform}" | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin" 2>/dev/null; then
             if ! cargo binstall --no-confirm cargo-nextest; then
                 echo "  FAIL: cargo-nextest"
                 failed="$failed cargo-nextest"
@@ -142,11 +144,11 @@ install:
 
 # Build all workspace crates
 build:
-    {{ cargo }} build --workspace
+    @{{ cargo }} build --workspace --quiet
 
 # Type-check all workspace crates
 check:
-    {{ cargo }} check --workspace --all-targets
+    @{{ cargo }} check --workspace --all-targets --quiet
 
 # ============================================================================
 # Test
@@ -154,11 +156,11 @@ check:
 
 # Run all tests via nextest (pass extra args after --)
 test *args:
-    {{ cargo }} nextest run --workspace --no-tests=pass {{ args }}
+    @{{ cargo }} nextest run --workspace --no-tests=pass {{ args }}
 
 # Generate code coverage report (lcov)
 coverage:
-    {{ cargo }} llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass
+    @{{ cargo }} llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass
     @echo "Coverage report: lcov.info"
 
 # ============================================================================
@@ -167,23 +169,23 @@ coverage:
 
 # Run clippy with deny warnings
 lint:
-    {{ cargo }} clippy --workspace --all-targets -- -D warnings
+    @{{ cargo }} clippy --workspace --all-targets --quiet -- -D warnings
 
 # Check formatting (Rust + TOML)
 fmt:
-    {{ cargo }} fmt --check
-    taplo fmt --check
+    @{{ cargo }} fmt --check
+    @RUST_LOG=error taplo fmt --check
 
 # Auto-fix formatting (Rust + TOML)
 fmt-fix:
-    {{ cargo }} fmt
-    taplo fmt
+    @{{ cargo }} fmt
+    @RUST_LOG=error taplo fmt
 
 # Auto-fix everything that can be auto-fixed (formatting + clippy suggestions)
 fix:
-    {{ cargo }} fmt
-    taplo fmt
-    {{ cargo }} clippy --workspace --all-targets --fix --allow-dirty --allow-staged -- -D warnings
+    @{{ cargo }} fmt
+    @RUST_LOG=error taplo fmt
+    @{{ cargo }} clippy --workspace --all-targets --fix --allow-dirty --allow-staged --quiet -- -D warnings
 
 # ============================================================================
 # Audit & Analysis
@@ -191,11 +193,11 @@ fix:
 
 # Audit dependencies (licenses, advisories, bans, sources)
 deny:
-    {{ cargo }} deny check
+    @{{ cargo }} deny --log-level error check
 
 # Detect unused dependencies
 machete:
-    {{ cargo }} machete
+    @{{ cargo }} machete
 
 # ============================================================================
 # Documentation
@@ -203,7 +205,7 @@ machete:
 
 # Build documentation (warnings are errors)
 doc:
-    RUSTDOCFLAGS="-D warnings" {{ cargo }} doc --workspace --no-deps
+    @RUSTDOCFLAGS="-D warnings" {{ cargo }} doc --workspace --no-deps --quiet
 
 # ============================================================================
 # Quality Gates

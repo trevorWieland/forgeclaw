@@ -2,8 +2,14 @@ pre-commit:
   parallel: true
   commands:
     fmt:
-      run: cargo fmt --check
+      run: |
+        export PATH="$HOME/.cargo/bin:$PATH"
+        cargo fmt --check
     clippy:
-      run: cargo clippy --workspace --all-targets -- -D warnings
+      run: |
+        export PATH="$HOME/.cargo/bin:$PATH"
+        cargo clippy --workspace --all-targets --quiet -- -D warnings
     taplo:
-      run: taplo fmt --check
+      run: |
+        export PATH="$HOME/.cargo/bin:$PATH"
+        RUST_LOG=error taplo fmt --check
