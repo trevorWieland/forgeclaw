@@ -2,36 +2,34 @@
 
 ## Overview
 
-Forgeclaw is a Cargo workspace with 12 crates. Each crate has a single responsibility, a typed public interface, and its own test suite. Dependency cycles are compile-time errors.
+Forgeclaw is a Cargo workspace with 14 crates (12 libraries + 2 binaries). All crates live under `crates/`. Each has a single responsibility, a typed public interface, and its own test suite. Dependency cycles are compile-time errors.
 
 ```
-bin ── runtime composition root
- ├── core ── shared types, event bus, config
- ├── providers ── model abstraction
- ├── channels ── channel trait + implementations
- ├── container ── lifecycle + Docker runtime
- │    └── ipc ── host-container protocol
- ├── auth ── credential proxy
- │    └── providers
- ├── store ── database layer
- ├── scheduler ── task scheduling
- │    ├── store
- │    └── queue
- ├── router ── message pipeline
- │    ├── store
- │    ├── channels
- │    └── queue
- ├── queue ── concurrency control
- │    └── container
- ├── tanren ── Tanren client
- │    ├── core
- │    └── store
- └── health ── monitoring
-      ├── core
-      ├── providers
-      ├── container
-      └── tanren
+crates/
+├── forgeclaw/      ── main binary (composition root)
+├── agent-runner/   ── container-side binary
+├── core/           ── shared types, event bus, config
+├── providers/      ── model abstraction
+├── channels/       ── channel trait + implementations
+├── container/      ── lifecycle + Docker runtime
+│    └── (depends on) ipc
+├── ipc/            ── host-container protocol
+├── auth/           ── credential proxy
+│    └── (depends on) providers
+├── store/          ── database layer
+├── scheduler/      ── task scheduling
+│    └── (depends on) store, queue
+├── router/         ── message pipeline
+│    └── (depends on) store, channels, queue
+├── queue/          ── concurrency control
+│    └── (depends on) container
+├── tanren/         ── Tanren client
+│    └── (depends on) store
+└── health/         ── monitoring
+     └── (depends on) providers, container, tanren
 ```
+
+All crates depend on `core` (implicitly). `forgeclaw` (main binary) depends on everything. `agent-runner` depends on `ipc`.
 
 ---
 
@@ -491,7 +489,9 @@ pub enum HealthStatus {
 
 ---
 
-## `bin`
+## `forgeclaw` (main binary)
+
+**Path**: `crates/forgeclaw/`
 
 **Responsibility**: Composition root. Thin — no business logic. Wires crates together, starts services, handles signals.
 

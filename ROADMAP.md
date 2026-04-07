@@ -12,21 +12,21 @@ Exit criteria are concrete and testable. A phase is done when its criteria pass,
 
 ### Lanes
 
-| Lane | Crate | Deliverable |
-|------|-------|------------|
-| 0.1 | workspace | Cargo workspace with all 12 crate stubs. `Cargo.toml` workspace manifest. CI pipeline: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test --workspace`. Dockerfile for host image (multi-stage: build + runtime). |
-| 0.2 | `core` | Event enum (`MessageEvent`, `ContainerEvent`, `TanrenEvent`, `TaskEvent`, `HealthEvent`, `IpcEvent`). Event bus (tokio broadcast channel with typed wrapper). Error taxonomy (`ErrorClass`: Transient, Auth, Config, Container, Fatal). Config types (deserialized from TOML via serde). `GroupId`, `ContainerId`, `ProviderId`, `ChannelId` newtypes. |
-| 0.3 | `store` | sqlx setup with SQLite and Postgres support. Schema migrations (sqlx-migrate). Tables: `messages`, `chat_metadata`, `tasks`, `task_run_logs`, `router_state`, `sessions`, `registered_groups`, `events`. Compile-time checked queries for all CRUD operations. DataStore trait with sqlx implementation. |
-| 0.4 | `ipc` | Protocol message types: `HostToContainer` and `ContainerToHost` enums. Frame codec: 4-byte length prefix + JSON payload. Unix socket server (host side) and client (container side) with tokio. Handshake: container connects, sends `Ready`, host sends `Init`. Unit tests for codec roundtrip, connection lifecycle. |
+| Lane | Crate | Deliverable | Status |
+|------|-------|------------|--------|
+| 0.1 | workspace | Cargo workspace with 14 crate stubs under `crates/`. Workspace manifest with shared lints, deps, and metadata. CI pipeline (9 GitHub Actions jobs). `justfile` with bootstrap and all dev recipes. License files, CONTRIBUTING.md, CLAUDE.md. | **Done** |
+| 0.2 | `core` | Event enum (`MessageEvent`, `ContainerEvent`, `TanrenEvent`, `TaskEvent`, `HealthEvent`, `IpcEvent`). Event bus (tokio broadcast channel with typed wrapper). Error taxonomy (`ErrorClass`: Transient, Auth, Config, Container, Fatal). Config types (deserialized from TOML via serde). `GroupId`, `ContainerId`, `ProviderId`, `ChannelId` newtypes. | |
+| 0.3 | `store` | sqlx setup with SQLite and Postgres support. Schema migrations (sqlx-migrate). Tables: `messages`, `chat_metadata`, `tasks`, `task_run_logs`, `router_state`, `sessions`, `registered_groups`, `events`. Compile-time checked queries for all CRUD operations. DataStore trait with sqlx implementation. | |
+| 0.4 | `ipc` | Protocol message types: `HostToContainer` and `ContainerToHost` enums. Frame codec: 4-byte length prefix + JSON payload. Unix socket server (host side) and client (container side) with tokio. Handshake: container connects, sends `Ready`, host sends `Init`. Unit tests for codec roundtrip, connection lifecycle. | |
 
 ### Exit Criteria
 
-- `cargo build --workspace` succeeds with zero warnings
-- `cargo test --workspace` passes
-- `cargo clippy -- -D warnings` clean
-- CI pipeline green
+- `just ci` passes locally (fmt, clippy, deny, check-lines, check-suppression, nextest, doc, machete)
+- GitHub Actions CI green on all 9 jobs
 - Database migrations run against both SQLite and Postgres
-- IPC codec roundtrip tests pass for all message types
+- IPC codec roundtrip tests pass for all message types (including proptest fuzzing)
+- Event bus emit/subscribe tests pass
+- Config deserialization roundtrip tests pass for a sample `forgeclaw.toml`
 
 ## Phase 1 — Container Lifecycle
 
@@ -161,13 +161,13 @@ Exit criteria are concrete and testable. A phase is done when its criteria pass,
 
 ## Summary Timeline
 
-| Phase | Name | Lanes | Key Milestone |
-|-------|------|-------|--------------|
-| 0 | Foundation | 4 | Workspace compiles, DB schema runs, IPC codec tested |
-| 1 | Container Lifecycle | 5 | Real Docker container spawned and communicated with via IPC |
-| 2 | Providers & Routing | 4 | Multi-model AI responses through full message pipeline |
-| 3 | Channels & Tanren | 4 | Discord messages processed, Tanren dispatches working |
-| 4 | Compose-Native | 5 | Service discovery, network isolation, self-improvement |
-| 5 | Hardening | 5 | Migration tool, security audit, load tested, documented |
+| Phase | Name | Lanes | Key Milestone | Demo |
+|-------|------|-------|--------------|------|
+| 0 | Foundation | 4 | Workspace compiles, DB schema runs, IPC codec tested | `just ci` green, 50+ tests passing |
+| 1 | Container Lifecycle | 5 | Real Docker container spawned and communicated with via IPC | Terminal recording: spawn container, IPC handshake, echo message, clean shutdown |
+| 2 | Providers & Routing | 4 | Multi-model AI responses through full message pipeline | CLI tool: pipe a prompt in, get AI response back through the full container pipeline |
+| 3 | Channels & Tanren | 4 | Discord messages processed, Tanren dispatches working | @mention bot in Discord, get response. Dispatch code work via Tanren. |
+| 4 | Compose-Native | 5 | Service discovery, network isolation, self-improvement | Agent identifies missing capability, dispatches self-improvement, PR created |
+| 5 | Hardening | 5 | Migration tool, security audit, load tested, documented | 24-hour load test results, security audit report |
 
 Each phase's lanes can be developed in parallel within the phase. Phases are sequential — Phase N must pass exit criteria before Phase N+1 begins.
