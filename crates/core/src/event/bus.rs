@@ -18,9 +18,11 @@ impl EventBus {
     /// Create a new event bus with the given channel capacity.
     ///
     /// The capacity determines how many events can be buffered before the
-    /// oldest events are dropped for slow receivers.
+    /// oldest events are dropped for slow receivers. A capacity of zero is
+    /// clamped to 1 (broadcast channels require at least 1 slot).
     pub fn new(capacity: usize) -> Self {
-        let (tx, _rx) = broadcast::channel(capacity);
+        let effective = capacity.max(1);
+        let (tx, _rx) = broadcast::channel(effective);
         Self { tx }
     }
 
@@ -50,6 +52,14 @@ mod tests {
         Event::Config(ConfigEvent {
             keys_changed: vec![key.to_owned()],
         })
+    }
+
+    #[test]
+    fn zero_capacity_does_not_panic() {
+        let bus = EventBus::new(0);
+        let mut rx = bus.subscribe();
+        assert_eq!(bus.emit(config_event("a")), 1);
+        assert!(rx.try_recv().is_ok());
     }
 
     #[test]
@@ -118,5 +128,27 @@ mod tests {
             received += 1;
         }
         assert_eq!(received, 10);
+    }
+
+    #[test]
+    fn slow_receiver_gets_lagged_error() {
+        // Use a capacity of 2 so overflow is easy to trigger.
+        let bus = EventBus::new(2);
+        let mut rx = bus.subscribe();
+
+        // Emit 3 events — the first will be dropped for the slow receiver.
+        bus.emit(config_event("a"));
+        bus.emit(config_event("b"));
+        bus.emit(config_event("c"));
+
+        // First recv should report Lagged with the count of missed messages.
+        let err = rx.try_recv().expect_err("should be lagged");
+        assert!(
+            matches!(err, broadcast::error::TryRecvError::Lagged(_)),
+            "expected Lagged, got: {err:?}"
+        );
+
+        // Subsequent recv should succeed with the most recent buffered event.
+        assert!(rx.try_recv().is_ok());
     }
 }

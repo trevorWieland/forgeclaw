@@ -1,5 +1,7 @@
 //! Typed event definitions for the event bus.
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -8,7 +10,10 @@ use crate::id::{ChannelId, ContainerId, DispatchId, GroupId, ProviderId, TaskId}
 /// A system event emitted on the event bus.
 ///
 /// Each variant wraps a specific event struct carrying the relevant payload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Events are `Clone + Send + Sync` but intentionally **not** `Serialize` —
+/// this allows future variants to carry non-serializable payloads such as
+/// `oneshot::Sender` for request-response patterns (see design principle 1).
+#[derive(Debug, Clone)]
 pub enum Event {
     /// A message was received from a channel.
     Message(MessageEvent),
@@ -29,6 +34,9 @@ pub enum Event {
 }
 
 /// A message received from a channel.
+///
+/// Heavy payload fields use `Arc<str>` to avoid per-subscriber allocation
+/// when cloned through the broadcast event bus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageEvent {
     /// The group this message belongs to.
@@ -36,9 +44,9 @@ pub struct MessageEvent {
     /// The channel the message arrived on.
     pub channel: ChannelId,
     /// Who sent the message.
-    pub sender: String,
+    pub sender: Arc<str>,
     /// The message text content.
-    pub text: String,
+    pub text: Arc<str>,
     /// When the message was received.
     pub timestamp: DateTime<Utc>,
 }
@@ -145,12 +153,15 @@ pub struct HealthEvent {
 }
 
 /// An IPC message received from a container.
+///
+/// The payload uses `Arc<str>` to avoid per-subscriber allocation
+/// when cloned through the broadcast event bus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcEvent {
     /// The container that sent the message.
     pub container: ContainerId,
     /// The message payload.
-    pub payload: String,
+    pub payload: Arc<str>,
 }
 
 /// A configuration reload event.

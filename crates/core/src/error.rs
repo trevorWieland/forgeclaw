@@ -66,7 +66,7 @@ impl ErrorClass {
     }
 }
 
-/// Errors that can occur when loading configuration.
+/// Errors that can occur when loading or validating configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     /// An I/O error reading the config file.
@@ -76,6 +76,13 @@ pub enum ConfigError {
     /// A TOML parsing or deserialization error.
     #[error("failed to parse config: {0}")]
     Parse(#[from] toml::de::Error),
+
+    /// One or more cross-reference validation errors.
+    #[error("config validation failed: {}", errors.join("; "))]
+    Validation {
+        /// List of validation error descriptions.
+        errors: Vec<String>,
+    },
 }
 
 #[cfg(test)]

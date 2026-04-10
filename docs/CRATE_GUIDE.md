@@ -82,7 +82,8 @@ pub enum ErrorClass {
 }
 
 // Configuration (deserialized from TOML)
-pub struct ForgeClawConfig {
+// Note: the implementation uses BTreeMap for deterministic serialization order.
+pub struct ForgeclawConfig {
     pub runtime: RuntimeConfig,
     pub store: StoreConfig,
     pub providers: HashMap<String, ProviderConfig>,
@@ -90,7 +91,7 @@ pub struct ForgeClawConfig {
     pub groups: HashMap<String, GroupConfig>,
     pub container: ContainerDefaults,
     pub tanren: Option<TanrenConfig>,
-    pub channels: ChannelConfigs,
+    pub channels: HashMap<String, ChannelConfig>,
 }
 ```
 

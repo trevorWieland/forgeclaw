@@ -1,5 +1,6 @@
 ---
-source: crates/core/src/config.rs
+source: crates/core/src/config/tests.rs
+assertion_line: 30
 expression: config
 ---
 runtime:
@@ -7,6 +8,7 @@ runtime:
   log_level: info
   max_concurrent_containers: 5
   warm_pool_size: 2
+  event_bus_capacity: 256
 store:
   backend: sqlite
   url: "sqlite:///data/forgeclaw.db"
@@ -51,6 +53,12 @@ groups:
       - postgres
       - tanren
       - redis
+channels:
+  discord:
+    type: discord
+    name: Main Discord Bot
+    settings:
+      guild_id: "123456789"
 container:
   image: "ghcr.io/you/forgeclaw-agent:latest"
   timeout: 30m
