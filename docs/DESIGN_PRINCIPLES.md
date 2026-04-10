@@ -16,7 +16,9 @@ Subsystems communicate through a typed event bus, not through direct function ca
 - Fragile coupling (changing the container manager's API doesn't break the router)
 - Cross-cutting concern explosion (adding tracing, audit logging, or metrics to NanoClaw required touching every call site)
 
-**The event bus is not an ESB.** It's a tokio broadcast channel with typed wrappers. Events are fire-and-observe, not request-response. For request-response patterns (e.g., "spawn a container and tell me when it's ready"), use oneshot channels carried inside the event payload.
+**The event bus is not an ESB.** It's a tokio broadcast channel with typed wrappers. Events are fire-and-observe, not request-response.
+
+**CQRS split.** For request-response patterns (e.g., "spawn a container and tell me when it's ready"), use the `CommandBus` — a typed, point-to-point channel where the caller awaits a oneshot response. Handlers typically process a command *and* emit an event so the observation layer stays informed. For patterns where the response itself should be observable, an event variant may carry a `oneshot::Sender` inside its payload — event types are intentionally not constrained to `Serialize` to allow this.
 
 ## 2. Protocol-First Polyglot
 

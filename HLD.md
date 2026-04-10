@@ -231,6 +231,10 @@ type = "anthropic"
 type = "openai_compat"
 base_url = "http://ollama:11434/v1"
 
+[channels.discord]
+type = "discord"
+# Credentials loaded from environment: FORGECLAW_DISCORD_TOKEN
+
 [groups.main]
 provider = "anthropic"
 model = "claude-sonnet-4-20250514"
