@@ -68,7 +68,8 @@ where
         let missing: Vec<&ColumnShape> = expected.difference(&actual).collect();
         let extra: Vec<&ColumnShape> = actual.difference(&expected).collect();
         return Err(StoreError::SchemaDrift {
-            column: table.to_owned(),
+            table: Some(table.to_owned()),
+            column: None,
             reason: format!(
                 "entity/table shape mismatch — \
                  missing in DB: {missing:?}, extra in DB: {extra:?}"
@@ -129,7 +130,8 @@ async fn actual_shape(
         DatabaseBackend::Sqlite => actual_shape_sqlite(db, table).await,
         DatabaseBackend::Postgres => actual_shape_postgres(db, table).await,
         DatabaseBackend::MySql => Err(StoreError::SchemaDrift {
-            column: table.to_owned(),
+            table: Some(table.to_owned()),
+            column: None,
             reason: "MySQL backend is not supported".to_owned(),
         }),
     }
@@ -224,7 +226,8 @@ async fn actual_shape_postgres(
 
 fn schema_drift_err(table: &str, reason: &str) -> StoreError {
     StoreError::SchemaDrift {
-        column: table.to_owned(),
+        table: Some(table.to_owned()),
+        column: None,
         reason: reason.to_owned(),
     }
 }

@@ -91,15 +91,17 @@ async fn file_backed_connect_migrate_round_trip() {
     // Prove the regular `connect(url)` path — not just
     // `connect_sqlite_memory` — works against a real SQLite file,
     // including migrate() + a round trip.
+    //
+    // `NamedTempFile::new()` creates and opens a fresh temp file,
+    // then we immediately borrow its path and drop the handle.
+    // Dropping `file` here deletes the on-disk file, which is what
+    // we want: sqlx gets a clean path and is told to create the
+    // database itself via `?mode=rwc`. We clean up the recreated
+    // file manually at the end of the test.
     let file = NamedTempFile::new().expect("tempfile");
     let path = file.path().to_str().expect("utf-8 path").to_owned();
-    let url = format!("sqlite://{path}");
-    // Keep the file alive for the duration of the test.
     drop(file);
-    // Re-create the path (NamedTempFile::new created and opened it;
-    // dropping closes the handle but the path is still a valid
-    // disk location and sqlx will create the file with `?mode=rwc`).
-    let url = format!("{url}?mode=rwc");
+    let url = format!("sqlite://{path}?mode=rwc");
 
     let store = Store::connect(&url).await.expect("connect file-backed");
     store.migrate().await.expect("migrate file-backed");
@@ -113,8 +115,8 @@ async fn file_backed_connect_migrate_round_trip() {
         Some("file-v".to_owned())
     );
 
-    // Clean up by dropping the store; the tempfile path will be
-    // removed when the OS reclaims it.
+    // Close the pool before unlinking so sqlx has released the
+    // file handle.
     drop(store);
     std::fs::remove_file(path).ok();
 }

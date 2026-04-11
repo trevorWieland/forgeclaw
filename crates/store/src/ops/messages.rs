@@ -59,10 +59,11 @@ pub(crate) async fn store_message(
     msg: &NewMessage,
 ) -> Result<(), StoreError> {
     let txn = db.begin().await?;
+    let backend = txn.get_database_backend();
 
-    if matches!(txn.get_database_backend(), DbBackend::Postgres) {
+    if matches!(backend, DbBackend::Postgres) {
         let lock_stmt = Statement::from_sql_and_values(
-            DbBackend::Postgres,
+            backend,
             ADVISORY_LOCK_SQL,
             [msg.group_id.as_ref().into()],
         );

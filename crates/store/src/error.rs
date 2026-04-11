@@ -49,12 +49,21 @@ pub enum StoreError {
     },
 
     /// A row decoded from the database contains a value the current
-    /// code doesn't understand (e.g. unknown `TaskStatus`). Treated as
-    /// a schema-drift signal.
-    #[error("schema drift in column `{column}`: {reason}")]
+    /// code doesn't understand (e.g. unknown `TaskStatus`), or a
+    /// table's shape doesn't match the entity that expects it.
+    /// Treated as a schema-drift signal.
+    #[error("schema drift in {}{}: {reason}",
+        table.as_deref().map_or(String::new(), |t| format!("table `{t}`")),
+        column.as_deref().map_or(String::new(), |c| {
+            if table.is_some() { format!(" column `{c}`") } else { format!("column `{c}`") }
+        }))]
     SchemaDrift {
-        /// Column whose value could not be decoded.
-        column: String,
+        /// Table whose shape differs from the entity. Set by the
+        /// schema-drift check when a whole table is inconsistent.
+        table: Option<String>,
+        /// Column whose value (or shape) could not be decoded. Set
+        /// when the drift is localized to a specific column.
+        column: Option<String>,
         /// Human-readable description of the mismatch.
         reason: String,
     },
@@ -131,9 +140,21 @@ impl StoreError {
             Self::InvalidLimit { reason } => ErrorClass::Fatal {
                 reason: format!("invalid limit: {reason}"),
             },
-            Self::SchemaDrift { column, reason } => ErrorClass::Fatal {
-                reason: format!("schema drift in `{column}`: {reason}"),
-            },
+            Self::SchemaDrift {
+                table,
+                column,
+                reason,
+            } => {
+                let location = match (table.as_deref(), column.as_deref()) {
+                    (Some(t), Some(c)) => format!("table `{t}` column `{c}`"),
+                    (Some(t), None) => format!("table `{t}`"),
+                    (None, Some(c)) => format!("column `{c}`"),
+                    (None, None) => String::from("schema"),
+                };
+                ErrorClass::Fatal {
+                    reason: format!("schema drift in {location}: {reason}"),
+                }
+            }
             Self::NotFound { entity } => ErrorClass::Fatal {
                 reason: format!("{entity} not found"),
             },
@@ -295,16 +316,37 @@ mod tests {
     }
 
     #[test]
-    fn schema_drift_classifies_as_fatal_with_prefix() {
+    fn schema_drift_column_classifies_as_fatal_with_column_location() {
         let err = StoreError::SchemaDrift {
-            column: "status".to_owned(),
+            table: None,
+            column: Some("status".to_owned()),
             reason: "unknown value `bogus`".to_owned(),
         };
         let class = err.classify();
         assert!(matches!(&class, ErrorClass::Fatal { .. }));
         if let ErrorClass::Fatal { reason } = class {
-            assert!(reason.contains("schema drift in `status`"));
+            assert!(
+                reason.contains("schema drift in column `status`"),
+                "expected column location, got: {reason}"
+            );
             assert!(reason.contains("unknown value"));
+        }
+    }
+
+    #[test]
+    fn schema_drift_table_classifies_as_fatal_with_table_location() {
+        let err = StoreError::SchemaDrift {
+            table: Some("messages".to_owned()),
+            column: None,
+            reason: "extra column".to_owned(),
+        };
+        let class = err.classify();
+        assert!(matches!(&class, ErrorClass::Fatal { .. }));
+        if let ErrorClass::Fatal { reason } = class {
+            assert!(
+                reason.contains("schema drift in table `messages`"),
+                "expected table location, got: {reason}"
+            );
         }
     }
 

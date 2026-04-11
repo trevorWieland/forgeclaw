@@ -16,9 +16,10 @@ use crate::MAX_PAGE_SIZE;
 use crate::error::StoreError;
 
 /// Clamp a caller-supplied row limit against [`MAX_PAGE_SIZE`] and
-/// convert it to a `u64` SeaORM accepts. Returns `Ok(0)` for any
-/// non-positive limit (caller gets an empty result set), and emits a
-/// debug trace when the request is clamped down.
+/// convert it to a `u64` SeaORM accepts. Negative limits return
+/// [`StoreError::InvalidLimit`], `0` returns `Ok(0)` (caller gets an
+/// empty result set), and positive limits are clamped as needed.
+/// Emits a debug trace when the request is clamped down.
 pub(crate) fn clamped_take(limit: i64, op: &'static str) -> Result<u64, StoreError> {
     if limit < 0 {
         return Err(StoreError::InvalidLimit {

@@ -98,11 +98,13 @@ pub(crate) async fn update_task_after_run(
 fn row_to_stored(row: tasks::Model) -> Result<StoredTask, StoreError> {
     let schedule_kind =
         ScheduleKind::from_str(&row.schedule_kind).map_err(|e| StoreError::SchemaDrift {
-            column: "schedule_kind".to_owned(),
+            table: Some("tasks".to_owned()),
+            column: Some("schedule_kind".to_owned()),
             reason: e.to_string(),
         })?;
     let status = TaskStatus::from_str(&row.status).map_err(|e| StoreError::SchemaDrift {
-        column: "status".to_owned(),
+        table: Some("tasks".to_owned()),
+        column: Some("status".to_owned()),
         reason: e.to_string(),
     })?;
     Ok(StoredTask {
