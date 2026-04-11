@@ -164,7 +164,7 @@ test *args:
 
 # Run the forgeclaw-store PostgreSQL parity suite against a real
 # Postgres. Requires FORGECLAW_TEST_POSTGRES_URL; defaults to a local
-# docker-compose-style postgres:16 service on localhost:5432. The
+# docker-compose-style postgres:18 service on localhost:5432. The
 # parity tests *panic* (not skip) when the env var is absent and the
 # feature is on, so forgetting the database is never a silent green.
 postgres-test:
