@@ -56,29 +56,25 @@ pub struct StoredMessage {
 ///
 /// The cursor wraps a single store-owned monotonic `seq` and is
 /// strictly greater-than: `get_messages_since(group, cursor, n)`
-/// returns rows with `seq > cursor.seq`. Because `seq` is assigned by
-/// the database at insert time, no caller can produce a row with a
-/// smaller `seq` than one already visible — this closes the classic
-/// "backdated insert skipped by cursor" hole.
+/// returns rows with `seq > cursor.seq`.
+///
+/// # Correctness contract
+///
+/// `seq` is assigned by the database at insert time and `store_message`
+/// allocates it in strict commit order on every supported backend.
+/// On SQLite the database-level single-writer lock already guarantees
+/// this. On PostgreSQL `store_message` wraps each insert in a
+/// transaction-scoped `pg_advisory_xact_lock` so concurrent inserts
+/// serialize on a single key and their commit order matches their seq
+/// order. As a result:
+///
+/// - No caller can produce a row whose `seq` is smaller than one
+///   already delivered to a reader (closes the caller-backdating hole).
+/// - No concurrent writer can commit a row with `seq < N` after a
+///   reader has already advanced past `N` (closes the PostgreSQL MVCC
+///   commit-order gap).
 ///
 /// A fresh caller starts from [`Cursor::beginning`].
-///
-/// # Known limitation: PostgreSQL MVCC commit ordering
-///
-/// On PostgreSQL a sequence value (`BIGSERIAL`) is reserved at insert
-/// time but becomes visible to readers only at commit time. Two
-/// concurrent transactions that acquire seqs `5` and `6` in that order
-/// can still commit in `6, 5` order, so a reader may see row `6`
-/// before `5` is visible. If the reader advances its cursor past `5`,
-/// it will skip that row once it finally commits. This is inherent to
-/// any sequence-based cursor on an MVCC database and is **not** solved
-/// here.
-///
-/// Mitigations live at the router layer: either (a) only advance past
-/// rows older than a short "lag window" so in-flight transactions
-/// have time to commit, or (b) inspect `pg_snapshot_xmin` on Postgres
-/// to wait for the oldest in-flight write. Neither is needed on
-/// SQLite, which does not expose the same MVCC gap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursor {
     /// Exclusive lower bound on `seq`. Readers get back rows where

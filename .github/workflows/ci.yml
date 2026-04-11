@@ -65,7 +65,7 @@ jobs:
           tool: cargo-nextest
 
       - name: Run tests
-        run: cargo nextest run --workspace --profile ci --no-tests=pass
+        run: cargo nextest run --workspace --features forgeclaw-store/test-hooks --profile ci --no-tests=pass
 
   # ============================================================
   # Coverage (Linux only)
@@ -87,7 +87,7 @@ jobs:
           tool: cargo-nextest,cargo-llvm-cov
 
       - name: Generate coverage
-        run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass
+        run: cargo llvm-cov nextest --workspace --features forgeclaw-store/test-hooks --lcov --output-path lcov.info --no-tests=pass
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v6
@@ -155,7 +155,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        image: postgres:18
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_USER: postgres

@@ -1,31 +1,61 @@
 //! Persistence ops for the `messages` table.
 //!
 //! Cursor pagination uses the store-owned `seq` column (an integer
-//! assigned by the database on insert) as the sole sort key. This
-//! closes the backdating hole that a caller-controlled `(created_at,
-//! id)` cursor would leave open: no caller can ever produce a `seq`
-//! smaller than one already delivered.
+//! assigned by the database on insert) as the sole sort key. On
+//! SQLite the database-level single-writer lock guarantees that seq
+//! allocation order equals commit order. On PostgreSQL we achieve
+//! the same by wrapping every insert in a transaction that first
+//! acquires a transaction-scoped advisory lock:
 //!
-//! See [`crate::Cursor`] for the MVCC commit-order caveat that still
-//! applies on PostgreSQL — store closes the backdating hole, but the
-//! router is responsible for tolerating the commit-visibility gap.
+//! ```text
+//! BEGIN;
+//!   SELECT pg_advisory_xact_lock(hashtextextended('forgeclaw_store_messages', 0));
+//!   INSERT INTO messages (...) VALUES (...);  -- seq assigned here
+//! COMMIT;  -- lock released
+//! ```
+//!
+//! The lock serializes concurrent writers on a single key, so
+//! `seq` values are allocated in strict commit order. A reader
+//! that observes `seq = N` is guaranteed that every `seq < N`
+//! either committed before the reader's snapshot was taken or
+//! was rolled back and will never exist. No MVCC commit-order
+//! gap is possible, and callers do not need to tolerate one.
 
 use forgeclaw_core::id::{ChannelId, GroupId};
 use sea_orm::{
     ActiveModelTrait,
     ActiveValue::{NotSet, Set},
-    ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, TransactionTrait,
 };
 
 use crate::entities::messages;
 use crate::error::StoreError;
 use crate::types::message::{Cursor, NewMessage, StoredMessage};
 
+/// Transaction-level advisory lock key. Any 64-bit integer works;
+/// using `hashtextextended` of a self-documenting string keeps
+/// collisions with future crates' advisory locks unlikely.
+const ADVISORY_LOCK_SQL: &str =
+    "SELECT pg_advisory_xact_lock(hashtextextended('forgeclaw_store_messages', 0))";
+
 /// Insert a single message. The database assigns `seq` automatically.
+///
+/// On PostgreSQL the insert runs inside a transaction that first
+/// acquires a transaction-scoped advisory lock, so `seq` allocation
+/// order matches commit order. On SQLite the database-level writer
+/// lock already gives the same guarantee, so the advisory lock is
+/// skipped.
 pub(crate) async fn store_message(
     db: &DatabaseConnection,
     msg: &NewMessage,
 ) -> Result<(), StoreError> {
+    let txn = db.begin().await?;
+
+    if matches!(txn.get_database_backend(), DbBackend::Postgres) {
+        txn.execute_unprepared(ADVISORY_LOCK_SQL).await?;
+    }
+
     let am = messages::ActiveModel {
         seq: NotSet,
         id: Set(msg.id.clone()),
@@ -35,7 +65,9 @@ pub(crate) async fn store_message(
         content: Set(msg.content.clone()),
         created_at: Set(msg.created_at),
     };
-    am.insert(db).await?;
+    am.insert(&txn).await?;
+
+    txn.commit().await?;
     Ok(())
 }
 

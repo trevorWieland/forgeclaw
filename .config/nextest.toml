@@ -10,3 +10,26 @@ failure-output = "immediate-final"
 status-level = "all"
 retries = 2
 slow-timeout = { period = "120s", terminate-after = 3 }
+
+# ----------------------------------------------------------------
+# PostgreSQL parity isolation
+#
+# The postgres_parity test binary wipes the same six tables at the
+# start of every test. If nextest runs two of those tests in
+# parallel, one's TRUNCATE can clobber another's fixtures mid-run.
+# Force strict serialization via a test group with max-threads = 1.
+# The same override on the `ci` profile also sets `retries = 0` so
+# a flake isn't masked by the default retry budget.
+# ----------------------------------------------------------------
+
+[test-groups.postgres-parity]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary(postgres_parity)'
+test-group = 'postgres-parity'
+
+[[profile.ci.overrides]]
+filter = 'binary(postgres_parity)'
+test-group = 'postgres-parity'
+retries = 0

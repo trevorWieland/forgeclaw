@@ -7,7 +7,9 @@
 
 use chrono::{DateTime, Utc};
 use forgeclaw_core::id::{GroupId, TaskId};
-use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement};
+use sea_orm::{ConnectOptions, Database, DatabaseConnection};
+#[cfg(feature = "test-hooks")]
+use sea_orm::{ConnectionTrait, Statement};
 use sea_orm_migration::MigratorTrait;
 
 use crate::error::StoreError;
@@ -83,8 +85,14 @@ impl Store {
         ops::messages::store_message(&self.db, msg).await
     }
 
-    /// Return up to `limit` messages in `group` strictly after `cursor`,
-    /// ordered by `(created_at, id)` ascending.
+    /// Return up to `limit` messages in `group` strictly after
+    /// `cursor.seq`, ordered by store-assigned `seq` ascending.
+    ///
+    /// `seq` is a monotonic integer assigned by the database at
+    /// insert time, so a backdated `created_at` cannot affect
+    /// pagination order and concurrent inserts are serialized by
+    /// commit order. `limit` is clamped against
+    /// [`crate::MAX_PAGE_SIZE`]. See [`Cursor`] for details.
     pub async fn get_messages_since(
         &self,
         group: &GroupId,
@@ -174,10 +182,11 @@ impl Store {
         ops::events::list_events(&self.db, filter, limit).await
     }
 
-    /// Execute a raw SQL statement. **Test-only helper** — integration
-    /// tests use it to preseed schema for the migration restart
-    /// regression. Not intended for production callers, not part of
-    /// the stable API, and subject to removal without notice.
+    /// Execute a raw SQL statement. **Test-only helper** — gated
+    /// behind the `test-hooks` Cargo feature so production builds
+    /// cannot compile it in. Integration tests use it to preseed
+    /// schema for the migration restart regression.
+    #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub async fn __raw_execute_for_test(&self, sql: &str) -> Result<(), StoreError> {
         let backend = self.db.get_database_backend();
@@ -188,8 +197,9 @@ impl Store {
     }
 
     /// Borrow the internal `DatabaseConnection`. **Test-only helper**
-    /// for the schema-drift check; see
+    /// gated behind `test-hooks`; see
     /// [`crate::schema_check::__check_for_test`].
+    #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     #[must_use]
     pub fn __db_for_test(&self) -> &DatabaseConnection {

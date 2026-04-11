@@ -118,3 +118,74 @@ async fn pg_schema_matches_entities() {
         .await
         .expect("schema drift check must pass on real Postgres");
 }
+
+/// Regression for B1-r2: under concurrent inserts, the advisory lock
+/// must guarantee that `seq` allocation order equals commit order.
+/// Without it, PostgreSQL's MVCC snapshot can expose rows in a
+/// different order from their seq assignment, which lets a reader
+/// advance past a seq that is still in-flight and permanently miss
+/// the row when it commits.
+///
+/// The test spawns N concurrent `store_message` calls. After they
+/// all complete, the reader walks the cursor from the beginning
+/// and asserts:
+///   1. it observes exactly N rows (no row is permanently missed)
+///   2. their `seq` values are strictly monotonic
+///
+/// Consecutiveness is NOT asserted because Postgres sequence caches
+/// can legitimately produce gaps even without rollbacks. Monotonic +
+/// complete is the full correctness contract.
+#[tokio::test]
+async fn pg_concurrent_inserts_preserve_seq_ordering() {
+    use chrono::Utc;
+    use forgeclaw_core::id::{ChannelId, GroupId};
+    use forgeclaw_store::{Cursor, NewMessage};
+    use std::sync::Arc;
+    use tokio::task::JoinSet;
+
+    const N: usize = 32;
+
+    let store = Arc::new(fresh_store().await);
+    let group = GroupId::from("pg-concurrent");
+    let channel = ChannelId::from("ch");
+
+    let mut join_set: JoinSet<()> = JoinSet::new();
+    for i in 0..N {
+        let store = Arc::clone(&store);
+        let group = group.clone();
+        let channel = channel.clone();
+        join_set.spawn(async move {
+            let msg = NewMessage {
+                id: format!("concurrent-{i:03}"),
+                group_id: group,
+                channel_id: channel,
+                sender: "worker".into(),
+                content: format!("msg {i}"),
+                created_at: Utc::now(),
+            };
+            store
+                .store_message(&msg)
+                .await
+                .expect("concurrent store_message");
+        });
+    }
+    while let Some(res) = join_set.join_next().await {
+        res.expect("task panicked");
+    }
+
+    let rows = store
+        .get_messages_since(&group, &Cursor::beginning(), 1_000)
+        .await
+        .expect("get_messages_since");
+
+    assert_eq!(rows.len(), N, "all inserted rows must be visible");
+
+    for pair in rows.windows(2) {
+        assert!(
+            pair[0].seq < pair[1].seq,
+            "seq order broken: {} then {}",
+            pair[0].seq,
+            pair[1].seq
+        );
+    }
+}

@@ -25,8 +25,12 @@
 //! - **Store-owned monotonic cursor.** [`Cursor`] is a single
 //!   store-owned `seq` assigned by the database on insert. No caller
 //!   can produce a cursor key smaller than one already delivered, so
-//!   backdated inserts cannot be skipped. A separate MVCC visibility
-//!   caveat applies on PostgreSQL — see [`Cursor`] for details.
+//!   backdated inserts cannot be skipped. On PostgreSQL
+//!   `store_message` wraps each insert in a transaction-scoped
+//!   `pg_advisory_xact_lock` so seq allocation order matches commit
+//!   order — a reader that observes `seq = N` is guaranteed to see
+//!   every `seq < N` that will ever exist. No MVCC commit-order
+//!   visibility gap remains.
 //! - **Bounded reads.** Every query method (`get_messages_since`,
 //!   `get_due_tasks`, `list_events`) clamps its caller-supplied limit
 //!   against [`MAX_PAGE_SIZE`]. Callers that need more rows page via
@@ -82,6 +86,7 @@ pub const MAX_PAGE_SIZE: i64 = 10_000;
 mod entities;
 mod migrations;
 mod ops;
+#[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub mod schema_check;
 mod store;
