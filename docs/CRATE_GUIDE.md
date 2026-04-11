@@ -314,7 +314,11 @@ impl Store {
 
     // Tasks
     pub async fn create_task(&self, task: &NewTask) -> Result<TaskId, StoreError>;
-    pub async fn get_due_tasks(&self, now: DateTime<Utc>) -> Result<Vec<StoredTask>, StoreError>;
+    pub async fn get_due_tasks(
+        &self,
+        now: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<StoredTask>, StoreError>;
     pub async fn update_task_after_run(
         &self,
         id: &TaskId,
@@ -339,21 +343,22 @@ impl Store {
 }
 
 pub struct Cursor {
-    pub timestamp: DateTime<Utc>,
-    pub message_id: String,
+    /// Exclusive lower bound on the store-owned monotonic `seq`.
+    pub seq: i64,
 }
 ```
 
 **Notes**
 
-- Queries go through SeaORM's typed `Entity` + `Column` API. Wrong column names, wrong operand types, and structurally-invalid filters fail compilation — not at runtime.
-- Schema is defined once in Rust via SeaQuery's `SchemaManager`; the same migration code emits correct DDL for both backends. There are no parallel per-dialect SQL files.
-- The messages cursor is strictly exclusive on the composite key `(created_at, message_id)`, so concurrent writes at identical timestamps are neither skipped nor double-delivered.
-- `get_messages_since` takes an explicit `limit` (unbounded reads on a growing chat log would be a footgun). `get_due_tasks` takes an explicit `now: DateTime<Utc>` so the method is pure with respect to system time and dialect-neutral.
+- Queries go through SeaORM's typed `Entity` + `Column` API. Wrong column names, wrong operand types, and structurally-invalid filters fail compilation — not at runtime. A schema-drift test additionally compares every entity against the live migrated schema on both backends.
+- Schema is defined once in Rust via SeaQuery's `SchemaManager`; the same migration code emits correct DDL for both backends. All index creations use `IF NOT EXISTS` so a crash mid-migration followed by a restart is safe.
+- **Message pagination uses a store-owned `seq` cursor.** On insert, the database assigns a monotonically-increasing `BIGINT` / `INTEGER PRIMARY KEY AUTOINCREMENT` ordinal, and `get_messages_since` pages strictly on that `seq`. No caller can produce a cursor key smaller than one already delivered, so backdated inserts cannot be silently skipped. The caller-generated UUIDv7 `id` is kept as a unique correlation key, not a sort key.
+- **Known limitation — PostgreSQL MVCC commit gaps.** A sequence value is assigned at insert time but becomes visible only at commit time. Concurrent transactions that acquire seqs `5` and `6` can commit in `6, 5` order, so a reader may see `6` before `5` is visible. Routers tolerate this with a short "lag window" — advance past rows only after they are older than some grace duration — or by inspecting `pg_snapshot_xmin` on Postgres. SQLite is unaffected.
+- **Bounded reads.** Every query method clamps its caller-supplied `limit` against `MAX_PAGE_SIZE` (default 10,000). `get_messages_since`, `get_due_tasks`, and `list_events` all accept an explicit `limit: i64`. `get_due_tasks` also takes an explicit `now: DateTime<Utc>` so the method is pure with respect to system time and dialect-neutral.
 - `StoredTask` is the flat row type the store returns; the `scheduler` crate maps it to its richer `ScheduledTask` domain enum.
-- `StoreError::classify()` maps every failure into a `core::ErrorClass` so callers decide retry vs circuit-break vs halt without parsing Display strings. Error messages are sanitized to redact connection URLs before they are ever formatted.
+- **Credential redaction.** `StoreError::Database` does **not** retain the raw `sea_orm::DbErr`. The full error chain is sanitized once at the `From<DbErr>` boundary and stored as plain strings; `Display`, `Debug`, and `source()` all see only the redacted form. `StoreError::classify()` maps every failure into a `core::ErrorClass` via an internal `DatabaseCategory` hint so callers decide retry vs circuit-break vs halt without parsing messages.
 
-**Test surface**: CRUD operations for all entities, cursor-based pagination edge cases, migration idempotency. The SQLite in-memory suite covers the full API surface and runs on any machine with no external services. PostgreSQL parity tests are gated behind a `postgres-tests` Cargo feature and read `FORGECLAW_TEST_POSTGRES_URL` at runtime; they are skipped cleanly when either is absent.
+**Test surface**: CRUD operations for all entities, cursor-based pagination edge cases (including a regression that proves backdated inserts are not skipped), migration idempotency AND migration restart safety after partial apply, schema-drift detection, and credential-redaction checks against `Display`/`Debug`/`source()`. The SQLite in-memory suite covers the full API surface and runs on any machine with no external services. PostgreSQL parity tests are gated behind a `postgres-tests` Cargo feature and a `FORGECLAW_TEST_POSTGRES_URL` env var; when the feature is enabled, a missing env var is a hard test failure (not a silent skip), and a dedicated `postgres-parity` CI job provisions a `postgres:16` service container so parity is a real gate.
 
 ---
 

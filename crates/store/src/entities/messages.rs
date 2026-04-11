@@ -3,11 +3,16 @@
 use sea_orm::entity::prelude::*;
 
 /// Row model for `messages`.
+///
+/// The primary key `seq` is a store-owned monotonic ordinal assigned
+/// by the database on insert. The caller-generated UUIDv7 `id` is a
+/// unique correlation key only.
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "messages")]
 pub struct Model {
-    /// UUIDv7 primary key (caller-generated).
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key)]
+    pub seq: i64,
+    #[sea_orm(unique)]
     pub id: String,
     pub group_id: String,
     pub channel_id: String,

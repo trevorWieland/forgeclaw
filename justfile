@@ -158,6 +158,15 @@ check:
 test *args:
     @{{ cargo }} nextest run --workspace --no-tests=pass {{ args }}
 
+# Run the forgeclaw-store PostgreSQL parity suite against a real
+# Postgres. Requires FORGECLAW_TEST_POSTGRES_URL; defaults to a local
+# docker-compose-style postgres:16 service on localhost:5432. The
+# parity tests *panic* (not skip) when the env var is absent and the
+# feature is on, so forgetting the database is never a silent green.
+postgres-test:
+    @FORGECLAW_TEST_POSTGRES_URL="${FORGECLAW_TEST_POSTGRES_URL:-postgres://postgres:postgres@localhost:5432/forgeclaw_test}" \
+        {{ cargo }} nextest run -p forgeclaw-store --features postgres-tests --no-tests=pass
+
 # Generate code coverage report (lcov)
 coverage:
     @{{ cargo }} llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass

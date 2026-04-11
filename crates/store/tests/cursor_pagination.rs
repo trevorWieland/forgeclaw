@@ -1,9 +1,11 @@
 //! Cursor pagination edge cases for `get_messages_since`.
 //!
-//! Exercises the seven correctness-sensitive scenarios in the plan:
-//! empty table, cursor at beginning, cursor past end, ties on
-//! timestamp, exact-match exclusion, LIMIT boundary, and multi-group
-//! isolation.
+//! The cursor is a single store-owned `seq` ordinal, so the edge
+//! cases are: empty table, cursor at beginning, cursor past end,
+//! exact-match exclusion, LIMIT boundary with resume, multi-group
+//! isolation, and the invariant that a row with a backdated
+//! `created_at` cannot be skipped — that is the whole point of moving
+//! the cursor off caller-supplied fields.
 
 use chrono::{DateTime, TimeZone, Utc};
 use forgeclaw_core::id::{ChannelId, GroupId};
@@ -38,10 +40,7 @@ async fn insert(store: &Store, group: &GroupId, id: &str, at: DateTime<Utc>) {
 }
 
 fn cursor_from(msg: &StoredMessage) -> Cursor {
-    Cursor {
-        timestamp: msg.created_at,
-        message_id: msg.id.clone(),
-    }
+    Cursor::after(msg.seq)
 }
 
 #[tokio::test]
@@ -67,6 +66,7 @@ async fn single_message_with_beginning_cursor_returns_it() {
         .expect("query");
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].id, "m-1");
+    assert!(got[0].seq >= 1, "first seq should be >= 1");
 }
 
 #[tokio::test]
@@ -75,10 +75,7 @@ async fn cursor_past_last_message_returns_empty() {
     let group = GroupId::from("g");
     insert(&store, &group, "m-1", epoch_plus(1000)).await;
 
-    let cursor = Cursor {
-        timestamp: epoch_plus(2000),
-        message_id: String::new(),
-    };
+    let cursor = Cursor::after(i64::MAX - 1);
     let got = store
         .get_messages_since(&group, &cursor, 100)
         .await
@@ -87,14 +84,18 @@ async fn cursor_past_last_message_returns_empty() {
 }
 
 #[tokio::test]
-async fn identical_timestamps_ordered_deterministically_by_id() {
+async fn ordering_is_by_insert_seq_not_created_at() {
+    // Insert in a funky order with backdated timestamps — the cursor
+    // must return them in insert order (the order the DB assigned
+    // `seq`), not in `created_at` order. This is the behavioral core
+    // of the B1 fix: caller-controlled `created_at` cannot affect
+    // pagination order.
     let store = fresh_store().await;
     let group = GroupId::from("g");
-    let at = epoch_plus(3000);
 
-    insert(&store, &group, "m-c", at).await;
-    insert(&store, &group, "m-a", at).await;
-    insert(&store, &group, "m-b", at).await;
+    insert(&store, &group, "m-c", epoch_plus(3000)).await;
+    insert(&store, &group, "m-a", epoch_plus(1000)).await; // backdated
+    insert(&store, &group, "m-b", epoch_plus(2000)).await; // backdated
 
     let got = store
         .get_messages_since(&group, &Cursor::beginning(), 100)
@@ -102,17 +103,59 @@ async fn identical_timestamps_ordered_deterministically_by_id() {
         .expect("query");
     assert_eq!(got.len(), 3);
     let ids: Vec<&str> = got.iter().map(|m| m.id.as_str()).collect();
-    assert_eq!(ids, vec!["m-a", "m-b", "m-c"]);
+    assert_eq!(
+        ids,
+        vec!["m-c", "m-a", "m-b"],
+        "pagination must return rows in insert (seq) order, not created_at order"
+    );
+    // And the seqs must be strictly monotonic.
+    assert!(got[0].seq < got[1].seq);
+    assert!(got[1].seq < got[2].seq);
 }
 
 #[tokio::test]
-async fn cursor_excludes_message_at_exact_composite_key() {
+async fn backdated_insert_is_not_skipped_when_cursor_is_advanced() {
+    // Regression for the Lane 0.3 audit blocker B1. A reader
+    // checkpoints after reading m-1. A second writer then inserts
+    // m-2 with a `created_at` far in the past. With the old
+    // (created_at, id) cursor, the reader would silently skip m-2
+    // because its composite key sorted below the checkpoint. With
+    // seq-based cursor, m-2 gets a fresh seq after the checkpoint
+    // and is visible to the reader.
     let store = fresh_store().await;
     let group = GroupId::from("g");
-    let at = epoch_plus(4000);
-    insert(&store, &group, "m-1", at).await;
-    insert(&store, &group, "m-2", at).await;
-    insert(&store, &group, "m-3", at).await;
+
+    insert(&store, &group, "m-1", epoch_plus(5_000_000_000)).await;
+    let page1 = store
+        .get_messages_since(&group, &Cursor::beginning(), 100)
+        .await
+        .expect("page 1");
+    assert_eq!(page1.len(), 1);
+    let checkpoint = cursor_from(&page1[0]);
+
+    // Concurrent writer: insert a message with a much earlier
+    // created_at.
+    insert(&store, &group, "m-2", epoch_plus(1)).await;
+
+    let page2 = store
+        .get_messages_since(&group, &checkpoint, 100)
+        .await
+        .expect("page 2");
+    assert_eq!(page2.len(), 1);
+    assert_eq!(page2[0].id, "m-2", "backdated insert must not be skipped");
+    assert!(
+        page2[0].seq > page1[0].seq,
+        "backdated row must still get a seq greater than earlier rows"
+    );
+}
+
+#[tokio::test]
+async fn cursor_excludes_message_at_exact_seq() {
+    let store = fresh_store().await;
+    let group = GroupId::from("g");
+    for i in 0..3 {
+        insert(&store, &group, &format!("m-{i}"), epoch_plus(4000 + i)).await;
+    }
 
     let all = store
         .get_messages_since(&group, &Cursor::beginning(), 100)
@@ -120,13 +163,13 @@ async fn cursor_excludes_message_at_exact_composite_key() {
         .expect("query all");
     assert_eq!(all.len(), 3);
 
-    // Cursor positioned at m-2 should return only m-3 (m-1, m-2 excluded).
-    let after_m2 = store
+    // Cursor positioned at m-1's seq returns only m-2.
+    let after_m1 = store
         .get_messages_since(&group, &cursor_from(&all[1]), 100)
         .await
-        .expect("query after m-2");
-    assert_eq!(after_m2.len(), 1);
-    assert_eq!(after_m2[0].id, "m-3");
+        .expect("query after m-1");
+    assert_eq!(after_m1.len(), 1);
+    assert_eq!(after_m1[0].id, "m-2");
 }
 
 #[tokio::test]
@@ -189,6 +232,38 @@ async fn multi_group_isolation() {
 }
 
 #[tokio::test]
+async fn negative_limit_is_rejected() {
+    let store = fresh_store().await;
+    let group = GroupId::from("g");
+    insert(&store, &group, "m-1", epoch_plus(7500)).await;
+
+    let err = store
+        .get_messages_since(&group, &Cursor::beginning(), -1)
+        .await
+        .expect_err("negative limit must error");
+    assert!(
+        matches!(err, forgeclaw_store::StoreError::InvalidLimit { .. }),
+        "expected InvalidLimit, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn huge_limit_is_clamped_to_max_page_size() {
+    let store = fresh_store().await;
+    let group = GroupId::from("g");
+    for i in 0..5_i64 {
+        insert(&store, &group, &format!("m-{i}"), epoch_plus(8000 + i)).await;
+    }
+    let got = store
+        .get_messages_since(&group, &Cursor::beginning(), i64::MAX)
+        .await
+        .expect("huge limit must succeed (clamped)");
+    assert_eq!(got.len(), 5);
+    let rows = i64::try_from(got.len()).expect("row count fits in i64");
+    assert!(rows <= forgeclaw_store::MAX_PAGE_SIZE);
+}
+
+#[tokio::test]
 async fn zero_limit_returns_empty() {
     let store = fresh_store().await;
     let group = GroupId::from("g");
@@ -199,4 +274,31 @@ async fn zero_limit_returns_empty() {
         .await
         .expect("zero limit");
     assert!(got.is_empty());
+}
+
+#[tokio::test]
+async fn duplicate_message_id_is_integrity_error() {
+    // `id` is now a UNIQUE secondary key. Inserting two messages
+    // with the same id must fail loudly so callers can dedupe
+    // upstream. Classification goes to `Fatal` via
+    // `DatabaseCategory::Integrity` / `Other`.
+    let store = fresh_store().await;
+    let group = GroupId::from("g");
+    insert(&store, &group, "m-dup", epoch_plus(9000)).await;
+
+    let err = store
+        .store_message(&NewMessage {
+            id: "m-dup".to_owned(),
+            group_id: group,
+            channel_id: ChannelId::from("ch"),
+            sender: "u".into(),
+            content: "c".into(),
+            created_at: epoch_plus(9001),
+        })
+        .await
+        .expect_err("duplicate id must error");
+    assert!(
+        matches!(err, forgeclaw_store::StoreError::Database { .. }),
+        "expected Database, got {err:?}"
+    );
 }

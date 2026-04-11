@@ -1,9 +1,9 @@
 //! PostgreSQL parity tests.
 //!
-//! Gated behind the `postgres-tests` Cargo feature AND a runtime
-//! environment variable so CI (with neither) runs zero Postgres work
-//! and local developers (with a real database) get full parity checks
-//! using identical Rust code on both backends.
+//! Gated behind the `postgres-tests` Cargo feature. When the feature
+//! is on, `FORGECLAW_TEST_POSTGRES_URL` **must** be set or every test
+//! panics at the point of use — a CI developer cannot accidentally
+//! green-light Postgres parity by forgetting to wire up a database.
 //!
 //! Usage:
 //! ```sh
@@ -11,82 +11,110 @@
 //! cargo nextest run -p forgeclaw-store --features postgres-tests
 //! ```
 //!
-//! If either the feature or the env var is absent, every test returns
-//! early with a tracing warning.
+//! Every scenario from the shared harness runs here, so the Postgres
+//! and SQLite suites exercise byte-identical Rust code.
 
 #![cfg(feature = "postgres-tests")]
 
-use chrono::{DateTime, TimeZone, Utc};
-use forgeclaw_core::id::{ChannelId, GroupId};
-use forgeclaw_store::{Cursor, NewMessage, Store};
+mod common;
+
+use forgeclaw_store::Store;
 
 const ENV_VAR: &str = "FORGECLAW_TEST_POSTGRES_URL";
 
-fn epoch_plus(seconds: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(seconds, 0)
-        .single()
-        .expect("valid UTC timestamp")
+/// Obtain the Postgres URL or fail loudly via `.expect()` — this is
+/// not a graceful skip. Enabling the feature means "run this suite",
+/// and no configuration is a configuration error, not a reason to
+/// report green.
+fn require_url() -> String {
+    std::env::var(ENV_VAR).expect(
+        "postgres-tests feature is on but FORGECLAW_TEST_POSTGRES_URL is unset \
+         — set the env var or disable the feature",
+    )
 }
 
-async fn maybe_connect() -> Option<Store> {
-    let url = std::env::var(ENV_VAR).ok()?;
-    let store = Store::connect(&url)
-        .await
-        .expect("connect postgres test database");
+async fn fresh_store() -> Store {
+    let url = require_url();
+    let store = Store::connect(&url).await.expect("connect postgres");
     store.migrate().await.expect("migrate postgres");
-    Some(store)
-}
 
-#[tokio::test]
-async fn postgres_messages_round_trip() {
-    let Some(store) = maybe_connect().await else {
-        tracing::warn!(env = ENV_VAR, "skipping — Postgres URL not set");
-        return;
-    };
-
-    let group = GroupId::from("pg-round-trip");
-    let channel = ChannelId::from("pg-ch");
-    let base = epoch_plus(1_800_000_000);
-
-    for i in 0..3 {
+    // Wipe every table so consecutive tests don't see each other's
+    // rows. Postgres state persists across test runs, so truncation
+    // is required for determinism.
+    for table in ["messages", "groups", "tasks", "state", "sessions", "events"] {
         store
-            .store_message(&NewMessage {
-                id: format!("pg-msg-{i:03}"),
-                group_id: group.clone(),
-                channel_id: channel.clone(),
-                sender: "alice".into(),
-                content: format!("hi {i}"),
-                created_at: base + chrono::Duration::seconds(i64::from(i)),
-            })
+            .__raw_execute_for_test(&format!("TRUNCATE TABLE {table} RESTART IDENTITY CASCADE"))
             .await
-            .expect("store_message");
+            .expect("truncate");
     }
 
-    let got = store
-        .get_messages_since(&group, &Cursor::beginning(), 100)
-        .await
-        .expect("get_messages_since");
-    assert_eq!(got.len(), 3);
-    assert_eq!(got[0].id, "pg-msg-000");
-    assert_eq!(got[2].content, "hi 2");
+    store
 }
 
 #[tokio::test]
-async fn postgres_state_round_trip() {
-    let Some(store) = maybe_connect().await else {
-        tracing::warn!(env = ENV_VAR, "skipping — Postgres URL not set");
-        return;
-    };
+async fn pg_messages_round_trip() {
+    let store = fresh_store().await;
+    common::scenario_messages_round_trip(&store).await;
+}
 
-    store.set_state("pg-key", "pg-v1").await.expect("set pg-v1");
-    assert_eq!(
-        store.get_state("pg-key").await.expect("get"),
-        Some("pg-v1".to_owned())
-    );
+#[tokio::test]
+async fn pg_groups_upsert_preserves_created_at() {
+    let store = fresh_store().await;
+    common::scenario_groups_upsert_preserves_created_at(&store).await;
+}
 
-    store.set_state("pg-key", "pg-v2").await.expect("set pg-v2");
-    assert_eq!(
-        store.get_state("pg-key").await.expect("get"),
-        Some("pg-v2".to_owned())
-    );
+#[tokio::test]
+async fn pg_get_group_missing_returns_none() {
+    let store = fresh_store().await;
+    common::scenario_get_group_missing_returns_none(&store).await;
+}
+
+#[tokio::test]
+async fn pg_state_round_trip() {
+    let store = fresh_store().await;
+    common::scenario_state_round_trip(&store).await;
+}
+
+#[tokio::test]
+async fn pg_sessions_round_trip() {
+    let store = fresh_store().await;
+    common::scenario_sessions_round_trip(&store).await;
+}
+
+#[tokio::test]
+async fn pg_get_session_missing_returns_none() {
+    let store = fresh_store().await;
+    common::scenario_get_session_missing_returns_none(&store).await;
+}
+
+#[tokio::test]
+async fn pg_tasks_due_and_update() {
+    let store = fresh_store().await;
+    common::scenario_tasks_due_and_update(&store).await;
+}
+
+#[tokio::test]
+async fn pg_update_missing_task_is_not_found() {
+    let store = fresh_store().await;
+    common::scenario_update_missing_task_is_not_found(&store).await;
+}
+
+#[tokio::test]
+async fn pg_events_filters() {
+    let store = fresh_store().await;
+    common::scenario_events_filters(&store).await;
+}
+
+#[tokio::test]
+async fn pg_event_with_no_group_round_trips() {
+    let store = fresh_store().await;
+    common::scenario_event_with_no_group(&store).await;
+}
+
+#[tokio::test]
+async fn pg_schema_matches_entities() {
+    let store = fresh_store().await;
+    forgeclaw_store::schema_check::__check_for_test(&store)
+        .await
+        .expect("schema drift check must pass on real Postgres");
 }

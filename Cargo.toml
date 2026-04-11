@@ -119,4 +119,5 @@ uuid = { version = "1", features = ["v7", "serde"] }
 # Testing (dev)
 insta = { version = "1", features = ["yaml"] }
 proptest = "1"
+tempfile = "3"
 wiremock = "0.6"

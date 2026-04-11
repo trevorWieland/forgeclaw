@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use forgeclaw_core::id::{GroupId, TaskId};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder,
+    QueryOrder, QuerySelect,
 };
 
 use crate::entities::tasks;
@@ -37,17 +37,28 @@ pub(crate) async fn create_task(
     Ok(TaskId::from(id))
 }
 
-/// Return every task whose `next_run <= now` with status `active`,
-/// ordered by `next_run` ascending.
+/// Return up to `limit` tasks whose `next_run <= now` with status
+/// `active`, ordered by `(next_run ASC, id ASC)`.
+///
+/// The secondary sort on `id` makes result ordering deterministic
+/// across backends when multiple tasks share the same `next_run`.
 pub(crate) async fn get_due_tasks(
     db: &DatabaseConnection,
     now: DateTime<Utc>,
+    limit: i64,
 ) -> Result<Vec<StoredTask>, StoreError> {
+    let take = super::clamped_take(limit, "get_due_tasks")?;
+    if take == 0 {
+        return Ok(Vec::new());
+    }
+
     let rows = tasks::Entity::find()
         .filter(tasks::Column::Status.eq(TaskStatus::Active.as_str()))
         .filter(tasks::Column::NextRun.is_not_null())
         .filter(tasks::Column::NextRun.lte(now))
         .order_by_asc(tasks::Column::NextRun)
+        .order_by_asc(tasks::Column::Id)
+        .limit(take)
         .all(db)
         .await?;
 
@@ -55,31 +66,44 @@ pub(crate) async fn get_due_tasks(
 }
 
 /// Record the outcome of a task run and update scheduling fields.
+///
+/// Returns [`StoreError::NotFound`] if no task with the given id
+/// exists. Every other failure surfaces as [`StoreError::Database`]
+/// with a category hint.
 pub(crate) async fn update_task_after_run(
     db: &DatabaseConnection,
     id: &TaskId,
     result: &TaskRunResult,
 ) -> Result<(), StoreError> {
+    // Load-then-update, so "missing row" becomes NotFound rather than
+    // SeaORM's generic `RecordNotUpdated` (which would classify as an
+    // integrity error).
+    let existing = tasks::Entity::find_by_id(id.as_ref().to_owned())
+        .one(db)
+        .await?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "task".to_owned(),
+        })?;
+
     let encoded = serde_json::to_string(result)?;
-    let am = tasks::ActiveModel {
-        id: Set(id.as_ref().to_owned()),
-        status: Set(result.status.as_str().to_owned()),
-        next_run: Set(result.next_run),
-        last_result: Set(Some(encoded)),
-        updated_at: Set(result.ran_at),
-        ..Default::default()
-    };
+    let mut am: tasks::ActiveModel = existing.into();
+    am.status = Set(result.status.as_str().to_owned());
+    am.next_run = Set(result.next_run);
+    am.last_result = Set(Some(encoded));
+    am.updated_at = Set(result.ran_at);
     am.update(db).await?;
     Ok(())
 }
 
 fn row_to_stored(row: tasks::Model) -> Result<StoredTask, StoreError> {
     let schedule_kind =
-        ScheduleKind::from_str(&row.schedule_kind).map_err(|e| StoreError::InvalidCursor {
-            reason: format!("unknown schedule_kind in db: {e}"),
+        ScheduleKind::from_str(&row.schedule_kind).map_err(|e| StoreError::SchemaDrift {
+            column: "schedule_kind".to_owned(),
+            reason: e.to_string(),
         })?;
-    let status = TaskStatus::from_str(&row.status).map_err(|e| StoreError::InvalidCursor {
-        reason: format!("unknown task status in db: {e}"),
+    let status = TaskStatus::from_str(&row.status).map_err(|e| StoreError::SchemaDrift {
+        column: "status".to_owned(),
+        reason: e.to_string(),
     })?;
     Ok(StoredTask {
         id: TaskId::from(row.id),

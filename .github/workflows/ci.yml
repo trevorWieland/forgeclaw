@@ -144,6 +144,46 @@ jobs:
         run: cargo machete
 
   # ============================================================
+  # PostgreSQL parity — runs the forgeclaw-store suite against a
+  # real Postgres service container. Enabling the `postgres-tests`
+  # Cargo feature is a strict gate: the tests panic if
+  # FORGECLAW_TEST_POSTGRES_URL is unset, so there is no path from
+  # "feature on, no database" to a silent green.
+  # ============================================================
+  postgres-parity:
+    name: Postgres parity
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: forgeclaw_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      FORGECLAW_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/forgeclaw_test
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Run postgres-gated tests
+        run: cargo nextest run -p forgeclaw-store --features postgres-tests --profile ci --no-tests=pass
+
+  # ============================================================
   # Quality gates (file length + inline suppression)
   # ============================================================
   quality-gates:

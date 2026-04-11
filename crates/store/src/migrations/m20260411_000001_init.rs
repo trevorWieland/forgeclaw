@@ -77,12 +77,27 @@ async fn create_groups(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 }
 
 async fn create_messages(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    // `seq` is the monotonic ingest ordinal used as the cursor key.
+    // Assigned by the database on insert, so no caller can produce a
+    // sort key smaller than an already-delivered row (closing the
+    // backdating hole flagged in the Lane 0.3 audit).
+    //
+    // `id` is the caller-generated correlation key (UUIDv7), not a
+    // sort key. It remains unique so callers can look a message up by
+    // its id but cannot use it to affect pagination order.
     manager
         .create_table(
             Table::create()
                 .table(Messages::Table)
                 .if_not_exists()
-                .col(ColumnDef::new(Messages::Id).text().not_null().primary_key())
+                .col(
+                    ColumnDef::new(Messages::Seq)
+                        .big_integer()
+                        .not_null()
+                        .primary_key()
+                        .auto_increment(),
+                )
+                .col(ColumnDef::new(Messages::Id).text().not_null().unique_key())
                 .col(ColumnDef::new(Messages::GroupId).text().not_null())
                 .col(ColumnDef::new(Messages::ChannelId).text().not_null())
                 .col(ColumnDef::new(Messages::Sender).text().not_null())
@@ -96,14 +111,16 @@ async fn create_messages(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         )
         .await?;
 
+    // One index supports the cursor query: find rows in a group with
+    // seq > cursor.seq, ordered by seq.
     manager
         .create_index(
             Index::create()
-                .name("messages_group_cursor_idx")
+                .if_not_exists()
+                .name("messages_group_seq_idx")
                 .table(Messages::Table)
                 .col(Messages::GroupId)
-                .col(Messages::CreatedAt)
-                .col(Messages::Id)
+                .col(Messages::Seq)
                 .to_owned(),
         )
         .await
@@ -137,13 +154,18 @@ async fn create_tasks(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         )
         .await?;
 
+    // Real partial index: only rows with status='active' are indexed,
+    // because the due-task query filters on that predicate. SeaQuery
+    // emits `WHERE status = 'active'` on both SQLite (≥3.8) and
+    // PostgreSQL via `and_where`.
     manager
         .create_index(
             Index::create()
+                .if_not_exists()
                 .name("tasks_due_idx")
                 .table(Tasks::Table)
-                .col(Tasks::Status)
                 .col(Tasks::NextRun)
+                .and_where(Expr::col(Tasks::Status).eq("active"))
                 .to_owned(),
         )
         .await
@@ -212,6 +234,7 @@ async fn create_events(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     manager
         .create_index(
             Index::create()
+                .if_not_exists()
                 .name("events_created_idx")
                 .table(Events::Table)
                 .col(Events::CreatedAt)
@@ -222,6 +245,7 @@ async fn create_events(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     manager
         .create_index(
             Index::create()
+                .if_not_exists()
                 .name("events_kind_idx")
                 .table(Events::Table)
                 .col(Events::Kind)
@@ -233,6 +257,7 @@ async fn create_events(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     manager
         .create_index(
             Index::create()
+                .if_not_exists()
                 .name("events_group_idx")
                 .table(Events::Table)
                 .col(Events::GroupId)
@@ -256,6 +281,7 @@ enum Groups {
 #[derive(DeriveIden)]
 enum Messages {
     Table,
+    Seq,
     Id,
     GroupId,
     ChannelId,

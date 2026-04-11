@@ -7,7 +7,7 @@
 
 use chrono::{DateTime, Utc};
 use forgeclaw_core::id::{GroupId, TaskId};
-use sea_orm::{ConnectOptions, Database, DatabaseConnection};
+use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 
 use crate::error::StoreError;
@@ -34,6 +34,17 @@ impl Store {
     ///
     /// Supported schemes: `sqlite://…`, `sqlite::memory:`, `postgres://…`,
     /// `postgresql://…`. Unknown schemes return [`StoreError::InvalidUrl`].
+    ///
+    /// **In-memory SQLite:** when the URL identifies an in-memory
+    /// SQLite database (`sqlite::memory:`, `sqlite://?mode=memory`,
+    /// …), the connection pool is clamped to a single connection.
+    /// sqlx's pool may otherwise open several, and each sqlx
+    /// in-memory SQLite connection is a distinct, unshared database —
+    /// a pool with `max_connections > 1` would see connections
+    /// silently diverge from each other. The clamp keeps the in-memory
+    /// backend reliable at the cost of serializing all store calls on
+    /// that single connection, which is acceptable for test use and
+    /// single-process dev workloads.
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
         if !is_supported_scheme(url) {
             return Err(StoreError::InvalidUrl {
@@ -42,12 +53,16 @@ impl Store {
         }
         let mut opts = ConnectOptions::new(url.to_owned());
         opts.sqlx_logging(false);
+        if is_sqlite_memory(url) {
+            opts.max_connections(1).min_connections(1);
+        }
         let db = Database::connect(opts).await?;
         Ok(Self { db })
     }
 
     /// Connect to a fresh in-memory SQLite database. Each call yields
-    /// a distinct, independent database.
+    /// a distinct, independent database with a single-connection pool
+    /// (see [`Store::connect`] for the in-memory pool caveat).
     pub async fn connect_sqlite_memory() -> Result<Self, StoreError> {
         Self::connect("sqlite::memory:").await
     }
@@ -98,9 +113,16 @@ impl Store {
         ops::tasks::create_task(&self.db, task).await
     }
 
-    /// Return every task whose `next_run <= now` with status `active`.
-    pub async fn get_due_tasks(&self, now: DateTime<Utc>) -> Result<Vec<StoredTask>, StoreError> {
-        ops::tasks::get_due_tasks(&self.db, now).await
+    /// Return up to `limit` active tasks whose `next_run <= now`,
+    /// ordered deterministically by `(next_run ASC, id ASC)`.
+    ///
+    /// `limit` is clamped against [`crate::MAX_PAGE_SIZE`].
+    pub async fn get_due_tasks(
+        &self,
+        now: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<StoredTask>, StoreError> {
+        ops::tasks::get_due_tasks(&self.db, now, limit).await
     }
 
     /// Record the outcome of a task run and advance scheduling fields.
@@ -151,6 +173,28 @@ impl Store {
     ) -> Result<Vec<StoredEvent>, StoreError> {
         ops::events::list_events(&self.db, filter, limit).await
     }
+
+    /// Execute a raw SQL statement. **Test-only helper** — integration
+    /// tests use it to preseed schema for the migration restart
+    /// regression. Not intended for production callers, not part of
+    /// the stable API, and subject to removal without notice.
+    #[doc(hidden)]
+    pub async fn __raw_execute_for_test(&self, sql: &str) -> Result<(), StoreError> {
+        let backend = self.db.get_database_backend();
+        self.db
+            .execute(Statement::from_string(backend, sql.to_owned()))
+            .await?;
+        Ok(())
+    }
+
+    /// Borrow the internal `DatabaseConnection`. **Test-only helper**
+    /// for the schema-drift check; see
+    /// [`crate::schema_check::__check_for_test`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __db_for_test(&self) -> &DatabaseConnection {
+        &self.db
+    }
 }
 
 fn is_supported_scheme(url: &str) -> bool {
@@ -158,6 +202,15 @@ fn is_supported_scheme(url: &str) -> bool {
         || url.starts_with("sqlite::memory:")
         || url.starts_with("postgres://")
         || url.starts_with("postgresql://")
+}
+
+/// `true` if `url` identifies an in-memory SQLite database (in any of
+/// the several shapes sqlx accepts).
+fn is_sqlite_memory(url: &str) -> bool {
+    url.starts_with("sqlite::memory:")
+        || url.starts_with("sqlite://:memory:")
+        || url.contains("?mode=memory")
+        || url.contains("&mode=memory")
 }
 
 fn scheme_hint(url: &str) -> String {
@@ -171,7 +224,7 @@ fn scheme_hint(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Store, is_supported_scheme};
+    use super::{Store, is_sqlite_memory, is_supported_scheme};
 
     #[test]
     fn supported_schemes() {
@@ -188,9 +241,40 @@ mod tests {
         assert!(!is_supported_scheme("not-a-url"));
     }
 
+    #[test]
+    fn in_memory_url_detection() {
+        assert!(is_sqlite_memory("sqlite::memory:"));
+        assert!(is_sqlite_memory("sqlite://:memory:"));
+        assert!(is_sqlite_memory("sqlite://?mode=memory"));
+        assert!(is_sqlite_memory("sqlite://foo?mode=memory&cache=private"));
+        assert!(!is_sqlite_memory("sqlite://./foo.db"));
+        assert!(!is_sqlite_memory("postgres://u:p@h/db"));
+    }
+
     #[tokio::test]
     async fn connect_rejects_unknown_scheme() {
         let err = Store::connect("mysql://root@localhost/db").await;
         assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn memory_store_shares_state_across_pool_usage() {
+        // Regression for audit issue I2: before the clamp, a pool
+        // with max_connections > 1 would open multiple distinct
+        // in-memory databases. State written on one connection would
+        // be invisible to reads on another. With the clamp to a
+        // single connection, repeated reads must all observe the
+        // same write.
+        let store = Store::connect_sqlite_memory()
+            .await
+            .expect("connect sqlite memory");
+        store.migrate().await.expect("migrate");
+        store.set_state("k", "v").await.expect("set");
+        for _ in 0..16 {
+            assert_eq!(
+                store.get_state("k").await.expect("get"),
+                Some("v".to_owned())
+            );
+        }
     }
 }

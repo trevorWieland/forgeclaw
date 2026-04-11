@@ -41,12 +41,10 @@ pub(crate) async fn list_events(
     filter: &EventFilter,
     limit: i64,
 ) -> Result<Vec<StoredEvent>, StoreError> {
-    if limit <= 0 {
+    let take = super::clamped_take(limit, "list_events")?;
+    if take == 0 {
         return Ok(Vec::new());
     }
-    let take = u64::try_from(limit).map_err(|_| StoreError::InvalidCursor {
-        reason: format!("limit {limit} cannot be converted to u64"),
-    })?;
 
     let rows = events::Entity::find()
         .apply_if(filter.kind.clone(), |q, kind| {
