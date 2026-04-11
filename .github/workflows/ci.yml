@@ -65,7 +65,7 @@ jobs:
           tool: cargo-nextest
 
       - name: Run tests
-        run: cargo nextest run --workspace --profile ci --no-tests=pass
+        run: cargo nextest run --workspace --features forgeclaw-store/test-hooks --profile ci --no-tests=pass
 
   # ============================================================
   # Coverage (Linux only)
@@ -87,7 +87,7 @@ jobs:
           tool: cargo-nextest,cargo-llvm-cov
 
       - name: Generate coverage
-        run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass
+        run: cargo llvm-cov nextest --workspace --features forgeclaw-store/test-hooks --lcov --output-path lcov.info --no-tests=pass
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v6
@@ -142,6 +142,46 @@ jobs:
 
       - name: Check for unused dependencies
         run: cargo machete
+
+  # ============================================================
+  # PostgreSQL parity — runs the forgeclaw-store suite against a
+  # real Postgres service container. Enabling the `postgres-tests`
+  # Cargo feature is a strict gate: the tests panic if
+  # FORGECLAW_TEST_POSTGRES_URL is unset, so there is no path from
+  # "feature on, no database" to a silent green.
+  # ============================================================
+  postgres-parity:
+    name: Postgres parity
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: forgeclaw_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      FORGECLAW_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/forgeclaw_test
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Run postgres-gated tests
+        run: cargo nextest run -p forgeclaw-store --features postgres-tests --profile ci --no-tests=pass
 
   # ============================================================
   # Quality gates (file length + inline suppression)

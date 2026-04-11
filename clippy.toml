@@ -1,1 +1,18 @@
 too-many-lines-threshold = 100
+
+# Extend the default list of identifiers that don't trip `doc_markdown`
+# inside rustdoc comments. Without this, common technical names like
+# `SeaORM` or `PostgreSQL` would require backticks in every prose line.
+doc-valid-idents = [
+  "..",
+  "SeaORM",
+  "SeaQuery",
+  "SQLite",
+  "PostgreSQL",
+  "Postgres",
+  "UUIDv7",
+  "JSONB",
+  "TIMESTAMPTZ",
+  "SQLSTATE",
+  "Forgeclaw",
+]

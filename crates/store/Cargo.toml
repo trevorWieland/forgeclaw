@@ -5,12 +5,81 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Database layer with compile-time checked queries (SQLite + Postgres)"
+description = "Database layer with dialect-agnostic, compile-time typed queries via SeaORM (SQLite + Postgres)"
 
-[lints]
-workspace = true
+[features]
+# `test-hooks` exposes crate-private escape hatches (raw SQL
+# execution, schema introspection) that only integration tests
+# should reach. The feature is NOT enabled by default, so
+# production builds cannot compile them in. Every test binary that
+# depends on the hooks declares `required-features = ["test-hooks"]`
+# below so a bare `cargo test -p forgeclaw-store` silently excludes
+# them rather than failing to link.
+test-hooks = []
+
+# PostgreSQL parity suite. Depends on test-hooks so the parity
+# tests can use the same escape hatches as the SQLite hooks.
+postgres-tests = ["test-hooks"]
+
+[[test]]
+name = "migration_restart"
+path = "tests/migration_restart.rs"
+required-features = ["test-hooks"]
+
+[[test]]
+name = "schema_drift"
+path = "tests/schema_drift.rs"
+required-features = ["test-hooks"]
+
+[[test]]
+name = "postgres_parity"
+path = "tests/postgres_parity.rs"
+required-features = ["postgres-tests"]
+
+# Lints — we mirror the workspace defaults manually because SeaORM's
+# `DeriveEntityModel` macro expands into `pub struct Entity` / `pub enum
+# Column` items inside otherwise-private entity modules, which trips
+# `unreachable_pub`. The workspace setting is `warn`; we relax it here
+# for this crate only. Everything else matches the workspace-level
+# configuration in the repo-root `Cargo.toml`.
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "allow"
+unused_qualifications = "warn"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+panic = "deny"
+todo = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+unimplemented = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
 
 [dependencies]
-# Added as crate develops
+forgeclaw-core = { path = "../core", version = "0.1" }
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+insta = { workspace = true }
+tempfile = { workspace = true }

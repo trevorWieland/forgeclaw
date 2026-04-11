@@ -154,13 +154,26 @@ check:
 # Test
 # ============================================================================
 
-# Run all tests via nextest (pass extra args after --)
+# Run all tests via nextest (pass extra args after --).
+# Enables `forgeclaw-store/test-hooks` so the crate's internal
+# escape hatches (raw SQL execution for the migration-restart test,
+# schema introspection for the drift test) compile in. Production
+# builds do NOT enable this feature.
 test *args:
-    @{{ cargo }} nextest run --workspace --no-tests=pass {{ args }}
+    @{{ cargo }} nextest run --workspace --features forgeclaw-store/test-hooks --no-tests=pass {{ args }}
+
+# Run the forgeclaw-store PostgreSQL parity suite against a real
+# Postgres. Requires FORGECLAW_TEST_POSTGRES_URL; defaults to a local
+# docker-compose-style postgres:18 service on localhost:5432. The
+# parity tests *panic* (not skip) when the env var is absent and the
+# feature is on, so forgetting the database is never a silent green.
+postgres-test:
+    @FORGECLAW_TEST_POSTGRES_URL="${FORGECLAW_TEST_POSTGRES_URL:-postgres://postgres:postgres@localhost:5432/forgeclaw_test}" \
+        {{ cargo }} nextest run -p forgeclaw-store --features postgres-tests --no-tests=pass
 
 # Generate code coverage report (lcov)
 coverage:
-    @{{ cargo }} llvm-cov nextest --workspace --lcov --output-path lcov.info --no-tests=pass
+    @{{ cargo }} llvm-cov nextest --workspace --features forgeclaw-store/test-hooks --lcov --output-path lcov.info --no-tests=pass
     @echo "Coverage report: lcov.info"
 
 # ============================================================================
