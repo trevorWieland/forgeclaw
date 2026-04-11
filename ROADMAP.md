@@ -15,9 +15,9 @@ Exit criteria are concrete and testable. A phase is done when its criteria pass,
 | Lane | Crate | Deliverable | Status |
 |------|-------|------------|--------|
 | 0.1 | workspace | Cargo workspace with 14 crate stubs under `crates/`. Workspace manifest with shared lints, deps, and metadata. CI pipeline (9 GitHub Actions jobs). `justfile` with bootstrap and all dev recipes. License files, CONTRIBUTING.md, CLAUDE.md. | **Done** |
-| 0.2 | `core` | Event enum (`MessageEvent`, `ContainerEvent`, `TanrenEvent`, `TaskEvent`, `HealthEvent`, `IpcEvent`). Event bus (tokio broadcast channel with typed wrapper). Error taxonomy (`ErrorClass`: Transient, Auth, Config, Container, Fatal). Config types (deserialized from TOML via serde). `GroupId`, `ContainerId`, `ProviderId`, `ChannelId` newtypes. | |
-| 0.3 | `store` | sqlx setup with SQLite and Postgres support. Schema migrations (sqlx-migrate). Tables: `messages`, `chat_metadata`, `tasks`, `task_run_logs`, `router_state`, `sessions`, `registered_groups`, `events`. Compile-time checked queries for all CRUD operations. DataStore trait with sqlx implementation. | |
-| 0.4 | `ipc` | Protocol message types: `HostToContainer` and `ContainerToHost` enums. Frame codec: 4-byte length prefix + JSON payload. Unix socket server (host side) and client (container side) with tokio. Handshake: container connects, sends `Ready`, host sends `Init`. Unit tests for codec roundtrip, connection lifecycle. | |
+| 0.2 | `core` | Event enum (`MessageEvent`, `ContainerEvent`, `TanrenEvent`, `TaskEvent`, `HealthEvent`, `IpcEvent`). Event bus (tokio broadcast channel with typed wrapper). Error taxonomy (`ErrorClass`: Transient, Auth, Config, Container, Fatal). Config types (deserialized from TOML via serde). `GroupId`, `ContainerId`, `ProviderId`, `ChannelId` newtypes. | **Done** |
+| 0.3 | `store` | sqlx setup with SQLite and Postgres support. Schema migrations (sqlx-migrate). Tables: `messages`, `chat_metadata`, `tasks`, `task_run_logs`, `router_state`, `sessions`, `registered_groups`, `events`. Compile-time checked queries for all CRUD operations. DataStore trait with sqlx implementation. | **Done** |
+| 0.4 | `ipc` | Protocol message types: `HostToContainer` and `ContainerToHost` enums. Frame codec: 4-byte length prefix + JSON payload. Unix socket server (host side) and client (container side) with tokio. Handshake: container connects, sends `Ready`, host sends `Init`. Unit tests for codec roundtrip, connection lifecycle. | **In Progress** |
 
 ### Exit Criteria
 
