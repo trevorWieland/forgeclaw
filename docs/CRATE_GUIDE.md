@@ -282,7 +282,7 @@ pub struct CircuitBreaker {
 
 ## `store`
 
-**Responsibility**: Database abstraction with compile-time checked queries. SQLite and Postgres backends via sqlx.
+**Responsibility**: Database abstraction with compile-time typed queries, a single Rust source of truth for schema, and error classification for the recovery machinery in `core`. Supports SQLite (local dev, tests, small deployments) and PostgreSQL (production) behind one API via SeaORM (built on sqlx). Also exposes an audit-log `events` table used by `router`, `scheduler`, and `health` for debugging and metrics.
 
 **Depends on**: `core`
 
@@ -290,33 +290,52 @@ pub struct CircuitBreaker {
 
 ```rust
 pub struct Store {
-    pool: sqlx::AnyPool,
+    db: sea_orm::DatabaseConnection,
 }
 
 impl Store {
+    // Construction & migrations
+    pub async fn connect(url: &str) -> Result<Self, StoreError>;
+    pub async fn connect_sqlite_memory() -> Result<Self, StoreError>;
+    pub async fn migrate(&self) -> Result<(), StoreError>;
+
     // Messages
-    pub async fn store_message(&self, msg: &NewMessage) -> Result<()>;
-    pub async fn get_messages_since(&self, group: &GroupId, cursor: &Cursor) -> Result<Vec<StoredMessage>>;
+    pub async fn store_message(&self, msg: &NewMessage) -> Result<(), StoreError>;
+    pub async fn get_messages_since(
+        &self,
+        group: &GroupId,
+        cursor: &Cursor,
+        limit: i64,
+    ) -> Result<Vec<StoredMessage>, StoreError>;
 
     // Groups
-    pub async fn get_group(&self, id: &GroupId) -> Result<Option<RegisteredGroup>>;
-    pub async fn upsert_group(&self, group: &RegisteredGroup) -> Result<()>;
+    pub async fn get_group(&self, id: &GroupId) -> Result<Option<RegisteredGroup>, StoreError>;
+    pub async fn upsert_group(&self, group: &RegisteredGroup) -> Result<(), StoreError>;
 
     // Tasks
-    pub async fn create_task(&self, task: &NewTask) -> Result<TaskId>;
-    pub async fn get_due_tasks(&self) -> Result<Vec<ScheduledTask>>;
-    pub async fn update_task_after_run(&self, id: &TaskId, result: &TaskRunResult) -> Result<()>;
+    pub async fn create_task(&self, task: &NewTask) -> Result<TaskId, StoreError>;
+    pub async fn get_due_tasks(&self, now: DateTime<Utc>) -> Result<Vec<StoredTask>, StoreError>;
+    pub async fn update_task_after_run(
+        &self,
+        id: &TaskId,
+        result: &TaskRunResult,
+    ) -> Result<(), StoreError>;
 
-    // State
-    pub async fn get_state(&self, key: &str) -> Result<Option<String>>;
-    pub async fn set_state(&self, key: &str, value: &str) -> Result<()>;
+    // State (generic key/value)
+    pub async fn get_state(&self, key: &str) -> Result<Option<String>, StoreError>;
+    pub async fn set_state(&self, key: &str, value: &str) -> Result<(), StoreError>;
 
-    // Sessions
-    pub async fn get_session(&self, group: &GroupId) -> Result<Option<String>>;
-    pub async fn set_session(&self, group: &GroupId, session_id: &str) -> Result<()>;
+    // Sessions (group → agent session id)
+    pub async fn get_session(&self, group: &GroupId) -> Result<Option<String>, StoreError>;
+    pub async fn set_session(&self, group: &GroupId, session_id: &str) -> Result<(), StoreError>;
 
-    // Migrations
-    pub async fn migrate(&self) -> Result<()>;
+    // Events (audit log)
+    pub async fn record_event(&self, event: &NewEvent) -> Result<(), StoreError>;
+    pub async fn list_events(
+        &self,
+        filter: &EventFilter,
+        limit: i64,
+    ) -> Result<Vec<StoredEvent>, StoreError>;
 }
 
 pub struct Cursor {
@@ -325,7 +344,16 @@ pub struct Cursor {
 }
 ```
 
-**Test surface**: CRUD operations for all entities, cursor-based pagination, migration idempotency. Tests run against both SQLite (in-memory) and Postgres (via testcontainers or CI service).
+**Notes**
+
+- Queries go through SeaORM's typed `Entity` + `Column` API. Wrong column names, wrong operand types, and structurally-invalid filters fail compilation — not at runtime.
+- Schema is defined once in Rust via SeaQuery's `SchemaManager`; the same migration code emits correct DDL for both backends. There are no parallel per-dialect SQL files.
+- The messages cursor is strictly exclusive on the composite key `(created_at, message_id)`, so concurrent writes at identical timestamps are neither skipped nor double-delivered.
+- `get_messages_since` takes an explicit `limit` (unbounded reads on a growing chat log would be a footgun). `get_due_tasks` takes an explicit `now: DateTime<Utc>` so the method is pure with respect to system time and dialect-neutral.
+- `StoredTask` is the flat row type the store returns; the `scheduler` crate maps it to its richer `ScheduledTask` domain enum.
+- `StoreError::classify()` maps every failure into a `core::ErrorClass` so callers decide retry vs circuit-break vs halt without parsing Display strings. Error messages are sanitized to redact connection URLs before they are ever formatted.
+
+**Test surface**: CRUD operations for all entities, cursor-based pagination edge cases, migration idempotency. The SQLite in-memory suite covers the full API surface and runs on any machine with no external services. PostgreSQL parity tests are gated behind a `postgres-tests` Cargo feature and read `FORGECLAW_TEST_POSTGRES_URL` at runtime; they are skipped cleanly when either is absent.
 
 ---
 

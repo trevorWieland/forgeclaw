@@ -96,6 +96,26 @@ chrono = { version = "0.4", features = ["serde"] }
 # TOML parsing
 toml = "0.8"
 
+# Database (SeaORM — dialect-agnostic async ORM built on sqlx)
+sea-orm = { version = "1.1", default-features = false, features = [
+  "macros",
+  "runtime-tokio-rustls",
+  "sqlx-sqlite",
+  "sqlx-postgres",
+  "with-chrono",
+  "with-uuid",
+  "with-json",
+] }
+sea-orm-migration = { version = "1.1", default-features = false, features = [
+  "runtime-tokio-rustls",
+  "sqlx-sqlite",
+  "sqlx-postgres",
+  "with-chrono",
+] }
+
+# Identifiers (UUIDv7 for time-ordered IDs)
+uuid = { version = "1", features = ["v7", "serde"] }
+
 # Testing (dev)
 insta = { version = "1", features = ["yaml"] }
 proptest = "1"
