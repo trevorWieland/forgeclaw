@@ -1,0 +1,7 @@
+{
+  "type": "messages",
+  "job_id": "job-abc123",
+  "messages": [
+    { "sender": "Alice", "text": "Also check the logs please", "timestamp": "2026-04-03T10:05:00Z" }
+  ]
+}

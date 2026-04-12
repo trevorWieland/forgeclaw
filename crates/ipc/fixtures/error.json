@@ -1,0 +1,7 @@
+{
+  "type": "error",
+  "code": "provider_error",
+  "message": "Model returned 429: rate limited",
+  "fatal": false,
+  "job_id": "job-abc123"
+}

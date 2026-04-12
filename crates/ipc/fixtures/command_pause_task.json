@@ -1,0 +1,7 @@
+{
+  "type": "command",
+  "command": "pause_task",
+  "payload": {
+    "task_id": "task-abc123"
+  }
+}

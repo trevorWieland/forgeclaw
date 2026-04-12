@@ -1,0 +1,256 @@
+//! Host-side Unix socket server and connection types.
+//!
+//! The [`IpcServer`] owns the bind lifecycle: it creates the socket
+//! file at a caller-supplied path, unlinks any stale *socket* at that
+//! path first, and cleans up on drop. Each accepted peer becomes an
+//! [`IpcConnection`], which wraps a [`tokio_util::codec::Framed`]
+//! over the accepted [`tokio::net::UnixStream`] with a
+//! [`crate::codec::FrameCodec`] on top.
+//!
+//! The handshake lifecycle (`Ready → Init`) is encapsulated in
+//! [`IpcConnection::handshake`] so higher-level crates never reach
+//! into the raw send/recv primitives just to establish a session.
+
+use std::path::{Path, PathBuf};
+
+use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
+use tokio::net::{UnixListener, UnixStream};
+use tokio_util::codec::Framed;
+
+use crate::codec::{FrameCodec, decode_container_to_host, encode_message};
+use crate::error::{IpcError, ProtocolError};
+use crate::message::{ContainerToHost, HostToContainer, InitPayload, ReadyPayload};
+use crate::version::{PROTOCOL_VERSION, is_compatible};
+
+/// Unix-socket server for the host side of the IPC protocol.
+///
+/// An [`IpcServer`] owns a single [`tokio::net::UnixListener`] and the
+/// filesystem path the listener is bound to. Accepted peers are
+/// returned as [`IpcConnection`]s; one container equals one
+/// connection, and the connection's lifetime equals the container's
+/// session lifetime.
+#[derive(Debug)]
+pub struct IpcServer {
+    listener: UnixListener,
+    socket_path: PathBuf,
+}
+
+impl IpcServer {
+    /// Bind a Unix socket at `path`.
+    ///
+    /// If a **stale Unix socket** already exists at the path, it is
+    /// removed first so that a host restart succeeds without manual
+    /// intervention. If a non-socket file (regular file, directory,
+    /// symlink, etc.) exists at the path, the call fails with
+    /// [`std::io::ErrorKind::AlreadyExists`] rather than silently
+    /// deleting an unrelated file.
+    ///
+    /// Parent directories are NOT created — the caller is responsible
+    /// for ensuring the workspace directory exists (Lane 1.1 will
+    /// wire that through container spec mounts).
+    pub fn bind(path: impl AsRef<Path>) -> Result<Self, IpcError> {
+        let socket_path = path.as_ref().to_path_buf();
+        // `bind` is a startup-time operation so the short blocking
+        // metadata check + unlink here is fine.
+        clean_stale_socket(&socket_path)?;
+        let listener = UnixListener::bind(&socket_path)?;
+        tracing::debug!(
+            target: "forgeclaw_ipc::server",
+            path = %socket_path.display(),
+            "bound IPC server"
+        );
+        Ok(Self {
+            listener,
+            socket_path,
+        })
+    }
+
+    /// Accept one container connection.
+    ///
+    /// Returns when a peer has fully connected; the returned
+    /// [`IpcConnection`] is ready to call
+    /// [`IpcConnection::handshake`].
+    pub async fn accept(&self) -> Result<IpcConnection, IpcError> {
+        let (stream, _addr) = self.listener.accept().await?;
+        Ok(IpcConnection::from_stream(stream))
+    }
+
+    /// Returns the filesystem path this server is bound to.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.socket_path
+    }
+}
+
+impl Drop for IpcServer {
+    fn drop(&mut self) {
+        // Only unlink if the path is still a Unix socket (defensive
+        // against the file being replaced between bind and drop).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            match std::fs::symlink_metadata(&self.socket_path) {
+                Ok(meta) if meta.file_type().is_socket() => {
+                    if let Err(e) = std::fs::remove_file(&self.socket_path) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            tracing::warn!(
+                                target: "forgeclaw_ipc::server",
+                                path = %self.socket_path.display(),
+                                error = %e,
+                                "failed to remove IPC socket file on drop"
+                            );
+                        }
+                    }
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        target: "forgeclaw_ipc::server",
+                        path = %self.socket_path.display(),
+                        "socket path replaced with non-socket; skipping cleanup"
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(
+                        target: "forgeclaw_ipc::server",
+                        path = %self.socket_path.display(),
+                        error = %e,
+                        "failed to stat IPC socket file on drop"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Inspect the filesystem at `path` and remove a stale Unix socket
+/// if present. Errors on non-socket entries; ignores missing paths.
+#[cfg(unix)]
+fn clean_stale_socket(path: &Path) -> Result<(), IpcError> {
+    use std::os::unix::fs::FileTypeExt;
+
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => {
+            std::fs::remove_file(path)?;
+            tracing::debug!(
+                target: "forgeclaw_ipc::server",
+                path = %path.display(),
+                "removed stale socket file"
+            );
+            Ok(())
+        }
+        Ok(_) => Err(IpcError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("path exists and is not a Unix socket: {}", path.display()),
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(IpcError::Io(e)),
+    }
+}
+
+/// An accepted host-side connection to a single container.
+///
+/// Exposes typed send / receive primitives plus a single-call
+/// [`handshake`](IpcConnection::handshake) that performs the `Ready →
+/// Init` exchange documented in `docs/IPC_PROTOCOL.md` §Lifecycle.
+#[derive(Debug)]
+pub struct IpcConnection {
+    framed: Framed<UnixStream, FrameCodec>,
+}
+
+impl IpcConnection {
+    fn from_stream(stream: UnixStream) -> Self {
+        Self {
+            framed: Framed::new(stream, FrameCodec::new()),
+        }
+    }
+
+    /// Send a [`HostToContainer`] message to the peer.
+    pub async fn send_host(&mut self, msg: &HostToContainer) -> Result<(), IpcError> {
+        let bytes: Bytes = encode_message(msg)?;
+        self.framed.send(bytes).await?;
+        Ok(())
+    }
+
+    /// Receive a [`ContainerToHost`] message from the peer.
+    ///
+    /// Returns [`IpcError::Closed`] if the peer disconnected cleanly
+    /// between frames.
+    pub async fn recv_container(&mut self) -> Result<ContainerToHost, IpcError> {
+        let Some(frame) = self.framed.next().await.transpose()? else {
+            return Err(IpcError::Closed);
+        };
+        decode_container_to_host(&frame)
+    }
+
+    /// Like [`recv_container`](Self::recv_container) but
+    /// forward-compatible: unknown message types are logged at warn
+    /// level and skipped, per `docs/IPC_PROTOCOL.md` §Error Handling
+    /// ("Unknown message type: Ignored with a warning log").
+    ///
+    /// All other errors (IO, frame, malformed JSON, closed) are
+    /// propagated as-is.
+    pub async fn recv_container_lossy(&mut self) -> Result<ContainerToHost, IpcError> {
+        loop {
+            match self.recv_container().await {
+                Ok(msg) => return Ok(msg),
+                Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
+                    tracing::warn!(
+                        target: "forgeclaw_ipc::server",
+                        message_type = %ty,
+                        "ignoring unknown message type (forward compatibility)"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Perform the host-side handshake.
+    ///
+    /// Waits for a [`ContainerToHost::Ready`] message, validates the
+    /// peer's declared protocol version against
+    /// [`crate::version::PROTOCOL_VERSION`], then sends the
+    /// caller-supplied [`InitPayload`]. Returns the received
+    /// [`ReadyPayload`] for the container manager to inspect.
+    ///
+    /// Unknown message types received before `Ready` are silently
+    /// skipped per `docs/IPC_PROTOCOL.md` §Error Handling (forward
+    /// compatibility). The first *known* non-`Ready` message is a
+    /// protocol violation and surfaces as
+    /// [`ProtocolError::UnexpectedMessage`].
+    pub async fn handshake(&mut self, init: InitPayload) -> Result<ReadyPayload, IpcError> {
+        let first = self.recv_container_lossy().await?;
+        let ready = match first {
+            ContainerToHost::Ready(payload) => payload,
+            other => {
+                return Err(IpcError::Protocol(ProtocolError::UnexpectedMessage {
+                    expected: "ready",
+                    got: other.type_name(),
+                }));
+            }
+        };
+        if !is_compatible(&ready.protocol_version) {
+            return Err(IpcError::Protocol(ProtocolError::UnsupportedVersion {
+                peer: ready.protocol_version.clone(),
+                local: PROTOCOL_VERSION,
+            }));
+        }
+        self.send_host(&HostToContainer::Init(init)).await?;
+        tracing::debug!(
+            target: "forgeclaw_ipc::server",
+            adapter = %ready.adapter,
+            adapter_version = %ready.adapter_version,
+            protocol_version = %ready.protocol_version,
+            "IPC handshake complete"
+        );
+        Ok(ready)
+    }
+
+    /// Cleanly close the connection.
+    pub async fn close(mut self) -> Result<(), IpcError> {
+        self.framed.close().await?;
+        Ok(())
+    }
+}

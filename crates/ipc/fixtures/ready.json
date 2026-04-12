@@ -1,0 +1,6 @@
+{
+  "type": "ready",
+  "adapter": "claude-code",
+  "adapter_version": "1.0.0",
+  "protocol_version": "1.0"
+}

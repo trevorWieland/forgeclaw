@@ -11,6 +11,17 @@ description = "Structured IPC protocol over Unix domain sockets"
 workspace = true
 
 [dependencies]
-# Added as crate develops
+forgeclaw-core = { path = "../core", version = "0.1" }
+tokio.workspace = true
+tokio-util.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
+insta.workspace = true
+proptest.workspace = true
+tempfile.workspace = true

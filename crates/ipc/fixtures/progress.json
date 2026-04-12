@@ -1,0 +1,7 @@
+{
+  "type": "progress",
+  "job_id": "job-abc123",
+  "stage": "tool_execution",
+  "detail": "Running cargo test...",
+  "percent": 60
+}

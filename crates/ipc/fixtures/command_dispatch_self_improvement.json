@@ -1,0 +1,10 @@
+{
+  "type": "command",
+  "command": "dispatch_self_improvement",
+  "payload": {
+    "objective": "Add retry logic",
+    "scope": "crates/ipc",
+    "acceptance_tests": "cargo nextest run -p forgeclaw-ipc",
+    "branch_policy": "create"
+  }
+}

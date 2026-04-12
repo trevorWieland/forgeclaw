@@ -1,0 +1,8 @@
+{
+  "type": "command",
+  "command": "send_message",
+  "payload": {
+    "target_group": "group-main",
+    "text": "Task completed successfully."
+  }
+}

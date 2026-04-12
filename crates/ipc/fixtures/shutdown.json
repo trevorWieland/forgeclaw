@@ -1,0 +1,5 @@
+{
+  "type": "shutdown",
+  "reason": "idle_timeout",
+  "deadline_ms": 10000
+}

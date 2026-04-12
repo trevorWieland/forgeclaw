@@ -1,0 +1,7 @@
+{
+  "type": "command",
+  "command": "cancel_task",
+  "payload": {
+    "task_id": "task-abc123"
+  }
+}

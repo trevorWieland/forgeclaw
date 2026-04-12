@@ -1,0 +1,11 @@
+{
+  "type": "command",
+  "command": "dispatch_tanren",
+  "payload": {
+    "project": "forgeclaw",
+    "branch": "main",
+    "phase": "do-task",
+    "prompt": "Implement feature X",
+    "environment_profile": "large-vm"
+  }
+}

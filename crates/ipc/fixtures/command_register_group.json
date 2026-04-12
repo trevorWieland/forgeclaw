@@ -1,0 +1,10 @@
+{
+  "type": "command",
+  "command": "register_group",
+  "payload": {
+    "group_spec": {
+      "name": "New Group",
+      "trigger": "@bot"
+    }
+  }
+}

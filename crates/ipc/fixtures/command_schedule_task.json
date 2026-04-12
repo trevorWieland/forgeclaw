@@ -1,0 +1,11 @@
+{
+  "type": "command",
+  "command": "schedule_task",
+  "payload": {
+    "group": "group-main",
+    "schedule_type": "cron",
+    "schedule_value": "0 9 * * *",
+    "prompt": "Check status",
+    "context_mode": "full"
+  }
+}

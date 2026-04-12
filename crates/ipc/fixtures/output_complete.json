@@ -1,0 +1,11 @@
+{
+  "type": "output_complete",
+  "job_id": "job-abc123",
+  "result": "Here's the full response...",
+  "session_id": "sess-xyz789",
+  "token_usage": {
+    "input_tokens": 1500,
+    "output_tokens": 800
+  },
+  "stop_reason": "end_turn"
+}

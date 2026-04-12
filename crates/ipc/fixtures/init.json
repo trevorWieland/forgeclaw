@@ -1,0 +1,25 @@
+{
+  "type": "init",
+  "job_id": "job-abc123",
+  "context": {
+    "messages": [
+      { "sender": "Alice", "text": "Hey @bot, what's the weather?", "timestamp": "2026-04-03T10:00:00Z" },
+      { "sender": "Bob", "text": "Also curious!", "timestamp": "2026-04-03T10:01:00Z" }
+    ],
+    "group": {
+      "id": "group-main",
+      "name": "Main Group",
+      "is_main": true
+    },
+    "timezone": "America/New_York"
+  },
+  "config": {
+    "provider_proxy_url": "http://host.docker.internal:9090/v1",
+    "provider_proxy_token": "abc123def456",
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens": 32000,
+    "session_id": "sess-xyz789",
+    "tools_enabled": true,
+    "timeout_seconds": 1800
+  }
+}
