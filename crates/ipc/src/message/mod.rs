@@ -28,9 +28,9 @@ pub mod shared;
 use serde::{Deserialize, Serialize};
 
 pub use command::{
-    CancelTaskPayload, CommandBody, CommandPayload, DispatchSelfImprovementPayload,
+    BranchPolicy, CancelTaskPayload, CommandBody, CommandPayload, DispatchSelfImprovementPayload,
     DispatchTanrenPayload, PauseTaskPayload, RegisterGroupPayload, ScheduleTaskPayload,
-    SendMessagePayload,
+    ScheduleType, SendMessagePayload, TanrenPhase,
 };
 pub use container_to_host::{
     ErrorPayload, HeartbeatPayload, OutputCompletePayload, OutputDeltaPayload, ProgressPayload,
@@ -67,6 +67,19 @@ pub enum ContainerToHost {
 }
 
 impl ContainerToHost {
+    /// The set of `type` discriminator values this crate recognizes.
+    /// Used by the codec's two-pass decode to structurally distinguish
+    /// "unknown message type" from "malformed known message".
+    pub const KNOWN_TYPES: &'static [&'static str] = &[
+        "ready",
+        "output_delta",
+        "output_complete",
+        "progress",
+        "command",
+        "error",
+        "heartbeat",
+    ];
+
     /// Returns the wire `type` name of this message, suitable for
     /// logging and for constructing
     /// [`crate::error::ProtocolError::UnexpectedMessage`].
@@ -101,6 +114,9 @@ pub enum HostToContainer {
 }
 
 impl HostToContainer {
+    /// The set of `type` discriminator values this crate recognizes.
+    pub const KNOWN_TYPES: &'static [&'static str] = &["init", "messages", "shutdown"];
+
     /// Returns the wire `type` name of this message, suitable for
     /// logging and for constructing
     /// [`crate::error::ProtocolError::UnexpectedMessage`].

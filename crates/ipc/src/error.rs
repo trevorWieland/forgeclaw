@@ -149,6 +149,24 @@ impl IpcError {
     pub(crate) fn serialize(err: &serde_json::Error) -> Self {
         Self::Serialize(err.to_string())
     }
+
+    /// Returns `true` if this error implies the connection is no
+    /// longer in a recoverable state and should be torn down.
+    ///
+    /// Fatal errors include all framing errors (the stream is
+    /// desynchronized), I/O failures, version mismatches, and
+    /// unexpected messages during handshake. Non-fatal:
+    /// [`ProtocolError::UnknownMessageType`] (forward compatibility),
+    /// [`IpcError::Closed`] (already done), and
+    /// [`IpcError::Serialize`] (encode-side only).
+    #[must_use]
+    pub fn is_fatal(&self) -> bool {
+        match self {
+            Self::Io(_) | Self::Frame(_) => true,
+            Self::Protocol(p) => !matches!(p, ProtocolError::UnknownMessageType(_)),
+            Self::Serialize(_) | Self::Closed => false,
+        }
+    }
 }
 
 #[cfg(test)]

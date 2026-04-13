@@ -1,27 +1,13 @@
-//! End-to-end lifecycle tests over a real `tempfile::tempdir` Unix
-//! socket.
-//!
-//! These tests spin up an [`IpcServer`] and an [`IpcClient`] as
-//! concurrent tokio tasks and assert:
-//!
-//! 1. the `Ready → Init` handshake succeeds and both sides receive
-//!    the payload the other sent;
-//! 2. a mismatched major protocol version is rejected with
-//!    [`ProtocolError::UnsupportedVersion`];
-//! 3. full-duplex message exchange works after the handshake;
-//! 4. a peer disconnect before handshake surfaces as
-//!    [`IpcError::Closed`];
-//! 5. dropping the server cleans up the socket file;
-//! 6. binding over a pre-existing stale file succeeds (the server
-//!    unlinks it).
+//! End-to-end lifecycle tests over real Unix sockets.
 
 use std::path::PathBuf;
 
 use forgeclaw_core::{GroupId, JobId};
 use forgeclaw_ipc::{
-    ContainerToHost, FrameError, GroupInfo, HeartbeatPayload, HostToContainer, InitConfig,
-    InitContext, InitPayload, IpcClient, IpcError, IpcServer, OutputCompletePayload, ProtocolError,
-    ReadyPayload, ShutdownPayload, ShutdownReason, StopReason,
+    ContainerToHost, FrameError, GroupInfo, HeartbeatPayload, HistoricalMessage, HostToContainer,
+    InitConfig, InitContext, InitPayload, IpcClient, IpcError, IpcServer, MessagesPayload,
+    OutputCompletePayload, OutputDeltaPayload, ProtocolError, ReadyPayload, ShutdownPayload,
+    ShutdownReason, StopReason,
 };
 use tempfile::tempdir;
 
@@ -274,10 +260,6 @@ async fn bind_refuses_regular_file_at_path() {
 }
 
 // --- Raw-socket adversarial input tests ---
-//
-// These inject hand-crafted bytes through a real Unix socket via
-// `std::os::unix::net::UnixStream` (std, not tokio) to test error
-// paths that the typed `IpcClient::send` API cannot reach.
 
 /// Write a length-prefixed frame to a raw socket.
 fn raw_send(stream: &mut std::os::unix::net::UnixStream, payload: &[u8]) {
@@ -288,74 +270,36 @@ fn raw_send(stream: &mut std::os::unix::net::UnixStream, payload: &[u8]) {
     stream.flush().expect("flush");
 }
 
-#[tokio::test]
-async fn raw_invalid_utf8_through_socket() {
+async fn raw_recv_error(payload: &'static [u8]) -> IpcError {
     let dir = tempdir().expect("tempdir");
     let path = socket_path(&dir, "ipc.sock");
     let server = IpcServer::bind(&path).expect("bind");
-
     let accept_task = tokio::spawn(async move {
         let mut conn = server.accept().await.expect("accept");
         conn.recv_container().await
     });
-
     let mut raw = std::os::unix::net::UnixStream::connect(&path).expect("raw connect");
-    raw_send(&mut raw, &[0xFF, 0xFE, 0xFD]);
+    raw_send(&mut raw, payload);
     drop(raw);
+    accept_task.await.expect("join").expect_err("should error")
+}
 
-    let result = accept_task.await.expect("join");
-    let err = result.expect_err("invalid UTF-8 should error");
-    assert!(
-        matches!(err, IpcError::Frame(FrameError::InvalidUtf8)),
-        "expected InvalidUtf8, got {err:?}"
-    );
+#[tokio::test]
+async fn raw_invalid_utf8_through_socket() {
+    let err = raw_recv_error(&[0xFF, 0xFE, 0xFD]).await;
+    assert!(matches!(err, IpcError::Frame(FrameError::InvalidUtf8)));
 }
 
 #[tokio::test]
 async fn raw_malformed_json_through_socket() {
-    let dir = tempdir().expect("tempdir");
-    let path = socket_path(&dir, "ipc.sock");
-    let server = IpcServer::bind(&path).expect("bind");
-
-    let accept_task = tokio::spawn(async move {
-        let mut conn = server.accept().await.expect("accept");
-        conn.recv_container().await
-    });
-
-    let mut raw = std::os::unix::net::UnixStream::connect(&path).expect("raw connect");
-    raw_send(&mut raw, b"{not json at all}");
-    drop(raw);
-
-    let result = accept_task.await.expect("join");
-    let err = result.expect_err("malformed JSON should error");
-    assert!(
-        matches!(err, IpcError::Frame(FrameError::MalformedJson(_))),
-        "expected MalformedJson, got {err:?}"
-    );
+    let err = raw_recv_error(b"{not json at all}").await;
+    assert!(matches!(err, IpcError::Frame(FrameError::MalformedJson(_))));
 }
 
 #[tokio::test]
 async fn raw_missing_required_fields_through_socket() {
-    let dir = tempdir().expect("tempdir");
-    let path = socket_path(&dir, "ipc.sock");
-    let server = IpcServer::bind(&path).expect("bind");
-
-    let accept_task = tokio::spawn(async move {
-        let mut conn = server.accept().await.expect("accept");
-        conn.recv_container().await
-    });
-
-    // Valid JSON with a known type but missing required payload fields.
-    let mut raw = std::os::unix::net::UnixStream::connect(&path).expect("raw connect");
-    raw_send(&mut raw, br#"{"type":"ready"}"#);
-    drop(raw);
-
-    let result = accept_task.await.expect("join");
-    let err = result.expect_err("missing fields should error");
-    assert!(
-        matches!(err, IpcError::Frame(FrameError::MalformedJson(_))),
-        "expected MalformedJson for missing fields, got {err:?}"
-    );
+    let err = raw_recv_error(br#"{"type":"ready"}"#).await;
+    assert!(matches!(err, IpcError::Frame(FrameError::MalformedJson(_))));
 }
 
 #[tokio::test]
@@ -402,4 +346,136 @@ async fn unknown_type_skipped_during_handshake() {
     // Server handshake should have succeeded (skipping the unknown message).
     let ready = accept_task.await.expect("join").expect("handshake ok");
     assert_eq!(ready.adapter, "test-adapter");
+}
+
+#[tokio::test]
+async fn messages_exchange_after_init() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ipc.sock");
+    let server = IpcServer::bind(&path).expect("bind");
+
+    let accept_task = tokio::spawn(async move {
+        let mut conn = server.accept().await.expect("accept");
+        let _ready = conn
+            .handshake(sample_init())
+            .await
+            .expect("server handshake");
+        // Host sends a follow-up Messages payload.
+        conn.send_host(&HostToContainer::Messages(MessagesPayload {
+            job_id: JobId::from("job-integration-1"),
+            messages: vec![HistoricalMessage {
+                sender: "Alice".to_owned(),
+                text: "Also check the logs".to_owned(),
+                timestamp: "2026-04-03T10:05:00Z".to_owned(),
+            }],
+        }))
+        .await
+        .expect("send messages");
+        conn.recv_container().await.expect("recv complete")
+    });
+
+    let mut client = IpcClient::connect(&path).await.expect("connect");
+    let _init = client
+        .handshake(sample_ready("1.0"))
+        .await
+        .expect("client handshake");
+    let msg = client.recv().await.expect("recv messages");
+    assert!(matches!(msg, HostToContainer::Messages(_)));
+
+    client
+        .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
+            job_id: JobId::from("job-integration-1"),
+            result: Some("done".to_owned()),
+            session_id: None,
+            token_usage: None,
+            stop_reason: StopReason::EndTurn,
+        }))
+        .await
+        .expect("send complete");
+
+    let last = accept_task.await.expect("join");
+    assert!(matches!(last, ContainerToHost::OutputComplete(_)));
+}
+
+#[tokio::test]
+async fn post_error_connection_is_poisoned() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ipc.sock");
+    let server = IpcServer::bind(&path).expect("bind");
+
+    let accept_task = tokio::spawn(async move {
+        let mut conn = server.accept().await.expect("accept");
+        // First recv gets a malformed frame → connection poisoned.
+        let err1 = conn.recv_container().await;
+        assert!(err1.is_err(), "malformed frame should error");
+        // Second recv should immediately return Closed (not garbage).
+        let err2 = conn.recv_container().await;
+        assert!(
+            matches!(err2, Err(IpcError::Closed)),
+            "poisoned connection should return Closed, got {err2:?}"
+        );
+    });
+
+    let mut raw = std::os::unix::net::UnixStream::connect(&path).expect("raw connect");
+    raw_send(&mut raw, &[0xFF, 0xFE, 0xFD]); // invalid UTF-8
+    // Write a valid-looking frame that should never be processed.
+    let valid = br#"{"type":"ready","adapter":"x","adapter_version":"v","protocol_version":"1.0"}"#;
+    raw_send(&mut raw, valid);
+    drop(raw);
+
+    accept_task.await.expect("join");
+}
+
+#[tokio::test]
+async fn concurrent_send_recv_through_split() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ipc.sock");
+    let server = IpcServer::bind(&path).expect("bind");
+
+    let accept_task = tokio::spawn(async move {
+        let mut conn = server.accept().await.expect("accept");
+        let _ready = conn
+            .handshake(sample_init())
+            .await
+            .expect("server handshake");
+        let (mut writer, mut reader) = conn.into_split();
+
+        // Spawn a writer that sends Shutdown while reader receives deltas.
+        let write_task = tokio::spawn(async move {
+            // Small delay so the reader is up first.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            writer
+                .send_host(&HostToContainer::Shutdown(ShutdownPayload {
+                    reason: ShutdownReason::HostShutdown,
+                    deadline_ms: 5_000,
+                }))
+                .await
+                .expect("send shutdown");
+        });
+
+        let msg = reader.recv_container().await.expect("recv delta");
+        assert!(matches!(msg, ContainerToHost::OutputDelta(_)));
+
+        write_task.await.expect("write task");
+    });
+
+    let mut client = IpcClient::connect(&path).await.expect("connect");
+    let _init = client
+        .handshake(sample_ready("1.0"))
+        .await
+        .expect("client handshake");
+
+    // Client sends a delta then reads the shutdown.
+    client
+        .send(&ContainerToHost::OutputDelta(OutputDeltaPayload {
+            text: "partial output".to_owned(),
+            job_id: JobId::from("job-integration-1"),
+        }))
+        .await
+        .expect("send delta");
+
+    let shutdown = client.recv().await.expect("recv shutdown");
+    assert!(matches!(shutdown, HostToContainer::Shutdown(_)));
+
+    accept_task.await.expect("join");
 }

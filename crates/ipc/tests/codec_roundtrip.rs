@@ -12,12 +12,12 @@
 use bytes::{Bytes, BytesMut};
 use forgeclaw_core::{GroupId, JobId, TaskId};
 use forgeclaw_ipc::{
-    CancelTaskPayload, CommandBody, CommandPayload, ContainerToHost,
+    BranchPolicy, CancelTaskPayload, CommandBody, CommandPayload, ContainerToHost,
     DispatchSelfImprovementPayload, DispatchTanrenPayload, ErrorCode, ErrorPayload, FrameCodec,
     GroupInfo, HeartbeatPayload, HistoricalMessage, HostToContainer, InitConfig, InitContext,
     InitPayload, MessagesPayload, OutputCompletePayload, OutputDeltaPayload, PauseTaskPayload,
-    ProgressPayload, ReadyPayload, RegisterGroupPayload, ScheduleTaskPayload, SendMessagePayload,
-    ShutdownPayload, ShutdownReason, StopReason, TokenUsage,
+    ProgressPayload, ReadyPayload, RegisterGroupPayload, ScheduleTaskPayload, ScheduleType,
+    SendMessagePayload, ShutdownPayload, ShutdownReason, StopReason, TanrenPhase, TokenUsage,
 };
 use proptest::prelude::*;
 use tokio_util::codec::{Decoder, Encoder};
@@ -140,7 +140,11 @@ fn command_strategy() -> impl Strategy<Value = CommandPayload> {
         }),
         (
             group_id_strategy(),
-            short_string(),
+            prop_oneof![
+                Just(ScheduleType::Cron),
+                Just(ScheduleType::Interval),
+                Just(ScheduleType::Once),
+            ],
             short_string(),
             bounded_string(),
             proptest::option::of(short_string()),
@@ -164,7 +168,11 @@ fn command_strategy() -> impl Strategy<Value = CommandPayload> {
         (
             short_string(),
             short_string(),
-            short_string(),
+            prop_oneof![
+                Just(TanrenPhase::DoTask),
+                Just(TanrenPhase::Gate),
+                Just(TanrenPhase::Audit),
+            ],
             bounded_string(),
             proptest::option::of(short_string()),
         )
@@ -181,7 +189,7 @@ fn command_strategy() -> impl Strategy<Value = CommandPayload> {
             bounded_string(),
             short_string(),
             bounded_string(),
-            short_string(),
+            prop_oneof![Just(BranchPolicy::Create), Just(BranchPolicy::Reuse)],
         )
             .prop_map(|(obj, sc, at, bp)| {
                 CommandBody::DispatchSelfImprovement(DispatchSelfImprovementPayload {

@@ -48,18 +48,19 @@ pub mod codec;
 pub mod error;
 pub mod message;
 pub mod server;
+pub(crate) mod util;
 pub mod version;
 
-pub use client::IpcClient;
+pub use client::{IpcClient, IpcClientReader, IpcClientWriter};
 pub use codec::{FrameCodec, LENGTH_PREFIX_BYTES, MAX_FRAME_BYTES};
 pub use error::{FrameError, IpcError, ProtocolError};
 pub use message::{
-    CancelTaskPayload, CommandBody, CommandPayload, ContainerToHost,
+    BranchPolicy, CancelTaskPayload, CommandBody, CommandPayload, ContainerToHost,
     DispatchSelfImprovementPayload, DispatchTanrenPayload, ErrorCode, ErrorPayload, GroupInfo,
     HeartbeatPayload, HistoricalMessage, HostToContainer, InitConfig, InitContext, InitPayload,
     MessagesPayload, OutputCompletePayload, OutputDeltaPayload, PauseTaskPayload, ProgressPayload,
-    ReadyPayload, RegisterGroupPayload, ScheduleTaskPayload, SendMessagePayload, ShutdownPayload,
-    ShutdownReason, StopReason, TokenUsage,
+    ReadyPayload, RegisterGroupPayload, ScheduleTaskPayload, ScheduleType, SendMessagePayload,
+    ShutdownPayload, ShutdownReason, StopReason, TanrenPhase, TokenUsage,
 };
-pub use server::{IpcConnection, IpcServer};
+pub use server::{IpcConnection, IpcConnectionReader, IpcConnectionWriter, IpcServer};
 pub use version::{PROTOCOL_VERSION, is_compatible};

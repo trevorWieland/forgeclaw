@@ -12,15 +12,19 @@
 //! into the raw send/recv primitives just to establish a session.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
-use tokio_util::codec::Framed;
+use tokio_util::codec::{Framed, FramedRead, FramedWrite};
 
 use crate::codec::{FrameCodec, decode_container_to_host, encode_message};
 use crate::error::{IpcError, ProtocolError};
 use crate::message::{ContainerToHost, HostToContainer, InitPayload, ReadyPayload};
+use crate::util::truncate_for_log;
 use crate::version::{PROTOCOL_VERSION, is_compatible};
 
 /// Unix-socket server for the host side of the IPC protocol.
@@ -154,43 +158,83 @@ fn clean_stale_socket(path: &Path) -> Result<(), IpcError> {
 /// Exposes typed send / receive primitives plus a single-call
 /// [`handshake`](IpcConnection::handshake) that performs the `Ready →
 /// Init` exchange documented in `docs/IPC_PROTOCOL.md` §Lifecycle.
+///
+/// After handshake, call [`into_split`](IpcConnection::into_split) to
+/// get independent read/write halves for full-duplex operation.
+///
+/// On any fatal error (frame, I/O, version mismatch, unexpected
+/// message), the connection is automatically poisoned: the
+/// underlying socket is shut down and all subsequent calls return
+/// [`IpcError::Closed`].
 #[derive(Debug)]
 pub struct IpcConnection {
     framed: Framed<UnixStream, FrameCodec>,
+    poisoned: bool,
 }
 
 impl IpcConnection {
     fn from_stream(stream: UnixStream) -> Self {
         Self {
             framed: Framed::new(stream, FrameCodec::new()),
+            poisoned: false,
         }
+    }
+
+    fn check_poisoned(&self) -> Result<(), IpcError> {
+        if self.poisoned {
+            return Err(IpcError::Closed);
+        }
+        Ok(())
+    }
+
+    async fn poison(&mut self) {
+        self.poisoned = true;
+        let _ = self.framed.get_mut().shutdown().await;
     }
 
     /// Send a [`HostToContainer`] message to the peer.
     pub async fn send_host(&mut self, msg: &HostToContainer) -> Result<(), IpcError> {
+        self.check_poisoned()?;
         let bytes: Bytes = encode_message(msg)?;
-        self.framed.send(bytes).await?;
-        Ok(())
+        let result = self.framed.send(bytes).await;
+        if let Err(ref e) = result {
+            if e.is_fatal() {
+                self.poison().await;
+            }
+        }
+        result
     }
 
     /// Receive a [`ContainerToHost`] message from the peer.
     ///
-    /// Returns [`IpcError::Closed`] if the peer disconnected cleanly
-    /// between frames.
+    /// On fatal errors the connection is poisoned and the underlying
+    /// socket is shut down. Returns [`IpcError::Closed`] if the peer
+    /// disconnected cleanly or the connection was previously poisoned.
     pub async fn recv_container(&mut self) -> Result<ContainerToHost, IpcError> {
-        let Some(frame) = self.framed.next().await.transpose()? else {
-            return Err(IpcError::Closed);
+        self.check_poisoned()?;
+        let frame = match self.framed.next().await.transpose() {
+            Ok(Some(f)) => f,
+            Ok(None) => {
+                self.poisoned = true;
+                return Err(IpcError::Closed);
+            }
+            Err(e) => {
+                self.poison().await;
+                return Err(e);
+            }
         };
-        decode_container_to_host(&frame)
+        let result = decode_container_to_host(&frame);
+        if let Err(ref e) = result {
+            if e.is_fatal() {
+                self.poison().await;
+            }
+        }
+        result
     }
 
     /// Like [`recv_container`](Self::recv_container) but
     /// forward-compatible: unknown message types are logged at warn
-    /// level and skipped, per `docs/IPC_PROTOCOL.md` §Error Handling
-    /// ("Unknown message type: Ignored with a warning log").
-    ///
-    /// All other errors (IO, frame, malformed JSON, closed) are
-    /// propagated as-is.
+    /// level and skipped per `docs/IPC_PROTOCOL.md` §Error Handling.
     pub async fn recv_container_lossy(&mut self) -> Result<ContainerToHost, IpcError> {
         loop {
             match self.recv_container().await {
@@ -198,7 +242,7 @@ impl IpcConnection {
                 Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
                     tracing::warn!(
                         target: "forgeclaw_ipc::server",
-                        message_type = %ty,
+                        message_type = %truncate_for_log(&ty),
                         "ignoring unknown message type (forward compatibility)"
                     );
                 }
@@ -209,18 +253,18 @@ impl IpcConnection {
 
     /// Perform the host-side handshake.
     ///
-    /// Waits for a [`ContainerToHost::Ready`] message, validates the
-    /// peer's declared protocol version against
-    /// [`crate::version::PROTOCOL_VERSION`], then sends the
-    /// caller-supplied [`InitPayload`]. Returns the received
-    /// [`ReadyPayload`] for the container manager to inspect.
-    ///
-    /// Unknown message types received before `Ready` are silently
-    /// skipped per `docs/IPC_PROTOCOL.md` §Error Handling (forward
-    /// compatibility). The first *known* non-`Ready` message is a
-    /// protocol violation and surfaces as
-    /// [`ProtocolError::UnexpectedMessage`].
+    /// On any failure the connection is poisoned automatically.
     pub async fn handshake(&mut self, init: InitPayload) -> Result<ReadyPayload, IpcError> {
+        let result = self.handshake_inner(init).await;
+        if let Err(ref e) = result {
+            if e.is_fatal() {
+                self.poison().await;
+            }
+        }
+        result
+    }
+
+    async fn handshake_inner(&mut self, init: InitPayload) -> Result<ReadyPayload, IpcError> {
         let first = self.recv_container_lossy().await?;
         let ready = match first {
             ContainerToHost::Ready(payload) => payload,
@@ -240,17 +284,112 @@ impl IpcConnection {
         self.send_host(&HostToContainer::Init(init)).await?;
         tracing::debug!(
             target: "forgeclaw_ipc::server",
-            adapter = %ready.adapter,
-            adapter_version = %ready.adapter_version,
-            protocol_version = %ready.protocol_version,
+            adapter = %truncate_for_log(&ready.adapter),
+            adapter_version = %truncate_for_log(&ready.adapter_version),
+            protocol_version = %truncate_for_log(&ready.protocol_version),
             "IPC handshake complete"
         );
         Ok(ready)
+    }
+
+    /// Split into independent read and write halves for full-duplex
+    /// operation. Use after handshake.
+    ///
+    /// A fatal error on either half poisons both via a shared flag.
+    pub fn into_split(self) -> (IpcConnectionWriter, IpcConnectionReader) {
+        let poisoned = Arc::new(AtomicBool::new(self.poisoned));
+        let parts = self.framed.into_parts();
+        let (read_half, write_half) = parts.io.into_split();
+        (
+            IpcConnectionWriter {
+                writer: FramedWrite::new(write_half, FrameCodec::new()),
+                poisoned: Arc::clone(&poisoned),
+            },
+            IpcConnectionReader {
+                reader: FramedRead::new(read_half, FrameCodec::new()),
+                poisoned,
+            },
+        )
     }
 
     /// Cleanly close the connection.
     pub async fn close(mut self) -> Result<(), IpcError> {
         self.framed.close().await?;
         Ok(())
+    }
+}
+
+/// Write half of a split [`IpcConnection`].
+#[derive(Debug)]
+pub struct IpcConnectionWriter {
+    writer: FramedWrite<tokio::net::unix::OwnedWriteHalf, FrameCodec>,
+    poisoned: Arc<AtomicBool>,
+}
+
+impl IpcConnectionWriter {
+    /// Send a [`HostToContainer`] message.
+    pub async fn send_host(&mut self, msg: &HostToContainer) -> Result<(), IpcError> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(IpcError::Closed);
+        }
+        let bytes: Bytes = encode_message(msg)?;
+        let result = self.writer.send(bytes).await;
+        if let Err(ref e) = result {
+            if e.is_fatal() {
+                self.poisoned.store(true, Ordering::Release);
+            }
+        }
+        result
+    }
+}
+
+/// Read half of a split [`IpcConnection`].
+#[derive(Debug)]
+pub struct IpcConnectionReader {
+    reader: FramedRead<tokio::net::unix::OwnedReadHalf, FrameCodec>,
+    poisoned: Arc<AtomicBool>,
+}
+
+impl IpcConnectionReader {
+    /// Receive a [`ContainerToHost`] message.
+    pub async fn recv_container(&mut self) -> Result<ContainerToHost, IpcError> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(IpcError::Closed);
+        }
+        let frame = match self.reader.next().await.transpose() {
+            Ok(Some(f)) => f,
+            Ok(None) => {
+                self.poisoned.store(true, Ordering::Release);
+                return Err(IpcError::Closed);
+            }
+            Err(e) => {
+                self.poisoned.store(true, Ordering::Release);
+                return Err(e);
+            }
+        };
+        let result = decode_container_to_host(&frame);
+        if let Err(ref e) = result {
+            if e.is_fatal() {
+                self.poisoned.store(true, Ordering::Release);
+            }
+        }
+        result
+    }
+
+    /// Forward-compatible receive: skip unknown message types.
+    pub async fn recv_container_lossy(&mut self) -> Result<ContainerToHost, IpcError> {
+        loop {
+            match self.recv_container().await {
+                Ok(msg) => return Ok(msg),
+                Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
+                    tracing::warn!(
+                        target: "forgeclaw_ipc::server",
+                        message_type = %truncate_for_log(&ty),
+                        "ignoring unknown message type (forward compatibility)"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 }

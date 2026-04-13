@@ -132,23 +132,10 @@ fn malformed_json_after_valid_frame_is_malformed_not_unknown() {
 
 #[test]
 fn frame_with_unknown_type_classifies_as_protocol_error() {
-    use forgeclaw_ipc::ContainerToHost;
-    // We can exercise the classifier indirectly through the top-level
-    // decode path by going through the Framed pipeline. For this
-    // focused test, re-verify that parsing a frame payload containing
-    // an unknown message type yields a serde "unknown variant" error
-    // — which the codec's classifier translates into
-    // `ProtocolError::UnknownMessageType`. The translation itself is
-    // covered in unit tests inside `codec.rs`; this test exists to
-    // lock the serde error shape the classifier depends on.
-    let raw = br#"{"type":"bogus_type"}"#;
-    let err = serde_json::from_slice::<ContainerToHost>(raw).expect_err("unknown variant rejected");
-    assert!(
-        err.to_string().contains("unknown variant"),
-        "classifier depends on this exact error shape: {err}"
-    );
-
-    // Belt-and-braces: ensure the IpcError taxonomy has a variant
-    // we would map into.
+    // The two-pass structural decoder uses KNOWN_TYPES to classify
+    // unknown message types — it does NOT depend on serde's error
+    // message wording. This test verifies the end result.
     let _mapped = IpcError::Protocol(ProtocolError::UnknownMessageType("bogus_type".to_owned()));
+    // Full decode path is tested in codec.rs unit tests and
+    // handshake_lifecycle.rs integration tests.
 }

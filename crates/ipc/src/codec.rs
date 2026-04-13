@@ -23,13 +23,9 @@
 //!   this cap are rejected immediately — the codec does **not**
 //!   allocate the oversized buffer.
 //!
-//! The codec is implemented by hand, not by delegating to
-//! [`tokio_util::codec::LengthDelimitedCodec`], so the wire contract
-//! is obvious at the call site. `LengthDelimitedCodec` is fine for
-//! general-purpose framing but hides max-size and header-layout
-//! semantics behind builder options; for the load-bearing protocol
-//! boundary of Forgeclaw we want those decisions to live in one
-//! reviewable place.
+//! The codec is implemented by hand (not via
+//! [`tokio_util::codec::LengthDelimitedCodec`]) so the wire contract
+//! is obvious at the call site rather than hidden in builder options.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::Serialize;
@@ -183,42 +179,48 @@ impl Decoder for FrameCodec {
     }
 }
 
-/// Encode a payload bytes slice into a typed protocol message.
+/// A minimal probe that extracts just the `type` field from a JSON
+/// object, used by the two-pass decode to structurally distinguish
+/// unknown message types from malformed known messages.
+#[derive(serde::Deserialize)]
+struct TypeProbe {
+    #[serde(rename = "type")]
+    ty: String,
+}
+
+/// Decode a frame payload into a typed protocol message.
 ///
-/// Decoding failure translates into either
-/// [`FrameError::InvalidUtf8`], [`FrameError::MalformedJson`], or
-/// [`crate::error::ProtocolError::UnknownMessageType`] depending on
-/// which layer rejected the input.
-pub(crate) fn decode_message<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, IpcError> {
+/// Uses a two-pass structural approach to classify decode failures:
+///
+/// 1. Attempt full deserialization into `T`.
+/// 2. On failure, probe the `type` field:
+///    - If the `type` value is not in `known_types`, return
+///      [`ProtocolError::UnknownMessageType`].
+///    - Otherwise (known type, bad payload), return
+///      [`FrameError::MalformedJson`].
+///
+/// This avoids depending on serde's error wording for forward
+/// compatibility.
+pub(crate) fn decode_typed_message<T: DeserializeOwned>(
+    bytes: &[u8],
+    known_types: &[&str],
+) -> Result<T, IpcError> {
     let text = std::str::from_utf8(bytes).map_err(|_| FrameError::InvalidUtf8)?;
     match serde_json::from_str::<T>(text) {
         Ok(msg) => Ok(msg),
-        Err(e) => Err(classify_decode_error(text, &e)),
-    }
-}
-
-/// Classify a serde decode error as either a malformed JSON frame or
-/// an unknown-message-type protocol error.
-///
-/// We detect the unknown-type case by re-deserializing just the
-/// `type` discriminator into a minimal helper struct; if that
-/// succeeds and produces a value that the full enum rejected, the
-/// wire shape is valid JSON with a known-unknown message type.
-fn classify_decode_error(text: &str, decode_err: &serde_json::Error) -> IpcError {
-    #[derive(serde::Deserialize)]
-    struct TypeProbe {
-        #[serde(rename = "type")]
-        ty: String,
-    }
-    if let Ok(TypeProbe { ty }) = serde_json::from_str::<TypeProbe>(text) {
-        // Only promote to UnknownMessageType when serde's error string
-        // explicitly says the variant is unknown; "missing field"
-        // errors on known types should still surface as MalformedJson.
-        if decode_err.to_string().contains("unknown variant") {
-            return IpcError::Protocol(ProtocolError::UnknownMessageType(ty));
+        Err(full_err) => {
+            // Two-pass: probe the type field structurally.
+            if let Ok(TypeProbe { ty }) = serde_json::from_str::<TypeProbe>(text) {
+                if !known_types.contains(&ty.as_str()) {
+                    return Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty)));
+                }
+            }
+            // Known type with bad payload, or no type field at all.
+            Err(IpcError::Frame(FrameError::MalformedJson(
+                full_err.to_string(),
+            )))
         }
     }
-    IpcError::Frame(FrameError::MalformedJson(decode_err.to_string()))
 }
 
 /// Serialize a protocol message to an owned [`Bytes`] buffer suitable
@@ -231,19 +233,19 @@ pub(crate) fn encode_message<T: Serialize>(msg: &T) -> Result<Bytes, IpcError> {
 
 /// Typed alias — turn a frame into a [`ContainerToHost`].
 pub(crate) fn decode_container_to_host(bytes: &[u8]) -> Result<ContainerToHost, IpcError> {
-    decode_message::<ContainerToHost>(bytes)
+    decode_typed_message::<ContainerToHost>(bytes, ContainerToHost::KNOWN_TYPES)
 }
 
 /// Typed alias — turn a frame into a [`HostToContainer`].
 pub(crate) fn decode_host_to_container(bytes: &[u8]) -> Result<HostToContainer, IpcError> {
-    decode_message::<HostToContainer>(bytes)
+    decode_typed_message::<HostToContainer>(bytes, HostToContainer::KNOWN_TYPES)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        FrameCodec, LENGTH_PREFIX_BYTES, MAX_FRAME_BYTES, classify_decode_error, decode_message,
-        encode_message,
+        FrameCodec, LENGTH_PREFIX_BYTES, MAX_FRAME_BYTES, decode_container_to_host,
+        decode_typed_message, encode_message,
     };
     use crate::error::{FrameError, IpcError, ProtocolError};
     use crate::message::{ContainerToHost, ReadyPayload};
@@ -423,40 +425,45 @@ mod tests {
     }
 
     #[test]
-    fn decode_message_rejects_non_utf8() {
-        // Invalid UTF-8 byte sequence.
+    fn decode_rejects_non_utf8() {
         let bytes = &[0xFFu8, 0xFE, 0xFD][..];
-        let err = decode_message::<ContainerToHost>(bytes).expect_err("non-UTF8 should error");
+        let err = decode_container_to_host(bytes).expect_err("non-UTF8 should error");
         assert!(matches!(err, IpcError::Frame(FrameError::InvalidUtf8)));
     }
 
     #[test]
-    fn decode_message_rejects_malformed_json() {
+    fn decode_rejects_malformed_json() {
         let bytes = b"{not json";
-        let err =
-            decode_message::<ContainerToHost>(bytes).expect_err("malformed JSON should error");
+        let err = decode_container_to_host(bytes).expect_err("malformed JSON should error");
         assert!(matches!(err, IpcError::Frame(FrameError::MalformedJson(_))));
     }
 
     #[test]
-    fn decode_message_rejects_unknown_message_type() {
+    fn decode_unknown_type_is_protocol_error() {
         let bytes = br#"{"type":"definitely_not_a_real_message"}"#;
-        let err = decode_message::<ContainerToHost>(bytes).expect_err("unknown type should error");
+        let err = decode_container_to_host(bytes).expect_err("unknown type should error");
         assert!(
             matches!(
                 &err,
                 IpcError::Protocol(ProtocolError::UnknownMessageType(n))
                     if n == "definitely_not_a_real_message"
             ),
-            "expected UnknownMessageType(\"definitely_not_a_real_message\"), got {err:?}"
+            "expected UnknownMessageType, got {err:?}"
         );
     }
 
     #[test]
-    fn decode_message_missing_field_is_malformed_not_unknown_type() {
+    fn decode_known_type_missing_field_is_malformed() {
         // "ready" is known, but the payload is missing required fields.
         let bytes = br#"{"type":"ready"}"#;
-        let err = decode_message::<ContainerToHost>(bytes).expect_err("missing field should error");
+        let err = decode_container_to_host(bytes).expect_err("missing field should error");
+        assert!(matches!(err, IpcError::Frame(FrameError::MalformedJson(_))));
+    }
+
+    #[test]
+    fn decode_no_type_field_is_malformed() {
+        let bytes = br#"{"adapter":"x"}"#;
+        let err = decode_container_to_host(bytes).expect_err("missing type should error");
         assert!(matches!(err, IpcError::Frame(FrameError::MalformedJson(_))));
     }
 
@@ -468,19 +475,21 @@ mod tests {
             protocol_version: "1.0".to_owned(),
         });
         let bytes = encode_message(&msg).expect("encode");
-        let back: ContainerToHost = decode_message(&bytes).expect("decode");
+        let back = decode_container_to_host(&bytes).expect("decode");
         assert_eq!(back, msg);
     }
 
     #[test]
-    fn classify_decode_error_chooses_malformed_when_no_type_field() {
-        // No `type` field at all — classify as MalformedJson.
-        let text = r#"{"adapter":"x"}"#;
-        let err = serde_json::from_str::<ContainerToHost>(text).expect_err("should fail");
-        let classified = classify_decode_error(text, &err);
-        assert!(matches!(
-            classified,
-            IpcError::Frame(FrameError::MalformedJson(_))
-        ));
+    fn two_pass_uses_known_types_not_serde_wording() {
+        // Verify structural detection: type "ready" is known, so a
+        // missing field classifies as MalformedJson not UnknownMessageType,
+        // regardless of serde's error message wording.
+        let bytes = br#"{"type":"ready"}"#;
+        let err = decode_typed_message::<ContainerToHost>(bytes, ContainerToHost::KNOWN_TYPES)
+            .expect_err("should error");
+        assert!(
+            matches!(err, IpcError::Frame(FrameError::MalformedJson(_))),
+            "known type with bad payload should be MalformedJson, got {err:?}"
+        );
     }
 }

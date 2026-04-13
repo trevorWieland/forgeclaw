@@ -12,6 +12,40 @@
 use forgeclaw_core::{GroupId, TaskId};
 use serde::{Deserialize, Serialize};
 
+/// The type of schedule for a scheduled task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleType {
+    /// Cron expression schedule.
+    Cron,
+    /// Fixed-interval schedule.
+    Interval,
+    /// Single execution at a specific time.
+    Once,
+}
+
+/// Tanren execution phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TanrenPhase {
+    /// Execute the primary task.
+    DoTask,
+    /// Run gate checks (tests, lints).
+    Gate,
+    /// Perform a code audit.
+    Audit,
+}
+
+/// Branch strategy for self-improvement dispatches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchPolicy {
+    /// Create a new branch for the work.
+    Create,
+    /// Reuse an existing branch.
+    Reuse,
+}
+
 /// Send a chat message to a group.
 ///
 /// Authorization: main agent may target any group; non-main agents
@@ -32,8 +66,8 @@ pub struct SendMessagePayload {
 pub struct ScheduleTaskPayload {
     /// Group to schedule the task for.
     pub group: GroupId,
-    /// Schedule type (e.g. `"cron"`, `"interval"`, `"once"`).
-    pub schedule_type: String,
+    /// Schedule type.
+    pub schedule_type: ScheduleType,
     /// Schedule value (cron expression, duration, or timestamp).
     pub schedule_value: String,
     /// The prompt to execute on each run.
@@ -86,8 +120,8 @@ pub struct DispatchTanrenPayload {
     pub project: String,
     /// Git branch to work on.
     pub branch: String,
-    /// Tanren phase (e.g. `"do-task"`, `"gate"`, `"audit"`).
-    pub phase: String,
+    /// Tanren execution phase.
+    pub phase: TanrenPhase,
     /// Prompt / instructions for the dispatch.
     pub prompt: String,
     /// Optional environment profile override.
@@ -106,8 +140,8 @@ pub struct DispatchSelfImprovementPayload {
     pub scope: String,
     /// Acceptance tests that must pass for the improvement to land.
     pub acceptance_tests: String,
-    /// Branch policy (e.g. `"create"`, `"reuse"`).
-    pub branch_policy: String,
+    /// Branch strategy for this improvement.
+    pub branch_policy: BranchPolicy,
 }
 
 /// The set of commands an agent may issue to the host.
@@ -174,7 +208,7 @@ mod tests {
         let cmd = CommandPayload {
             body: CommandBody::ScheduleTask(ScheduleTaskPayload {
                 group: GroupId::from("group-main"),
-                schedule_type: "cron".to_owned(),
+                schedule_type: ScheduleType::Cron,
                 schedule_value: "0 9 * * *".to_owned(),
                 prompt: "Check status".to_owned(),
                 context_mode: Some("full".to_owned()),
@@ -182,6 +216,7 @@ mod tests {
         };
         let json = serde_json::to_value(&cmd).expect("serialize");
         assert_eq!(json["command"], "schedule_task");
+        assert_eq!(json["payload"]["schedule_type"], "cron");
         let back: CommandPayload = serde_json::from_value(json).expect("deserialize");
         assert_eq!(back, cmd);
     }
@@ -191,7 +226,7 @@ mod tests {
         let cmd = CommandPayload {
             body: CommandBody::ScheduleTask(ScheduleTaskPayload {
                 group: GroupId::from("g"),
-                schedule_type: "once".to_owned(),
+                schedule_type: ScheduleType::Once,
                 schedule_value: "2026-04-12T00:00:00Z".to_owned(),
                 prompt: "p".to_owned(),
                 context_mode: None,
@@ -250,13 +285,14 @@ mod tests {
             body: CommandBody::DispatchTanren(DispatchTanrenPayload {
                 project: "forgeclaw".to_owned(),
                 branch: "main".to_owned(),
-                phase: "do-task".to_owned(),
+                phase: TanrenPhase::DoTask,
                 prompt: "Implement feature X".to_owned(),
                 environment_profile: Some("large-vm".to_owned()),
             }),
         };
         let json = serde_json::to_value(&cmd).expect("serialize");
         assert_eq!(json["command"], "dispatch_tanren");
+        assert_eq!(json["payload"]["phase"], "do-task");
         let back: CommandPayload = serde_json::from_value(json).expect("deserialize");
         assert_eq!(back, cmd);
     }
@@ -268,7 +304,7 @@ mod tests {
                 objective: "Add retry logic".to_owned(),
                 scope: "crates/ipc".to_owned(),
                 acceptance_tests: "cargo nextest run -p forgeclaw-ipc".to_owned(),
-                branch_policy: "create".to_owned(),
+                branch_policy: BranchPolicy::Create,
             }),
         };
         let json = serde_json::to_value(&cmd).expect("serialize");
