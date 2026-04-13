@@ -295,20 +295,29 @@ impl IpcConnection {
     /// Split into independent read and write halves for full-duplex
     /// operation. Use after handshake.
     ///
-    /// A fatal error on either half poisons both via a shared flag.
+    /// Any bytes already buffered by the internal `Framed` reader
+    /// (e.g. pipelined by the peer during handshake) are preserved in
+    /// the returned reader half. A fatal error on either half poisons
+    /// both and shuts down the transport.
     pub fn into_split(self) -> (IpcConnectionWriter, IpcConnectionReader) {
         let poisoned = Arc::new(AtomicBool::new(self.poisoned));
         let parts = self.framed.into_parts();
         let (read_half, write_half) = parts.io.into_split();
+        let mut reader = FramedRead::new(read_half, FrameCodec::new());
+        // Preserve any bytes the Framed reader already buffered.
+        if !parts.read_buf.is_empty() {
+            *reader.read_buffer_mut() = parts.read_buf;
+        }
+        let mut writer = FramedWrite::new(write_half, FrameCodec::new());
+        if !parts.write_buf.is_empty() {
+            *writer.write_buffer_mut() = parts.write_buf;
+        }
         (
             IpcConnectionWriter {
-                writer: FramedWrite::new(write_half, FrameCodec::new()),
+                writer,
                 poisoned: Arc::clone(&poisoned),
             },
-            IpcConnectionReader {
-                reader: FramedRead::new(read_half, FrameCodec::new()),
-                poisoned,
-            },
+            IpcConnectionReader { reader, poisoned },
         )
     }
 
@@ -330,6 +339,8 @@ impl IpcConnectionWriter {
     /// Send a [`HostToContainer`] message.
     pub async fn send_host(&mut self, msg: &HostToContainer) -> Result<(), IpcError> {
         if self.poisoned.load(Ordering::Acquire) {
+            // Peer-visible: shut down write side so peer's read sees EOF.
+            let _ = self.writer.get_mut().shutdown().await;
             return Err(IpcError::Closed);
         }
         let bytes: Bytes = encode_message(msg)?;
@@ -337,6 +348,7 @@ impl IpcConnectionWriter {
         if let Err(ref e) = result {
             if e.is_fatal() {
                 self.poisoned.store(true, Ordering::Release);
+                let _ = self.writer.get_mut().shutdown().await;
             }
         }
         result

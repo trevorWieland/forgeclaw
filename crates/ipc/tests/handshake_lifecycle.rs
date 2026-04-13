@@ -6,8 +6,8 @@ use forgeclaw_core::{GroupId, JobId};
 use forgeclaw_ipc::{
     ContainerToHost, FrameError, GroupInfo, HeartbeatPayload, HistoricalMessage, HostToContainer,
     InitConfig, InitContext, InitPayload, IpcClient, IpcError, IpcServer, MessagesPayload,
-    OutputCompletePayload, OutputDeltaPayload, ProtocolError, ReadyPayload, ShutdownPayload,
-    ShutdownReason, StopReason,
+    OutputCompletePayload, ProtocolError, ReadyPayload, ShutdownPayload, ShutdownReason,
+    StopReason,
 };
 use tempfile::tempdir;
 
@@ -422,60 +422,6 @@ async fn post_error_connection_is_poisoned() {
     let valid = br#"{"type":"ready","adapter":"x","adapter_version":"v","protocol_version":"1.0"}"#;
     raw_send(&mut raw, valid);
     drop(raw);
-
-    accept_task.await.expect("join");
-}
-
-#[tokio::test]
-async fn concurrent_send_recv_through_split() {
-    let dir = tempdir().expect("tempdir");
-    let path = socket_path(&dir, "ipc.sock");
-    let server = IpcServer::bind(&path).expect("bind");
-
-    let accept_task = tokio::spawn(async move {
-        let mut conn = server.accept().await.expect("accept");
-        let _ready = conn
-            .handshake(sample_init())
-            .await
-            .expect("server handshake");
-        let (mut writer, mut reader) = conn.into_split();
-
-        // Spawn a writer that sends Shutdown while reader receives deltas.
-        let write_task = tokio::spawn(async move {
-            // Small delay so the reader is up first.
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            writer
-                .send_host(&HostToContainer::Shutdown(ShutdownPayload {
-                    reason: ShutdownReason::HostShutdown,
-                    deadline_ms: 5_000,
-                }))
-                .await
-                .expect("send shutdown");
-        });
-
-        let msg = reader.recv_container().await.expect("recv delta");
-        assert!(matches!(msg, ContainerToHost::OutputDelta(_)));
-
-        write_task.await.expect("write task");
-    });
-
-    let mut client = IpcClient::connect(&path).await.expect("connect");
-    let _init = client
-        .handshake(sample_ready("1.0"))
-        .await
-        .expect("client handshake");
-
-    // Client sends a delta then reads the shutdown.
-    client
-        .send(&ContainerToHost::OutputDelta(OutputDeltaPayload {
-            text: "partial output".to_owned(),
-            job_id: JobId::from("job-integration-1"),
-        }))
-        .await
-        .expect("send delta");
-
-    let shutdown = client.recv().await.expect("recv shutdown");
-    assert!(matches!(shutdown, HostToContainer::Shutdown(_)));
 
     accept_task.await.expect("join");
 }

@@ -131,19 +131,27 @@ impl IpcClient {
     }
 
     /// Split into independent read and write halves for full-duplex.
+    ///
+    /// Any bytes already buffered by the internal `Framed` reader
+    /// are preserved in the returned reader half.
     pub fn into_split(self) -> (IpcClientWriter, IpcClientReader) {
         let poisoned = Arc::new(AtomicBool::new(self.poisoned));
         let parts = self.framed.into_parts();
         let (read_half, write_half) = parts.io.into_split();
+        let mut reader = FramedRead::new(read_half, FrameCodec::new());
+        if !parts.read_buf.is_empty() {
+            *reader.read_buffer_mut() = parts.read_buf;
+        }
+        let mut writer = FramedWrite::new(write_half, FrameCodec::new());
+        if !parts.write_buf.is_empty() {
+            *writer.write_buffer_mut() = parts.write_buf;
+        }
         (
             IpcClientWriter {
-                writer: FramedWrite::new(write_half, FrameCodec::new()),
+                writer,
                 poisoned: Arc::clone(&poisoned),
             },
-            IpcClientReader {
-                reader: FramedRead::new(read_half, FrameCodec::new()),
-                poisoned,
-            },
+            IpcClientReader { reader, poisoned },
         )
     }
 
@@ -165,6 +173,7 @@ impl IpcClientWriter {
     /// Send a [`ContainerToHost`] message.
     pub async fn send(&mut self, msg: &ContainerToHost) -> Result<(), IpcError> {
         if self.poisoned.load(Ordering::Acquire) {
+            let _ = self.writer.get_mut().shutdown().await;
             return Err(IpcError::Closed);
         }
         let bytes: Bytes = encode_message(msg)?;
@@ -172,6 +181,7 @@ impl IpcClientWriter {
         if let Err(ref e) = result {
             if e.is_fatal() {
                 self.poisoned.store(true, Ordering::Release);
+                let _ = self.writer.get_mut().shutdown().await;
             }
         }
         result
