@@ -94,7 +94,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # TOML parsing
-toml = "0.8"
+toml = "1.1"
 
 # Database (SeaORM — dialect-agnostic async ORM built on sqlx)
 sea-orm = { version = "1.1", default-features = false, features = [
