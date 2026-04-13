@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use forgeclaw_core::{GroupId, JobId};
 use forgeclaw_ipc::{
     ContainerToHost, GroupInfo, HostToContainer, InitConfig, InitContext, InitPayload, IpcClient,
-    IpcError, IpcServer, OutputDeltaPayload, ReadyPayload, ShutdownPayload, ShutdownReason,
+    IpcServer, OutputDeltaPayload, ReadyPayload, ShutdownPayload, ShutdownReason,
 };
 use tempfile::tempdir;
 
@@ -148,32 +148,29 @@ async fn split_preserves_pipelined_buffered_bytes() {
 }
 
 #[tokio::test]
-async fn split_writer_shuts_down_transport_when_poisoned() {
+async fn split_reader_error_immediately_closes_transport() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let dir = tempdir().expect("tempdir");
     let path = socket_path(&dir, "ipc.sock");
     let server = IpcServer::bind(&path).expect("bind");
 
+    // The key assertion: the reader's fatal error shuts down the
+    // write half *directly* — without the writer ever running again.
+    // The writer is held but never called.
     let accept_task = tokio::spawn(async move {
         let mut conn = server.accept().await.expect("accept");
         let _ready = conn
             .handshake(sample_init())
             .await
             .expect("server handshake");
-        let (mut writer, mut reader) = conn.into_split();
+        let (_writer, mut reader) = conn.into_split();
+        // Reader gets invalid UTF-8 → triggers shutdown via handle.
         let err = reader.recv_container().await;
         assert!(err.is_err(), "invalid frame should error");
-        let write_err = writer
-            .send_host(&HostToContainer::Shutdown(ShutdownPayload {
-                reason: ShutdownReason::HostShutdown,
-                deadline_ms: 1000,
-            }))
-            .await;
-        assert!(
-            matches!(write_err, Err(IpcError::Closed)),
-            "poisoned writer should return Closed, got {write_err:?}"
-        );
+        // Keep _writer alive but never call send_host(). The peer
+        // should still see EOF because the reader shut down the
+        // shared write half directly.
     });
 
     let mut raw = tokio::net::UnixStream::connect(&path)
@@ -190,16 +187,16 @@ async fn split_writer_shuts_down_transport_when_poisoned() {
     let init_len = u32::from_be_bytes(len_buf) as usize;
     let mut init_buf = vec![0u8; init_len];
     raw.read_exact(&mut init_buf).await.expect("read init");
-    // Send invalid UTF-8 frame.
+    // Send invalid UTF-8 frame to trigger fatal read error.
     let bad: &[u8] = &[0xFF, 0xFE, 0xFD];
     let bad_len = u32::try_from(bad.len()).expect("fits");
     raw.write_all(&bad_len.to_be_bytes()).await.expect("w");
     raw.write_all(bad).await.expect("w");
     raw.flush().await.expect("flush");
-    // Peer should see EOF after server shuts down write side.
+    // Peer sees EOF immediately — no waiting for writer.
     let mut buf = [0u8; 1];
     let n = raw.read(&mut buf).await.expect("read");
-    assert_eq!(n, 0, "peer should see EOF after server shuts down");
+    assert_eq!(n, 0, "peer should see EOF after reader error");
 
     accept_task.await.expect("join");
 }

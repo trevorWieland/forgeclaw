@@ -25,7 +25,7 @@ use tokio_util::codec::{Framed, FramedRead, FramedWrite};
 use crate::codec::{FrameCodec, decode_host_to_container, encode_message};
 use crate::error::{IpcError, ProtocolError};
 use crate::message::{ContainerToHost, HostToContainer, InitPayload, ReadyPayload};
-use crate::util::truncate_for_log;
+use crate::util::{SharedWriteHalf, ShutdownHandle, truncate_for_log};
 
 /// Container-side IPC client.
 ///
@@ -138,20 +138,25 @@ impl IpcClient {
         let poisoned = Arc::new(AtomicBool::new(self.poisoned));
         let parts = self.framed.into_parts();
         let (read_half, write_half) = parts.io.into_split();
+        let (shared_write, shutdown_handle) = SharedWriteHalf::new(write_half);
+        let mut writer = FramedWrite::new(shared_write, FrameCodec::new());
+        if !parts.write_buf.is_empty() {
+            *writer.write_buffer_mut() = parts.write_buf;
+        }
         let mut reader = FramedRead::new(read_half, FrameCodec::new());
         if !parts.read_buf.is_empty() {
             *reader.read_buffer_mut() = parts.read_buf;
-        }
-        let mut writer = FramedWrite::new(write_half, FrameCodec::new());
-        if !parts.write_buf.is_empty() {
-            *writer.write_buffer_mut() = parts.write_buf;
         }
         (
             IpcClientWriter {
                 writer,
                 poisoned: Arc::clone(&poisoned),
             },
-            IpcClientReader { reader, poisoned },
+            IpcClientReader {
+                reader,
+                poisoned,
+                shutdown_handle,
+            },
         )
     }
 
@@ -165,7 +170,7 @@ impl IpcClient {
 /// Write half of a split [`IpcClient`].
 #[derive(Debug)]
 pub struct IpcClientWriter {
-    writer: FramedWrite<tokio::net::unix::OwnedWriteHalf, FrameCodec>,
+    writer: FramedWrite<SharedWriteHalf<tokio::net::unix::OwnedWriteHalf>, FrameCodec>,
     poisoned: Arc<AtomicBool>,
 }
 
@@ -173,7 +178,6 @@ impl IpcClientWriter {
     /// Send a [`ContainerToHost`] message.
     pub async fn send(&mut self, msg: &ContainerToHost) -> Result<(), IpcError> {
         if self.poisoned.load(Ordering::Acquire) {
-            let _ = self.writer.get_mut().shutdown().await;
             return Err(IpcError::Closed);
         }
         let bytes: Bytes = encode_message(msg)?;
@@ -181,7 +185,6 @@ impl IpcClientWriter {
         if let Err(ref e) = result {
             if e.is_fatal() {
                 self.poisoned.store(true, Ordering::Release);
-                let _ = self.writer.get_mut().shutdown().await;
             }
         }
         result
@@ -189,13 +192,22 @@ impl IpcClientWriter {
 }
 
 /// Read half of a split [`IpcClient`].
+///
+/// On fatal errors the reader immediately shuts down the shared write
+/// half so the peer observes EOF without waiting for the writer task.
 #[derive(Debug)]
 pub struct IpcClientReader {
     reader: FramedRead<tokio::net::unix::OwnedReadHalf, FrameCodec>,
     poisoned: Arc<AtomicBool>,
+    shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
 }
 
 impl IpcClientReader {
+    async fn poison(&mut self) {
+        self.poisoned.store(true, Ordering::Release);
+        self.shutdown_handle.trigger().await;
+    }
+
     /// Receive a [`HostToContainer`] message.
     pub async fn recv(&mut self) -> Result<HostToContainer, IpcError> {
         if self.poisoned.load(Ordering::Acquire) {
@@ -204,18 +216,18 @@ impl IpcClientReader {
         let frame = match self.reader.next().await.transpose() {
             Ok(Some(f)) => f,
             Ok(None) => {
-                self.poisoned.store(true, Ordering::Release);
+                self.poison().await;
                 return Err(IpcError::Closed);
             }
             Err(e) => {
-                self.poisoned.store(true, Ordering::Release);
+                self.poison().await;
                 return Err(e);
             }
         };
         let result = decode_host_to_container(&frame);
         if let Err(ref e) = result {
             if e.is_fatal() {
-                self.poisoned.store(true, Ordering::Release);
+                self.poison().await;
             }
         }
         result

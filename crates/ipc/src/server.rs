@@ -24,7 +24,7 @@ use tokio_util::codec::{Framed, FramedRead, FramedWrite};
 use crate::codec::{FrameCodec, decode_container_to_host, encode_message};
 use crate::error::{IpcError, ProtocolError};
 use crate::message::{ContainerToHost, HostToContainer, InitPayload, ReadyPayload};
-use crate::util::truncate_for_log;
+use crate::util::{SharedWriteHalf, ShutdownHandle, truncate_for_log};
 use crate::version::{PROTOCOL_VERSION, is_compatible};
 
 /// Unix-socket server for the host side of the IPC protocol.
@@ -303,21 +303,26 @@ impl IpcConnection {
         let poisoned = Arc::new(AtomicBool::new(self.poisoned));
         let parts = self.framed.into_parts();
         let (read_half, write_half) = parts.io.into_split();
-        let mut reader = FramedRead::new(read_half, FrameCodec::new());
-        // Preserve any bytes the Framed reader already buffered.
-        if !parts.read_buf.is_empty() {
-            *reader.read_buffer_mut() = parts.read_buf;
-        }
-        let mut writer = FramedWrite::new(write_half, FrameCodec::new());
+        // Wrap write half so the reader can shut it down directly.
+        let (shared_write, shutdown_handle) = SharedWriteHalf::new(write_half);
+        let mut writer = FramedWrite::new(shared_write, FrameCodec::new());
         if !parts.write_buf.is_empty() {
             *writer.write_buffer_mut() = parts.write_buf;
+        }
+        let mut reader = FramedRead::new(read_half, FrameCodec::new());
+        if !parts.read_buf.is_empty() {
+            *reader.read_buffer_mut() = parts.read_buf;
         }
         (
             IpcConnectionWriter {
                 writer,
                 poisoned: Arc::clone(&poisoned),
             },
-            IpcConnectionReader { reader, poisoned },
+            IpcConnectionReader {
+                reader,
+                poisoned,
+                shutdown_handle,
+            },
         )
     }
 
@@ -331,7 +336,7 @@ impl IpcConnection {
 /// Write half of a split [`IpcConnection`].
 #[derive(Debug)]
 pub struct IpcConnectionWriter {
-    writer: FramedWrite<tokio::net::unix::OwnedWriteHalf, FrameCodec>,
+    writer: FramedWrite<SharedWriteHalf<tokio::net::unix::OwnedWriteHalf>, FrameCodec>,
     poisoned: Arc<AtomicBool>,
 }
 
@@ -339,8 +344,6 @@ impl IpcConnectionWriter {
     /// Send a [`HostToContainer`] message.
     pub async fn send_host(&mut self, msg: &HostToContainer) -> Result<(), IpcError> {
         if self.poisoned.load(Ordering::Acquire) {
-            // Peer-visible: shut down write side so peer's read sees EOF.
-            let _ = self.writer.get_mut().shutdown().await;
             return Err(IpcError::Closed);
         }
         let bytes: Bytes = encode_message(msg)?;
@@ -348,7 +351,6 @@ impl IpcConnectionWriter {
         if let Err(ref e) = result {
             if e.is_fatal() {
                 self.poisoned.store(true, Ordering::Release);
-                let _ = self.writer.get_mut().shutdown().await;
             }
         }
         result
@@ -356,13 +358,23 @@ impl IpcConnectionWriter {
 }
 
 /// Read half of a split [`IpcConnection`].
+///
+/// On fatal errors the reader immediately shuts down the shared write
+/// half so the peer observes EOF without waiting for the writer task.
 #[derive(Debug)]
 pub struct IpcConnectionReader {
     reader: FramedRead<tokio::net::unix::OwnedReadHalf, FrameCodec>,
     poisoned: Arc<AtomicBool>,
+    shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
 }
 
 impl IpcConnectionReader {
+    /// Poison the connection and shut down the write half immediately.
+    async fn poison(&mut self) {
+        self.poisoned.store(true, Ordering::Release);
+        self.shutdown_handle.trigger().await;
+    }
+
     /// Receive a [`ContainerToHost`] message.
     pub async fn recv_container(&mut self) -> Result<ContainerToHost, IpcError> {
         if self.poisoned.load(Ordering::Acquire) {
@@ -371,18 +383,18 @@ impl IpcConnectionReader {
         let frame = match self.reader.next().await.transpose() {
             Ok(Some(f)) => f,
             Ok(None) => {
-                self.poisoned.store(true, Ordering::Release);
+                self.poison().await;
                 return Err(IpcError::Closed);
             }
             Err(e) => {
-                self.poisoned.store(true, Ordering::Release);
+                self.poison().await;
                 return Err(e);
             }
         };
         let result = decode_container_to_host(&frame);
         if let Err(ref e) = result {
             if e.is_fatal() {
-                self.poisoned.store(true, Ordering::Release);
+                self.poison().await;
             }
         }
         result
