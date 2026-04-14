@@ -18,6 +18,7 @@ use crate::codec::{
 };
 use crate::error::{IpcError, ProtocolError};
 use crate::message::{ContainerToHost, HostToContainer, InitPayload, ReadyPayload};
+use crate::policy::{DEFAULT_MAX_UNKNOWN_BYTES, UnknownFrameBudget};
 use crate::util::truncate_for_log;
 
 use super::IpcClient;
@@ -31,7 +32,8 @@ use super::IpcClient;
 pub struct PendingClient {
     framed: Framed<UnixStream, FrameCodec>,
     poisoned: bool,
-    unknown_skip_count: usize,
+    unknown_budget: UnknownFrameBudget,
+    last_frame_len: usize,
 }
 
 impl PendingClient {
@@ -39,7 +41,8 @@ impl PendingClient {
         Self {
             framed: Framed::new(stream, FrameCodec::new()),
             poisoned: false,
-            unknown_skip_count: 0,
+            unknown_budget: UnknownFrameBudget::default(),
+            last_frame_len: 0,
         }
     }
 
@@ -132,6 +135,7 @@ impl PendingClient {
                 return Err(e);
             }
         };
+        self.last_frame_len = frame.len();
         let result = decode_host_to_container(&frame);
         if let Err(ref e) = result {
             if e.is_fatal() {
@@ -145,23 +149,21 @@ impl PendingClient {
         loop {
             match self.recv_strict().await {
                 Ok(msg) => {
-                    self.unknown_skip_count = 0;
+                    self.unknown_budget.reset();
                     return Ok(msg);
                 }
                 Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
-                    self.unknown_skip_count += 1;
-                    if self.unknown_skip_count > DEFAULT_MAX_UNKNOWN_SKIPS {
-                        let err = IpcError::Protocol(ProtocolError::TooManyUnknownMessages {
-                            count: self.unknown_skip_count,
-                            limit: DEFAULT_MAX_UNKNOWN_SKIPS,
-                        });
+                    if let Err(err) = self.unknown_budget.on_unknown(self.last_frame_len) {
                         self.poison().await;
                         return Err(err);
                     }
                     tracing::warn!(
                         target: "forgeclaw_ipc::client",
                         message_type = %truncate_for_log(&ty),
-                        skip_count = self.unknown_skip_count,
+                        skip_count = self.unknown_budget.count(),
+                        skip_count_limit = DEFAULT_MAX_UNKNOWN_SKIPS,
+                        skip_bytes = self.unknown_budget.bytes(),
+                        skip_bytes_limit = DEFAULT_MAX_UNKNOWN_BYTES,
                         "ignoring unknown message type (forward compatibility)"
                     );
                 }

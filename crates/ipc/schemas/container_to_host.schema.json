@@ -428,7 +428,10 @@
         },
         "result": {
           "description": "Final text output. `None` for tools-only turns.\n\nRequired on the wire even when `null` — adapters must not omit\nthis key. See `docs/IPC_PROTOCOL.md` §`output_complete`.",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "session_id": {
           "description": "Adapter-specific session identifier for resume.",

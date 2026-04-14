@@ -9,7 +9,7 @@ use std::time::Duration;
 use forgeclaw_core::{GroupId, JobId};
 use forgeclaw_ipc::{
     ContainerToHost, FrameError, GroupCapabilities, GroupInfo, InitConfig, InitContext,
-    InitPayload, IpcClient, IpcError, IpcServer, ReadyPayload,
+    InitPayload, IpcClient, IpcError, IpcServer, ProtocolError, ReadyPayload,
 };
 use tempfile::tempdir;
 
@@ -146,6 +146,51 @@ async fn unknown_type_skipped_during_handshake() {
 
     let (_conn, ready) = accept_task.await.expect("join").expect("handshake ok");
     assert_eq!(ready.adapter, "test-adapter");
+}
+
+#[tokio::test]
+async fn unknown_type_byte_budget_enforced_during_handshake() {
+    use tokio::io::AsyncWriteExt;
+
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ipc-budget.sock");
+    let server = IpcServer::bind(&path).expect("bind");
+
+    let accept_task = tokio::spawn(async move {
+        let pending = server.accept(sample_group()).await.expect("accept");
+        pending.handshake(sample_init(), HS_TIMEOUT).await
+    });
+
+    let mut raw = tokio::net::UnixStream::connect(&path)
+        .await
+        .expect("raw connect");
+
+    // Single unknown frame > 1 MiB (but < max frame) should fail the
+    // cumulative unknown-byte budget.
+    let mut payload = vec![b' '; 1_049_000];
+    let prefix = br#"{"type":"experimental_large","data":"#;
+    payload[..prefix.len()].copy_from_slice(prefix);
+    let suffix = br#""}"#;
+    let suffix_start = payload.len() - suffix.len();
+    payload[suffix_start..].copy_from_slice(suffix);
+
+    let len = u32::try_from(payload.len()).expect("fits");
+    raw.write_all(&len.to_be_bytes()).await.expect("write len");
+    raw.write_all(&payload).await.expect("write payload");
+    raw.flush().await.expect("flush");
+    drop(raw);
+
+    let err = accept_task
+        .await
+        .expect("join")
+        .expect_err("handshake should fail");
+    assert!(
+        matches!(
+            err,
+            IpcError::Protocol(ProtocolError::TooManyUnknownBytes { .. })
+        ),
+        "expected TooManyUnknownBytes, got {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -307,4 +352,90 @@ async fn default_recv_container_skips_unknown_types() {
         ),
         "expected Ready, got something else"
     );
+}
+
+#[tokio::test]
+async fn unknown_budget_resets_after_recognized_message() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ipc-reset.sock");
+    let server = IpcServer::bind(&path).expect("bind");
+
+    let accept_task = tokio::spawn(async move {
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (mut conn, _ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
+            .await
+            .expect("handshake");
+        let first = conn.recv_container().await.expect("first known message");
+        let second = conn.recv_container().await.expect("second known message");
+        (first, second)
+    });
+
+    let mut raw = tokio::net::UnixStream::connect(&path)
+        .await
+        .expect("raw connect");
+
+    // Handshake ready.
+    let ready_json =
+        serde_json::to_vec(&ContainerToHost::Ready(sample_ready("1.0"))).expect("serialize");
+    let ready_len = u32::try_from(ready_json.len()).expect("fits");
+    raw.write_all(&ready_len.to_be_bytes()).await.expect("w");
+    raw.write_all(&ready_json).await.expect("w");
+    raw.flush().await.expect("flush");
+
+    // Drain init from server.
+    let mut init_len = [0u8; 4];
+    raw.read_exact(&mut init_len).await.expect("read init len");
+    let payload_len = u32::from_be_bytes(init_len) as usize;
+    let mut init_payload = vec![0u8; payload_len];
+    raw.read_exact(&mut init_payload)
+        .await
+        .expect("read init payload");
+
+    // 1 unknown frame.
+    let unknown = br#"{"type":"experimental_pre","x":1}"#;
+    let unknown_len = u32::try_from(unknown.len()).expect("fits");
+    raw.write_all(&unknown_len.to_be_bytes()).await.expect("w");
+    raw.write_all(unknown).await.expect("w");
+
+    // Known message resets unknown budget.
+    let delta = serde_json::to_vec(&ContainerToHost::OutputDelta(
+        forgeclaw_ipc::OutputDeltaPayload {
+            text: "delta".to_owned(),
+            job_id: JobId::from("job-integration-1"),
+        },
+    ))
+    .expect("serialize");
+    let delta_len = u32::try_from(delta.len()).expect("fits");
+    raw.write_all(&delta_len.to_be_bytes()).await.expect("w");
+    raw.write_all(&delta).await.expect("w");
+
+    // Send exactly 32 unknown frames (count limit), then a known complete.
+    for i in 0..32 {
+        let msg = format!(r#"{{"type":"experimental_post_{i}","x":1}}"#);
+        let len = u32::try_from(msg.len()).expect("fits");
+        raw.write_all(&len.to_be_bytes()).await.expect("w");
+        raw.write_all(msg.as_bytes()).await.expect("w");
+    }
+    let complete = serde_json::to_vec(&ContainerToHost::OutputComplete(
+        forgeclaw_ipc::OutputCompletePayload {
+            job_id: JobId::from("job-integration-1"),
+            result: Some("done".to_owned()),
+            session_id: None,
+            token_usage: None,
+            stop_reason: forgeclaw_ipc::StopReason::EndTurn,
+        },
+    ))
+    .expect("serialize");
+    let complete_len = u32::try_from(complete.len()).expect("fits");
+    raw.write_all(&complete_len.to_be_bytes()).await.expect("w");
+    raw.write_all(&complete).await.expect("w");
+    raw.flush().await.expect("flush");
+    drop(raw);
+
+    let (first, second) = accept_task.await.expect("join");
+    assert!(matches!(first, ContainerToHost::OutputDelta(_)));
+    assert!(matches!(second, ContainerToHost::OutputComplete(_)));
 }

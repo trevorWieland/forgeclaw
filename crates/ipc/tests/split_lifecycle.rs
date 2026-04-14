@@ -7,8 +7,8 @@ use std::time::Duration;
 use forgeclaw_core::{GroupId, JobId};
 use forgeclaw_ipc::{
     ContainerToHost, GroupCapabilities, GroupInfo, HostToContainer, InitConfig, InitContext,
-    InitPayload, IpcClient, IpcServer, OutputDeltaPayload, ReadyPayload, ShutdownPayload,
-    ShutdownReason,
+    InitPayload, IpcClient, IpcError, IpcServer, MessagesPayload, OutputCompletePayload,
+    OutputDeltaPayload, ProtocolError, ReadyPayload, ShutdownPayload, ShutdownReason, StopReason,
 };
 use tempfile::tempdir;
 
@@ -213,4 +213,163 @@ async fn split_reader_error_immediately_closes_transport() {
     assert_eq!(n, 0, "peer should see EOF after reader error");
 
     accept_task.await.expect("join");
+}
+
+#[tokio::test]
+async fn split_reader_rejects_output_delta_after_idle() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ipc-split-lifecycle-idle.sock");
+    let server = IpcServer::bind(&path).expect("bind");
+
+    let accept_task = tokio::spawn(async move {
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (conn, _ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
+            .await
+            .expect("server handshake");
+        let (_writer, mut reader) = conn.into_split();
+        let first = reader.recv_container().await.expect("first message");
+        assert!(matches!(first, ContainerToHost::OutputComplete(_)));
+        reader
+            .recv_container()
+            .await
+            .expect_err("late delta should fail")
+    });
+
+    let pending_client = IpcClient::connect(&path).await.expect("connect");
+    let (mut client, _init) = pending_client
+        .handshake(sample_ready("1.0"), HS_TIMEOUT)
+        .await
+        .expect("client handshake");
+    client
+        .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
+            job_id: JobId::from("job-integration-1"),
+            result: None,
+            session_id: None,
+            token_usage: None,
+            stop_reason: StopReason::EndTurn,
+        }))
+        .await
+        .expect("send complete");
+    client
+        .send(&ContainerToHost::OutputDelta(OutputDeltaPayload {
+            text: "late".to_owned(),
+            job_id: JobId::from("job-integration-1"),
+        }))
+        .await
+        .expect("send late delta");
+
+    let err = accept_task.await.expect("join");
+    assert!(
+        matches!(
+            err,
+            IpcError::Protocol(ProtocolError::LifecycleViolation { .. })
+        ),
+        "expected lifecycle violation, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn split_writer_rejects_messages_after_shutdown() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ipc-split-lifecycle-shutdown.sock");
+    let server = IpcServer::bind(&path).expect("bind");
+
+    let accept_task = tokio::spawn(async move {
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (conn, _ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
+            .await
+            .expect("server handshake");
+        let (mut writer, _reader) = conn.into_split();
+        writer
+            .send_host(&HostToContainer::Shutdown(ShutdownPayload {
+                reason: ShutdownReason::HostShutdown,
+                deadline_ms: 5_000,
+            }))
+            .await
+            .expect("shutdown allowed");
+        writer
+            .send_host(&HostToContainer::Messages(MessagesPayload {
+                job_id: JobId::from("job-integration-1"),
+                messages: vec![],
+            }))
+            .await
+            .expect_err("messages after shutdown should fail")
+    });
+
+    let pending_client = IpcClient::connect(&path).await.expect("connect");
+    let (mut client, _init) = pending_client
+        .handshake(sample_ready("1.0"), HS_TIMEOUT)
+        .await
+        .expect("client handshake");
+    let received = client.recv().await.expect("recv shutdown");
+    assert!(matches!(received, HostToContainer::Shutdown(_)));
+
+    let err = accept_task.await.expect("join");
+    assert!(
+        matches!(
+            err,
+            IpcError::Protocol(ProtocolError::LifecycleViolation { .. })
+        ),
+        "expected lifecycle violation, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn split_reader_rejects_repeated_output_complete_while_draining() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ipc-split-lifecycle-draining-complete.sock");
+    let server = IpcServer::bind(&path).expect("bind");
+
+    let accept_task = tokio::spawn(async move {
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (conn, _ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
+            .await
+            .expect("server handshake");
+        let (mut writer, mut reader) = conn.into_split();
+        writer
+            .send_host(&HostToContainer::Shutdown(ShutdownPayload {
+                reason: ShutdownReason::HostShutdown,
+                deadline_ms: 5_000,
+            }))
+            .await
+            .expect("send shutdown");
+        let first = reader.recv_container().await.expect("first complete");
+        assert!(matches!(first, ContainerToHost::OutputComplete(_)));
+        reader
+            .recv_container()
+            .await
+            .expect_err("second complete should fail")
+    });
+
+    let pending_client = IpcClient::connect(&path).await.expect("connect");
+    let (mut client, _init) = pending_client
+        .handshake(sample_ready("1.0"), HS_TIMEOUT)
+        .await
+        .expect("client handshake");
+    let received = client.recv().await.expect("recv shutdown");
+    assert!(matches!(received, HostToContainer::Shutdown(_)));
+    for _ in 0..2 {
+        client
+            .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
+                job_id: JobId::from("job-integration-1"),
+                result: None,
+                session_id: None,
+                token_usage: None,
+                stop_reason: StopReason::EndTurn,
+            }))
+            .await
+            .expect("send complete");
+    }
+
+    let err = accept_task.await.expect("join");
+    assert!(
+        matches!(
+            err,
+            IpcError::Protocol(ProtocolError::LifecycleViolation { .. })
+        ),
+        "expected lifecycle violation, got {err:?}"
+    );
 }

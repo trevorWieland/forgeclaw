@@ -27,6 +27,7 @@ use crate::codec::{
 };
 use crate::error::{IpcError, ProtocolError};
 use crate::message::{ContainerToHost, HostToContainer};
+use crate::policy::{DEFAULT_MAX_UNKNOWN_BYTES, UnknownFrameBudget};
 use crate::util::{SharedWriteHalf, ShutdownHandle, truncate_for_log};
 
 /// An established container-side IPC client.
@@ -39,7 +40,8 @@ use crate::util::{SharedWriteHalf, ShutdownHandle, truncate_for_log};
 pub struct IpcClient {
     framed: Framed<UnixStream, FrameCodec>,
     poisoned: bool,
-    unknown_skip_count: usize,
+    unknown_budget: UnknownFrameBudget,
+    last_frame_len: usize,
 }
 
 impl IpcClient {
@@ -57,7 +59,8 @@ impl IpcClient {
         Self {
             framed,
             poisoned: false,
-            unknown_skip_count: 0,
+            unknown_budget: UnknownFrameBudget::default(),
+            last_frame_len: 0,
         }
     }
 
@@ -105,6 +108,7 @@ impl IpcClient {
                 return Err(e);
             }
         };
+        self.last_frame_len = frame.len();
         let result = decode_host_to_container(&frame);
         if let Err(ref e) = result {
             if e.is_fatal() {
@@ -117,30 +121,31 @@ impl IpcClient {
     /// Receive a [`HostToContainer`] message.
     ///
     /// This is the spec-compliant default: unknown message types are
-    /// silently skipped (with a warning log) up to 32 consecutive
-    /// frames. Use [`recv_strict`](Self::recv_strict) if you need raw
-    /// decode errors for every frame.
+    /// silently skipped (with a warning log) up to both:
+    /// - 32 consecutive frames, and
+    /// - 1 MiB cumulative bytes across the current unknown streak.
+    ///
+    /// Use [`recv_strict`](Self::recv_strict) if you need raw decode
+    /// errors for every frame.
     pub async fn recv(&mut self) -> Result<HostToContainer, IpcError> {
         loop {
             match self.recv_strict().await {
                 Ok(msg) => {
-                    self.unknown_skip_count = 0;
+                    self.unknown_budget.reset();
                     return Ok(msg);
                 }
                 Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
-                    self.unknown_skip_count += 1;
-                    if self.unknown_skip_count > DEFAULT_MAX_UNKNOWN_SKIPS {
-                        let err = IpcError::Protocol(ProtocolError::TooManyUnknownMessages {
-                            count: self.unknown_skip_count,
-                            limit: DEFAULT_MAX_UNKNOWN_SKIPS,
-                        });
+                    if let Err(err) = self.unknown_budget.on_unknown(self.last_frame_len) {
                         self.poison().await;
                         return Err(err);
                     }
                     tracing::warn!(
                         target: "forgeclaw_ipc::client",
                         message_type = %truncate_for_log(&ty),
-                        skip_count = self.unknown_skip_count,
+                        skip_count = self.unknown_budget.count(),
+                        skip_count_limit = DEFAULT_MAX_UNKNOWN_SKIPS,
+                        skip_bytes = self.unknown_budget.bytes(),
+                        skip_bytes_limit = DEFAULT_MAX_UNKNOWN_BYTES,
                         "ignoring unknown message type (forward compatibility)"
                     );
                 }
@@ -175,7 +180,8 @@ impl IpcClient {
                 reader,
                 poisoned,
                 shutdown_handle,
-                unknown_skip_count: 0,
+                unknown_budget: UnknownFrameBudget::default(),
+                last_frame_len: 0,
             },
         )
     }
@@ -220,7 +226,8 @@ pub struct IpcClientReader {
     reader: FramedRead<tokio::net::unix::OwnedReadHalf, FrameCodec>,
     poisoned: Arc<AtomicBool>,
     shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
-    unknown_skip_count: usize,
+    unknown_budget: UnknownFrameBudget,
+    last_frame_len: usize,
 }
 
 impl IpcClientReader {
@@ -250,6 +257,7 @@ impl IpcClientReader {
                 return Err(e);
             }
         };
+        self.last_frame_len = frame.len();
         let result = decode_host_to_container(&frame);
         if let Err(ref e) = result {
             if e.is_fatal() {
@@ -262,30 +270,31 @@ impl IpcClientReader {
     /// Receive a [`HostToContainer`] message.
     ///
     /// This is the spec-compliant default: unknown message types are
-    /// silently skipped (with a warning log) up to 32 consecutive
-    /// frames. Use [`recv_strict`](Self::recv_strict) if you need raw
-    /// decode errors for every frame.
+    /// silently skipped (with a warning log) up to both:
+    /// - 32 consecutive frames, and
+    /// - 1 MiB cumulative bytes across the current unknown streak.
+    ///
+    /// Use [`recv_strict`](Self::recv_strict) if you need raw decode
+    /// errors for every frame.
     pub async fn recv(&mut self) -> Result<HostToContainer, IpcError> {
         loop {
             match self.recv_strict().await {
                 Ok(msg) => {
-                    self.unknown_skip_count = 0;
+                    self.unknown_budget.reset();
                     return Ok(msg);
                 }
                 Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
-                    self.unknown_skip_count += 1;
-                    if self.unknown_skip_count > DEFAULT_MAX_UNKNOWN_SKIPS {
-                        let err = IpcError::Protocol(ProtocolError::TooManyUnknownMessages {
-                            count: self.unknown_skip_count,
-                            limit: DEFAULT_MAX_UNKNOWN_SKIPS,
-                        });
+                    if let Err(err) = self.unknown_budget.on_unknown(self.last_frame_len) {
                         self.poison().await;
                         return Err(err);
                     }
                     tracing::warn!(
                         target: "forgeclaw_ipc::client",
                         message_type = %truncate_for_log(&ty),
-                        skip_count = self.unknown_skip_count,
+                        skip_count = self.unknown_budget.count(),
+                        skip_count_limit = DEFAULT_MAX_UNKNOWN_SKIPS,
+                        skip_bytes = self.unknown_budget.bytes(),
+                        skip_bytes_limit = DEFAULT_MAX_UNKNOWN_BYTES,
                         "ignoring unknown message type (forward compatibility)"
                     );
                 }

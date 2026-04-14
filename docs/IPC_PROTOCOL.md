@@ -300,6 +300,14 @@ Host                              Container
   │                                   │
 ```
 
+The host enforces post-handshake phases at the IPC boundary:
+
+- **Processing**: default immediately after `init`; container may emit streaming/progress/commands/heartbeat/error and must eventually emit `output_complete`.
+- **Idle**: entered after `output_complete`; container must not continue streaming until the host sends new `messages`.
+- **Draining**: entered after host `shutdown`; host rejects new `messages`, and container may only finish/heartbeat/error before close.
+
+Out-of-phase traffic is treated as a protocol error and the connection is closed.
+
 ## Versioning
 
 The `protocol_version` field in `ready` allows the host to detect adapter capability:
@@ -311,11 +319,15 @@ The host rejects connections from adapters with an unsupported major version.
 
 ## Error Handling
 
-- **Malformed frame** (invalid length, non-UTF8, non-JSON): Host logs the error and closes the socket. Container is transitioned to `Failed`.
-- **Unknown message type**: Ignored with a warning log, up to 32 consecutive unknown frames per connection. If a peer exceeds this limit without sending a recognized message, the connection is closed. This allows forward-compatible adapters to send experimental messages while bounding the resource cost of a misbehaving or malicious peer.
+- **Malformed frame** (invalid length, non-UTF8, non-JSON): Host emits a structured error log at the protocol boundary (including peer/group identity and error class, never raw payload bytes), then closes the socket. Container is transitioned to `Failed`.
+- **Unknown message type**: Ignored with a warning log for forward compatibility, up to both:
+  - 32 consecutive unknown frames, and
+  - 1 MiB cumulative bytes across the current consecutive-unknown streak.
+  On either limit breach, the host closes the connection. Any recognized message resets both unknown counters.
 - **Missing required field**: Treated as malformed. Socket closed.
 - **Socket disconnect without `output_complete`**: Host treats the in-progress job as failed. Container transitioned to `Exited` with error status.
 - **Heartbeat timeout** (no heartbeat for 60 seconds during `Processing`): Host sends `shutdown` with a short deadline, then kills the container if it doesn't respond.
+- **Lifecycle violation** (valid message at wrong phase): Host logs the violation and closes the connection.
 
 ## Implementing an Adapter
 

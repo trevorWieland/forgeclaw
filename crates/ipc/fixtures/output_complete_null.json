@@ -1,0 +1,6 @@
+{
+  "type": "output_complete",
+  "job_id": "job-tools-only-1",
+  "result": null,
+  "stop_reason": "tool_use"
+}

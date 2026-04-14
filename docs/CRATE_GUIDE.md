@@ -228,16 +228,36 @@ impl Decoder for FrameCodec { ... }
 // Server (host side)
 pub struct IpcServer { ... }
 impl IpcServer {
-    pub async fn listen(path: &Path) -> Result<Self>;
-    pub async fn accept(&self) -> Result<IpcChannel>;
+    pub fn bind(path: &Path) -> Result<Self>;
+    pub async fn accept(&self, group: GroupInfo) -> Result<PendingConnection>;
 }
+
+pub struct PendingConnection { ... }
+impl PendingConnection {
+    pub async fn handshake(
+        self,
+        init: InitPayload,
+        timeout: Duration,
+    ) -> Result<(IpcConnection, ReadyPayload)>;
+}
+
+pub struct IpcConnection { ... } // typed send/recv, recv_command auth matrix, into_split
+pub struct IpcConnectionWriter { ... }
+pub struct IpcConnectionReader { ... }
 
 // Client (container side)
 pub struct IpcClient { ... }
 impl IpcClient {
-    pub async fn connect(path: &Path) -> Result<Self>;
-    pub async fn send(&self, msg: ContainerToHost) -> Result<()>;
-    pub async fn recv(&self) -> Result<HostToContainer>;
+    pub async fn connect(path: &Path) -> Result<PendingClient>;
+}
+
+pub struct PendingClient { ... }
+impl PendingClient {
+    pub async fn handshake(
+        self,
+        ready: ReadyPayload,
+        timeout: Duration,
+    ) -> Result<(IpcClient, InitPayload)>;
 }
 ```
 

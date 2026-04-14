@@ -113,6 +113,14 @@ pub(crate) struct ShutdownHandle<T> {
     inner: Arc<Mutex<Option<T>>>,
 }
 
+impl<T> Clone for ShutdownHandle<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
 impl<T: AsyncWrite + Unpin> ShutdownHandle<T> {
     /// Take the write half out and shut it down. After this call,
     /// the writer's `AsyncWrite` methods will return `BrokenPipe`.

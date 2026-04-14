@@ -123,6 +123,19 @@ pub enum ProtocolError {
         limit: usize,
     },
 
+    /// The peer sent too many cumulative bytes across consecutive
+    /// unknown-message frames, exceeding the configured budget.
+    ///
+    /// This is fatal — the connection is poisoned when this fires.
+    #[error("too many unknown message bytes: {bytes} bytes (limit {limit})")]
+    TooManyUnknownBytes {
+        /// How many unknown-message bytes were observed in the current
+        /// consecutive streak.
+        bytes: usize,
+        /// The configured byte limit.
+        limit: usize,
+    },
+
     /// A command was rejected because the session lacks the required
     /// authorization.
     ///
@@ -150,6 +163,36 @@ pub enum ProtocolError {
         init_group_id: GroupId,
         /// The group ID the host passed as the authoritative identity.
         session_group_id: GroupId,
+    },
+
+    /// A message was valid JSON but arrived at an illegal protocol
+    /// lifecycle phase.
+    #[error(
+        "lifecycle violation: {direction} message `{message_type}` is invalid in phase {phase} ({reason})"
+    )]
+    LifecycleViolation {
+        /// Current server-side lifecycle phase.
+        phase: &'static str,
+        /// Message direction (`host_to_container` or
+        /// `container_to_host`).
+        direction: &'static str,
+        /// Wire `type` discriminator.
+        message_type: &'static str,
+        /// Human-readable reason for the rejection.
+        reason: &'static str,
+    },
+
+    /// No heartbeat was observed before the processing deadline.
+    ///
+    /// This is non-fatal at the IPC layer so the caller can execute
+    /// the spec-required escalation path (send `shutdown`, then kill
+    /// the container if needed).
+    #[error("heartbeat timeout: no heartbeat for {timeout_secs}s while in phase {phase}")]
+    HeartbeatTimeout {
+        /// Current server-side lifecycle phase (`processing`).
+        phase: &'static str,
+        /// Configured heartbeat timeout in seconds.
+        timeout_secs: u64,
     },
 }
 
@@ -212,7 +255,9 @@ impl IpcError {
             Self::Io(_) | Self::Frame(_) | Self::Timeout(_) => true,
             Self::Protocol(p) => !matches!(
                 p,
-                ProtocolError::UnknownMessageType(_) | ProtocolError::Unauthorized { .. }
+                ProtocolError::UnknownMessageType(_)
+                    | ProtocolError::Unauthorized { .. }
+                    | ProtocolError::HeartbeatTimeout { .. }
             ),
             Self::Serialize(_) | Self::Closed => false,
         }
@@ -334,6 +379,27 @@ mod tests {
     }
 
     #[test]
+    fn too_many_unknown_bytes_display() {
+        let err = ProtocolError::TooManyUnknownBytes {
+            bytes: 1_500_000,
+            limit: 1_048_576,
+        };
+        assert_eq!(
+            err.to_string(),
+            "too many unknown message bytes: 1500000 bytes (limit 1048576)"
+        );
+    }
+
+    #[test]
+    fn too_many_unknown_bytes_is_fatal() {
+        let err = IpcError::Protocol(ProtocolError::TooManyUnknownBytes {
+            bytes: 1_500_000,
+            limit: 1_048_576,
+        });
+        assert!(err.is_fatal());
+    }
+
+    #[test]
     fn unauthorized_display() {
         let err = ProtocolError::Unauthorized {
             command: "register_group",
@@ -371,5 +437,37 @@ mod tests {
             session_group_id: "group-b".into(),
         });
         assert!(err.is_fatal());
+    }
+
+    #[test]
+    fn lifecycle_violation_is_fatal() {
+        let err = IpcError::Protocol(ProtocolError::LifecycleViolation {
+            phase: "idle",
+            direction: "container_to_host",
+            message_type: "output_delta",
+            reason: "requires active processing",
+        });
+        assert!(err.is_fatal());
+    }
+
+    #[test]
+    fn heartbeat_timeout_display() {
+        let err = ProtocolError::HeartbeatTimeout {
+            phase: "processing",
+            timeout_secs: 60,
+        };
+        assert_eq!(
+            err.to_string(),
+            "heartbeat timeout: no heartbeat for 60s while in phase processing"
+        );
+    }
+
+    #[test]
+    fn heartbeat_timeout_is_not_fatal() {
+        let err = IpcError::Protocol(ProtocolError::HeartbeatTimeout {
+            phase: "processing",
+            timeout_secs: 60,
+        });
+        assert!(!err.is_fatal());
     }
 }

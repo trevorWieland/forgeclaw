@@ -13,6 +13,7 @@
 mod auth;
 mod listener;
 mod pending;
+mod protocol;
 
 pub use listener::IpcServer;
 pub use pending::PendingConnection;
@@ -24,17 +25,22 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
+use tokio::time::Instant;
 use tokio_util::codec::{Framed, FramedRead, FramedWrite};
 
-use crate::codec::{
-    DEFAULT_MAX_UNKNOWN_SKIPS, FrameCodec, decode_container_to_host, encode_message,
-};
+use crate::codec::{FrameCodec, decode_container_to_host, encode_message};
 use crate::error::{IpcError, ProtocolError};
 use crate::message::authorized::AuthorizedCommand;
 use crate::message::command::ClassifiedCommand;
 use crate::message::{ContainerToHost, HostToContainer};
 use crate::peer_cred::SessionIdentity;
-use crate::util::{SharedWriteHalf, ShutdownHandle, truncate_for_log};
+use crate::policy::UnknownFrameBudget;
+use crate::util::{SharedWriteHalf, ShutdownHandle};
+
+use self::protocol::{
+    ConnectionState, enforce_inbound_state, enforce_outbound_state, heartbeat_timeout_error,
+    log_fatal_protocol_error, log_unknown_message, recv_deadline,
+};
 
 /// An established host-side connection to a single container.
 ///
@@ -48,7 +54,9 @@ use crate::util::{SharedWriteHalf, ShutdownHandle, truncate_for_log};
 pub struct IpcConnection {
     framed: Framed<UnixStream, FrameCodec>,
     poisoned: bool,
-    unknown_skip_count: usize,
+    unknown_budget: UnknownFrameBudget,
+    last_frame_len: usize,
+    state: ConnectionState,
     identity: Arc<std::sync::Mutex<SessionIdentity>>,
 }
 
@@ -61,7 +69,9 @@ impl IpcConnection {
         Self {
             framed,
             poisoned: false,
-            unknown_skip_count: 0,
+            unknown_budget: UnknownFrameBudget::default(),
+            last_frame_len: 0,
+            state: ConnectionState::new(Instant::now()),
             identity,
         }
     }
@@ -87,10 +97,17 @@ impl IpcConnection {
     /// Send a [`HostToContainer`] message to the peer.
     pub async fn send_host(&mut self, msg: &HostToContainer) -> Result<(), IpcError> {
         self.check_poisoned()?;
+        let phase_name = self.state.phase_name();
+        if let Err(e) = enforce_outbound_state(&mut self.state, msg, Instant::now()) {
+            log_fatal_protocol_error(&self.identity, phase_name, &e);
+            self.poison().await;
+            return Err(e);
+        }
         let bytes: Bytes = encode_message(msg)?;
         let result = self.framed.send(bytes).await;
         if let Err(ref e) = result {
             if e.is_fatal() {
+                log_fatal_protocol_error(&self.identity, self.state.phase_name(), e);
                 self.poison().await;
             }
         }
@@ -106,54 +123,67 @@ impl IpcConnection {
     /// skips unknown types per the spec.
     pub async fn recv_container_strict(&mut self) -> Result<ContainerToHost, IpcError> {
         self.check_poisoned()?;
-        let frame = match self.framed.next().await.transpose() {
+        let next_frame = if let Some(deadline) = recv_deadline(&self.state) {
+            match tokio::time::timeout_at(deadline, self.framed.next()).await {
+                Ok(next) => next,
+                Err(_elapsed) => return Err(heartbeat_timeout_error(&self.state)),
+            }
+        } else {
+            self.framed.next().await
+        };
+        let frame = match next_frame.transpose() {
             Ok(Some(f)) => f,
             Ok(None) => {
                 self.poisoned = true;
                 return Err(IpcError::Closed);
             }
             Err(e) => {
+                log_fatal_protocol_error(&self.identity, self.state.phase_name(), &e);
                 self.poison().await;
                 return Err(e);
             }
         };
+        self.last_frame_len = frame.len();
         let result = decode_container_to_host(&frame);
-        if let Err(ref e) = result {
+        let msg = match result {
+            Ok(msg) => msg,
+            Err(e) => {
+                if e.is_fatal() {
+                    log_fatal_protocol_error(&self.identity, self.state.phase_name(), &e);
+                    self.poison().await;
+                }
+                return Err(e);
+            }
+        };
+        if let Err(e) = enforce_inbound_state(&mut self.state, &msg, Instant::now()) {
             if e.is_fatal() {
+                log_fatal_protocol_error(&self.identity, self.state.phase_name(), &e);
                 self.poison().await;
             }
+            return Err(e);
         }
-        result
+        Ok(msg)
     }
 
     /// Receive a [`ContainerToHost`] message.
     ///
     /// This is the spec-compliant default: unknown message types are
-    /// silently skipped (with a warning log) up to 32 consecutive
-    /// frames. Use [`recv_container_strict`](Self::recv_container_strict)
-    /// if you need raw decode errors for every frame.
+    /// silently skipped (with a warning log) up to spec limits
+    /// (count and cumulative-byte budgets).
     pub async fn recv_container(&mut self) -> Result<ContainerToHost, IpcError> {
         loop {
             match self.recv_container_strict().await {
                 Ok(msg) => {
-                    self.unknown_skip_count = 0;
+                    self.unknown_budget.reset();
                     return Ok(msg);
                 }
                 Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
-                    self.unknown_skip_count += 1;
-                    if self.unknown_skip_count > DEFAULT_MAX_UNKNOWN_SKIPS {
+                    if let Err(e) = self.unknown_budget.on_unknown(self.last_frame_len) {
+                        log_fatal_protocol_error(&self.identity, self.state.phase_name(), &e);
                         self.poison().await;
-                        return Err(IpcError::Protocol(ProtocolError::TooManyUnknownMessages {
-                            count: self.unknown_skip_count,
-                            limit: DEFAULT_MAX_UNKNOWN_SKIPS,
-                        }));
+                        return Err(e);
                     }
-                    tracing::warn!(
-                        target: "forgeclaw_ipc::server",
-                        message_type = %truncate_for_log(&ty),
-                        skip_count = self.unknown_skip_count,
-                        "ignoring unknown message type"
-                    );
+                    log_unknown_message(&self.identity, &ty, &self.unknown_budget);
                 }
                 Err(e) => return Err(e),
             }
@@ -166,6 +196,7 @@ impl IpcConnection {
     /// error on either half poisons both.
     pub fn into_split(self) -> (IpcConnectionWriter, IpcConnectionReader) {
         let poisoned = Arc::new(AtomicBool::new(self.poisoned));
+        let state = Arc::new(std::sync::Mutex::new(self.state));
         let parts = self.framed.into_parts();
         let (read_half, write_half) = parts.io.into_split();
         // Wrap write half so the reader can shut it down directly.
@@ -183,13 +214,17 @@ impl IpcConnection {
                 writer,
                 poisoned: Arc::clone(&poisoned),
                 identity: Arc::clone(&self.identity),
+                state: Arc::clone(&state),
+                shutdown_handle: shutdown_handle.clone(),
             },
             IpcConnectionReader {
                 reader,
                 poisoned,
-                shutdown_handle,
-                unknown_skip_count: 0,
+                unknown_budget: UnknownFrameBudget::default(),
+                last_frame_len: 0,
+                state,
                 identity: self.identity,
+                shutdown_handle,
             },
         )
     }
@@ -235,6 +270,8 @@ pub struct IpcConnectionWriter {
     writer: FramedWrite<SharedWriteHalf<tokio::net::unix::OwnedWriteHalf>, FrameCodec>,
     poisoned: Arc<AtomicBool>,
     identity: Arc<std::sync::Mutex<SessionIdentity>>,
+    state: Arc<std::sync::Mutex<ConnectionState>>,
+    shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
 }
 
 impl IpcConnectionWriter {
@@ -244,16 +281,42 @@ impl IpcConnectionWriter {
         &self.identity
     }
 
+    fn enforce_phase_for_send(
+        &self,
+        msg: &HostToContainer,
+    ) -> Result<&'static str, (&'static str, IpcError)> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ("unknown", IpcError::Closed))?;
+        let phase_name = state.phase_name();
+        if let Err(e) = enforce_outbound_state(&mut state, msg, Instant::now()) {
+            return Err((phase_name, e));
+        }
+        Ok(phase_name)
+    }
+
     /// Send a [`HostToContainer`] message.
     pub async fn send_host(&mut self, msg: &HostToContainer) -> Result<(), IpcError> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(IpcError::Closed);
         }
+        let phase_name = match self.enforce_phase_for_send(msg) {
+            Ok(phase_name) => phase_name,
+            Err((phase_name, e)) => {
+                self.poisoned.store(true, Ordering::Release);
+                log_fatal_protocol_error(&self.identity, phase_name, &e);
+                self.shutdown_handle.trigger().await;
+                return Err(e);
+            }
+        };
         let bytes: Bytes = encode_message(msg)?;
         let result = self.writer.send(bytes).await;
         if let Err(ref e) = result {
             if e.is_fatal() {
                 self.poisoned.store(true, Ordering::Release);
+                log_fatal_protocol_error(&self.identity, phase_name, e);
+                self.shutdown_handle.trigger().await;
             }
         }
         result
@@ -265,9 +328,11 @@ impl IpcConnectionWriter {
 pub struct IpcConnectionReader {
     reader: FramedRead<tokio::net::unix::OwnedReadHalf, FrameCodec>,
     poisoned: Arc<AtomicBool>,
-    shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
-    unknown_skip_count: usize,
+    unknown_budget: UnknownFrameBudget,
+    last_frame_len: usize,
+    state: Arc<std::sync::Mutex<ConnectionState>>,
     identity: Arc<std::sync::Mutex<SessionIdentity>>,
+    shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
 }
 
 impl IpcConnectionReader {
@@ -294,58 +359,106 @@ impl IpcConnectionReader {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(IpcError::Closed);
         }
-        let frame = match self.reader.next().await.transpose() {
+        let next_frame = if let Some(deadline) = self.current_recv_deadline()? {
+            match tokio::time::timeout_at(deadline, self.reader.next()).await {
+                Ok(next) => next,
+                Err(_elapsed) => return self.heartbeat_timeout_error(),
+            }
+        } else {
+            self.reader.next().await
+        };
+        let frame = match next_frame.transpose() {
             Ok(Some(f)) => f,
             Ok(None) => {
                 self.poison().await;
                 return Err(IpcError::Closed);
             }
             Err(e) => {
+                let phase_name = self.current_phase_name()?;
+                log_fatal_protocol_error(&self.identity, phase_name, &e);
                 self.poison().await;
                 return Err(e);
             }
         };
+        self.last_frame_len = frame.len();
         let result = decode_container_to_host(&frame);
-        if let Err(ref e) = result {
+        let msg = match result {
+            Ok(msg) => msg,
+            Err(e) => {
+                if e.is_fatal() {
+                    let phase_name = self.current_phase_name()?;
+                    log_fatal_protocol_error(&self.identity, phase_name, &e);
+                    self.poison().await;
+                }
+                return Err(e);
+            }
+        };
+        let phase_name = self.current_phase_name()?;
+        if let Err(e) =
+            self.with_state_mut(|state| enforce_inbound_state(state, &msg, Instant::now()))
+        {
             if e.is_fatal() {
+                log_fatal_protocol_error(&self.identity, phase_name, &e);
                 self.poison().await;
             }
+            return Err(e);
         }
-        result
+        Ok(msg)
     }
 
     /// Receive a [`ContainerToHost`] message.
     ///
     /// This is the spec-compliant default: unknown message types are
-    /// silently skipped (with a warning log) up to 32 consecutive
-    /// frames. Use [`recv_container_strict`](Self::recv_container_strict)
-    /// if you need raw decode errors for every frame.
+    /// silently skipped (with a warning log) up to spec limits
+    /// (count and cumulative-byte budgets).
     pub async fn recv_container(&mut self) -> Result<ContainerToHost, IpcError> {
         loop {
             match self.recv_container_strict().await {
                 Ok(msg) => {
-                    self.unknown_skip_count = 0;
+                    self.unknown_budget.reset();
                     return Ok(msg);
                 }
                 Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
-                    self.unknown_skip_count += 1;
-                    if self.unknown_skip_count > DEFAULT_MAX_UNKNOWN_SKIPS {
+                    if let Err(e) = self.unknown_budget.on_unknown(self.last_frame_len) {
+                        let phase_name = self.current_phase_name()?;
+                        log_fatal_protocol_error(&self.identity, phase_name, &e);
                         self.poison().await;
-                        return Err(IpcError::Protocol(ProtocolError::TooManyUnknownMessages {
-                            count: self.unknown_skip_count,
-                            limit: DEFAULT_MAX_UNKNOWN_SKIPS,
-                        }));
+                        return Err(e);
                     }
-                    tracing::warn!(
-                        target: "forgeclaw_ipc::server",
-                        message_type = %truncate_for_log(&ty),
-                        skip_count = self.unknown_skip_count,
-                        "ignoring unknown message type"
-                    );
+                    log_unknown_message(&self.identity, &ty, &self.unknown_budget);
                 }
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    fn with_state_mut<T>(
+        &self,
+        f: impl FnOnce(&mut ConnectionState) -> Result<T, IpcError>,
+    ) -> Result<T, IpcError> {
+        let mut state = self.state.lock().map_err(|_| IpcError::Closed)?;
+        f(&mut state)
+    }
+
+    fn current_phase_name(&self) -> Result<&'static str, IpcError> {
+        self.state
+            .lock()
+            .map(|state| state.phase_name())
+            .map_err(|_| IpcError::Closed)
+    }
+
+    fn current_recv_deadline(&self) -> Result<Option<Instant>, IpcError> {
+        self.state
+            .lock()
+            .map(|state| recv_deadline(&state))
+            .map_err(|_| IpcError::Closed)
+    }
+
+    fn heartbeat_timeout_error(&self) -> Result<ContainerToHost, IpcError> {
+        self.state
+            .lock()
+            .map(|state| Err(heartbeat_timeout_error(&state)))
+            .map_err(|_| IpcError::Closed)?
     }
 
     /// Receive the next command with the full authorization matrix.

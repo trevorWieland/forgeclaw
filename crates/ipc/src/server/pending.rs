@@ -12,18 +12,19 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
+use tokio::time::Instant;
 use tokio_util::codec::Framed;
 
-use crate::codec::{
-    DEFAULT_MAX_UNKNOWN_SKIPS, FrameCodec, decode_container_to_host, encode_message,
-};
+use crate::codec::{FrameCodec, decode_container_to_host, encode_message};
 use crate::error::{IpcError, ProtocolError};
 use crate::message::{ContainerToHost, GroupInfo, HostToContainer, InitPayload, ReadyPayload};
 use crate::peer_cred::SessionIdentity;
+use crate::policy::UnknownFrameBudget;
 use crate::util::truncate_for_log;
 use crate::version::{PROTOCOL_VERSION, is_compatible};
 
 use super::IpcConnection;
+use super::protocol::{log_fatal_protocol_error, log_unknown_message};
 
 /// A server-side connection that has not yet completed the handshake.
 ///
@@ -38,7 +39,8 @@ use super::IpcConnection;
 pub struct PendingConnection {
     framed: Framed<UnixStream, FrameCodec>,
     poisoned: bool,
-    unknown_skip_count: usize,
+    unknown_budget: UnknownFrameBudget,
+    last_frame_len: usize,
     identity: Arc<std::sync::Mutex<SessionIdentity>>,
 }
 
@@ -50,7 +52,8 @@ impl PendingConnection {
         Self {
             framed: Framed::new(stream, FrameCodec::new()),
             poisoned: false,
-            unknown_skip_count: 0,
+            unknown_budget: UnknownFrameBudget::default(),
+            last_frame_len: 0,
             identity,
         }
     }
@@ -81,15 +84,16 @@ impl PendingConnection {
             Ok(init) => init,
             Err(e) => {
                 if e.is_fatal() {
+                    log_fatal_protocol_error(&self.identity, "handshake", &e);
                     self.poison().await;
                 }
                 return Err(e);
             }
         };
 
-        match tokio::time::timeout(timeout, self.handshake_inner()).await {
-            Ok(Ok(ready)) => {
-                self.send_host(&HostToContainer::Init(init)).await?;
+        let deadline = Instant::now() + timeout;
+        match self.handshake_inner(init, deadline, timeout).await {
+            Ok(ready) => {
                 tracing::debug!(
                     target: "forgeclaw_ipc::server",
                     adapter = %truncate_for_log(&ready.adapter),
@@ -100,15 +104,12 @@ impl PendingConnection {
                 let conn = IpcConnection::from_parts(self.framed, self.identity);
                 Ok((conn, ready))
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 if e.is_fatal() {
+                    log_fatal_protocol_error(&self.identity, "handshake", &e);
                     self.poison().await;
                 }
                 Err(e)
-            }
-            Err(_elapsed) => {
-                self.poison().await;
-                Err(IpcError::Timeout(timeout))
             }
         }
     }
@@ -132,10 +133,18 @@ impl PendingConnection {
             .map(|guard| guard.group().clone())
     }
 
-    /// Validate the handshake protocol: receive `Ready` and check
-    /// protocol version. Returns the `ReadyPayload` on success.
-    async fn handshake_inner(&mut self) -> Result<ReadyPayload, IpcError> {
-        let first = self.recv_container().await?;
+    /// Validate the handshake protocol under a shared deadline:
+    /// receive `Ready`, check version, and send `Init`.
+    async fn handshake_inner(
+        &mut self,
+        init: InitPayload,
+        deadline: Instant,
+        timeout: Duration,
+    ) -> Result<ReadyPayload, IpcError> {
+        let first = match tokio::time::timeout_at(deadline, self.recv_container()).await {
+            Ok(result) => result?,
+            Err(_elapsed) => return Err(IpcError::Timeout(timeout)),
+        };
         let ready = match first {
             ContainerToHost::Ready(payload) => payload,
             other => {
@@ -150,6 +159,11 @@ impl PendingConnection {
                 peer: ready.protocol_version.clone(),
                 local: PROTOCOL_VERSION,
             }));
+        }
+        match tokio::time::timeout_at(deadline, self.send_host(&HostToContainer::Init(init))).await
+        {
+            Ok(result) => result?,
+            Err(_elapsed) => return Err(IpcError::Timeout(timeout)),
         }
         Ok(ready)
     }
@@ -193,13 +207,16 @@ impl PendingConnection {
                 return Err(IpcError::Closed);
             }
             Err(e) => {
+                log_fatal_protocol_error(&self.identity, "handshake", &e);
                 self.poison().await;
                 return Err(e);
             }
         };
+        self.last_frame_len = frame.len();
         let result = decode_container_to_host(&frame);
         if let Err(ref e) = result {
             if e.is_fatal() {
+                log_fatal_protocol_error(&self.identity, "handshake", e);
                 self.poison().await;
             }
         }
@@ -210,24 +227,16 @@ impl PendingConnection {
         loop {
             match self.recv_container_strict().await {
                 Ok(msg) => {
-                    self.unknown_skip_count = 0;
+                    self.unknown_budget.reset();
                     return Ok(msg);
                 }
                 Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
-                    self.unknown_skip_count += 1;
-                    if self.unknown_skip_count > DEFAULT_MAX_UNKNOWN_SKIPS {
+                    if let Err(e) = self.unknown_budget.on_unknown(self.last_frame_len) {
+                        log_fatal_protocol_error(&self.identity, "handshake", &e);
                         self.poison().await;
-                        return Err(IpcError::Protocol(ProtocolError::TooManyUnknownMessages {
-                            count: self.unknown_skip_count,
-                            limit: DEFAULT_MAX_UNKNOWN_SKIPS,
-                        }));
+                        return Err(e);
                     }
-                    tracing::warn!(
-                        target: "forgeclaw_ipc::server",
-                        message_type = %truncate_for_log(&ty),
-                        skip_count = self.unknown_skip_count,
-                        "ignoring unknown message type"
-                    );
+                    log_unknown_message(&self.identity, &ty, &self.unknown_budget);
                 }
                 Err(e) => return Err(e),
             }

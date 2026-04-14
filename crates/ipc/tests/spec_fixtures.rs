@@ -58,6 +58,14 @@ fn output_complete_fixture_roundtrip() {
 }
 
 #[test]
+fn output_complete_null_fixture_roundtrip() {
+    roundtrip_container_to_host(
+        include_str!("../fixtures/output_complete_null.json"),
+        "output_complete_null",
+    );
+}
+
+#[test]
 fn progress_fixture_roundtrip() {
     roundtrip_container_to_host(include_str!("../fixtures/progress.json"), "progress");
 }

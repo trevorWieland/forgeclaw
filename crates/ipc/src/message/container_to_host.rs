@@ -23,6 +23,13 @@ where
     Option::<T>::deserialize(deserializer)
 }
 
+#[cfg(feature = "json-schema")]
+fn required_nullable_string_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["string", "null"]
+    })
+}
+
 /// Error returned when a percentage value exceeds the valid 0-100 range.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("percentage {value} exceeds maximum of 100")]
@@ -133,7 +140,10 @@ pub struct OutputCompletePayload {
     /// Required on the wire even when `null` — adapters must not omit
     /// this key. See `docs/IPC_PROTOCOL.md` §`output_complete`.
     #[serde(deserialize_with = "deserialize_required_nullable")]
-    #[cfg_attr(feature = "json-schema", schemars(required))]
+    #[cfg_attr(
+        feature = "json-schema",
+        schemars(required, schema_with = "required_nullable_string_schema")
+    )]
     pub result: Option<String>,
     /// Adapter-specific session identifier for resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]

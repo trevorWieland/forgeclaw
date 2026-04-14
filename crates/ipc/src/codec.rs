@@ -31,15 +31,12 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio_util::codec::{Decoder, Encoder};
-
+#[path = "codec_type_probe.rs"]
+mod type_probe;
 use crate::error::{FrameError, IpcError, ProtocolError};
 use crate::message::{ContainerToHost, HostToContainer};
 
-/// Result alias used across the crate: codec errors are surfaced
-/// through the crate-top [`IpcError`] taxonomy so that
-/// [`tokio_util::codec::Framed`]'s `Sink`/`Stream` impls compose
-/// cleanly with I/O errors (`tokio_util::codec::{Encoder,
-/// Decoder}::Error` must be `From<io::Error>`).
+/// Result alias used across the crate.
 pub(crate) type CodecResult<T> = Result<T, IpcError>;
 
 /// Size of the length prefix in bytes.
@@ -208,11 +205,15 @@ pub(crate) fn decode_typed_message<T: DeserializeOwned>(
     bytes: &[u8],
     known_types: &[&str],
 ) -> Result<T, IpcError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| FrameError::InvalidUtf8)?;
+    if let Some(ty) = type_probe::probe_first_type_field(text) {
+        if !known_types.contains(&ty.as_str()) {
+            return Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty)));
+        }
+    }
     match serde_json::from_slice::<T>(bytes) {
         Ok(msg) => Ok(msg),
         Err(full_err) => {
-            // Distinguish invalid UTF-8 from malformed JSON.
-            let text = std::str::from_utf8(bytes).map_err(|_| FrameError::InvalidUtf8)?;
             // Two-pass: probe the type field structurally.
             if let Ok(TypeProbe { ty }) = serde_json::from_str::<TypeProbe>(text) {
                 if !known_types.contains(&ty.as_str()) {

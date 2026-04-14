@@ -189,6 +189,43 @@ async fn client_recv_unknown_type_skip_limit() {
 }
 
 #[tokio::test]
+async fn client_recv_unknown_type_byte_budget_limit() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ipc-byte-budget.sock");
+    let listener = tokio::net::UnixListener::bind(&path).expect("bind");
+
+    let host_task = tokio::spawn(async move {
+        let mut stream = fake_host_handshake(&listener).await;
+        let mut payload = vec![b' '; 1_049_000];
+        let prefix = br#"{"type":"unknown_adv_large","data":"#;
+        payload[..prefix.len()].copy_from_slice(prefix);
+        let suffix = br#""}"#;
+        let suffix_start = payload.len() - suffix.len();
+        payload[suffix_start..].copy_from_slice(suffix);
+        raw_write_frame(&mut stream, &payload).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    });
+
+    let pending_client = IpcClient::connect(&path).await.expect("connect");
+    let (mut client, _init) = pending_client
+        .handshake(sample_ready(), HS_TIMEOUT)
+        .await
+        .expect("handshake");
+    let err = client.recv().await.expect_err("should poison");
+    assert!(
+        matches!(
+            err,
+            IpcError::Protocol(ProtocolError::TooManyUnknownBytes { .. })
+        ),
+        "expected TooManyUnknownBytes, got {err:?}"
+    );
+    let err2 = client.recv_strict().await.expect_err("should be closed");
+    assert!(matches!(err2, IpcError::Closed));
+
+    host_task.abort();
+}
+
+#[tokio::test]
 async fn client_recv_unknown_then_valid() {
     let dir = tempdir().expect("tempdir");
     let path = socket_path(&dir, "ipc.sock");

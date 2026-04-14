@@ -43,6 +43,7 @@ fn container_to_host_fixtures_conform_to_schema() {
         "ready.json",
         "output_delta.json",
         "output_complete.json",
+        "output_complete_null.json",
         "progress.json",
         "command.json",
         "command_register_group.json",
@@ -61,6 +62,24 @@ fn container_to_host_fixtures_conform_to_schema() {
         assert!(path.exists(), "fixture missing: {name}");
         validate_fixture(&schema_value, &path);
     }
+}
+
+#[test]
+fn container_to_host_schema_rejects_output_complete_missing_result() {
+    let schema_value = load_schema("container_to_host.schema.json");
+    let validator = jsonschema::validator_for(&schema_value).expect("compile schema");
+    let missing_result = serde_json::json!({
+        "type": "output_complete",
+        "job_id": "job-1",
+        "stop_reason": "end_turn"
+    });
+    let err = validator
+        .validate(&missing_result)
+        .expect_err("missing required result should fail schema");
+    assert!(
+        !err.to_string().is_empty(),
+        "schema validation should report a concrete error"
+    );
 }
 
 #[test]
