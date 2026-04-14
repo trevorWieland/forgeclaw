@@ -11,6 +11,7 @@ use super::shared::{GroupInfo, HistoricalMessage, ShutdownReason};
 
 /// Context bundle carried inside an `init` message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct InitContext {
     /// Historical messages making up the current context window.
     pub messages: Vec<HistoricalMessage>,
@@ -23,6 +24,7 @@ pub struct InitContext {
 /// Provider-proxy and adapter configuration carried inside an `init`
 /// message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct InitConfig {
     /// Base URL the adapter should target for provider calls.
     pub provider_proxy_url: String,
@@ -43,6 +45,7 @@ pub struct InitConfig {
 
 /// `init` — initial context and configuration for processing a job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct InitPayload {
     /// Unique job identifier for correlation with downstream messages.
     pub job_id: JobId,
@@ -55,6 +58,7 @@ pub struct InitPayload {
 /// `messages` — follow-up messages that arrived while the container
 /// was processing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct MessagesPayload {
     /// Job identifier this follow-up belongs to.
     pub job_id: JobId,
@@ -64,6 +68,7 @@ pub struct MessagesPayload {
 
 /// `shutdown` — request graceful shutdown.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct ShutdownPayload {
     /// Why the host is asking for shutdown.
     pub reason: ShutdownReason,
@@ -75,7 +80,7 @@ pub struct ShutdownPayload {
 #[cfg(test)]
 mod tests {
     use super::{InitConfig, InitContext, InitPayload, MessagesPayload, ShutdownPayload};
-    use crate::message::shared::{GroupInfo, HistoricalMessage, ShutdownReason};
+    use crate::message::shared::{GroupCapabilities, GroupInfo, HistoricalMessage, ShutdownReason};
     use forgeclaw_core::{GroupId, JobId};
 
     fn sample_init() -> InitPayload {
@@ -98,6 +103,7 @@ mod tests {
                     id: GroupId::from("group-main"),
                     name: "Main Group".to_owned(),
                     is_main: true,
+                    capabilities: GroupCapabilities::default(),
                 },
                 timezone: "America/New_York".to_owned(),
             },

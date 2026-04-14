@@ -131,15 +131,30 @@ IPC commands from the agent to the host system.
 
 **Available commands:**
 
-| Command | Payload | Authorization |
-|---------|---------|--------------|
-| `send_message` | `{ target_group, text }` | Main: any group. Non-main: own group only. |
-| `schedule_task` | `{ group, schedule_type, schedule_value, prompt, context_mode? }` | Main: any group. Non-main: own group only. |
-| `pause_task` | `{ task_id }` | Main: any. Non-main: own tasks only. |
-| `cancel_task` | `{ task_id }` | Main: any. Non-main: own tasks only. |
-| `register_group` | `{ group_spec }` | Main only. |
-| `dispatch_tanren` | `{ project, branch, phase, prompt, environment_profile? }` | Groups with Tanren permission only. |
-| `dispatch_self_improvement` | `{ objective, scope, acceptance_tests, branch_policy }` | Main only. |
+| Command | Payload | Authorization | IPC Enforcement |
+|---------|---------|--------------|-----------------|
+| `send_message` | `{ target_group, text }` | Main: any group. Non-main: own group only. | Enforced at IPC boundary |
+| `schedule_task` | `{ group, schedule_type, schedule_value, prompt, context_mode? }` | Main: any group. Non-main: own group only. | Enforced at IPC boundary |
+| `pause_task` | `{ task_id }` | Main: any. Non-main: own tasks only. | Ownership verified by caller via `OwnershipPending` |
+| `cancel_task` | `{ task_id }` | Main: any. Non-main: own tasks only. | Ownership verified by caller via `OwnershipPending` |
+| `register_group` | `{ name, extensions? }` | Main only. | Enforced at IPC boundary |
+| `dispatch_tanren` | `{ project, branch, phase, prompt, environment_profile? }` | Groups with `tanren` capability only. | Enforced at IPC boundary |
+| `dispatch_self_improvement` | `{ objective, scopes, acceptance_tests, branch_policy }` | Main only. | Enforced at IPC boundary |
+
+**Group capabilities**: The `group` object in `init.context` carries a `capabilities` field:
+
+```json
+{
+  "id": "group-tanren",
+  "name": "Tanren Group",
+  "is_main": false,
+  "capabilities": {
+    "tanren": true
+  }
+}
+```
+
+The `capabilities` object is host-authoritative and determines which command families the IPC layer will accept. If omitted, capabilities default to all-false.
 
 #### `error`
 
@@ -297,7 +312,7 @@ The host rejects connections from adapters with an unsupported major version.
 ## Error Handling
 
 - **Malformed frame** (invalid length, non-UTF8, non-JSON): Host logs the error and closes the socket. Container is transitioned to `Failed`.
-- **Unknown message type**: Ignored with a warning log. This allows forward-compatible adapters to send experimental messages.
+- **Unknown message type**: Ignored with a warning log, up to 32 consecutive unknown frames per connection. If a peer exceeds this limit without sending a recognized message, the connection is closed. This allows forward-compatible adapters to send experimental messages while bounding the resource cost of a misbehaving or malicious peer.
 - **Missing required field**: Treated as malformed. Socket closed.
 - **Socket disconnect without `output_complete`**: Host treats the in-progress job as failed. Container transitioned to `Exited` with error status.
 - **Heartbeat timeout** (no heartbeat for 60 seconds during `Processing`): Host sends `shutdown` with a short deadline, then kills the container if it doesn't respond.
@@ -318,5 +333,5 @@ An adapter is a program that:
 The adapter surface is intentionally minimal. The complexity lives in the agent runtime (Claude Code, OpenAI Agents SDK, custom harness), not in the adapter.
 
 Reference implementations:
-- **Rust**: `agent-runner/src/ipc_client.rs` (~100 lines)
-- **TypeScript**: `ipc-adapter-js/src/index.ts` (~80 lines)
+- **Rust**: `crates/ipc/` (host + client, with full auth matrix)
+- **TypeScript**: `ipc-adapter-js/src/index.ts` (planned — JSON Schemas at `crates/ipc/schemas/` enable type-safe generation)

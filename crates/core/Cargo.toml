@@ -10,9 +10,13 @@ description = "Shared types, event bus, error taxonomy, and configuration"
 [lints]
 workspace = true
 
+[features]
+json-schema = ["schemars"]
+
 [dependencies]
 chrono = { workspace = true }
 serde = { workspace = true }
+schemars = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }

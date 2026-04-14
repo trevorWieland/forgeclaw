@@ -10,6 +10,9 @@ description = "Structured IPC protocol over Unix domain sockets"
 [lints]
 workspace = true
 
+[features]
+json-schema = ["schemars", "forgeclaw-core/json-schema"]
+
 [dependencies]
 forgeclaw-core = { path = "../core", version = "0.1" }
 tokio.workspace = true
@@ -21,7 +24,13 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+# Optional — only needed for JSON Schema generation
+schemars = { workspace = true, optional = true }
+
 [dev-dependencies]
+forgeclaw-ipc = { path = ".", features = ["json-schema"] }
 insta.workspace = true
+jsonschema.workspace = true
 proptest.workspace = true
+schemars.workspace = true
 tempfile.workspace = true

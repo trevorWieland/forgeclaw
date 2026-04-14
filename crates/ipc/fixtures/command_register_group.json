@@ -2,8 +2,9 @@
   "type": "command",
   "command": "register_group",
   "payload": {
-    "group_spec": {
-      "name": "New Group",
+    "name": "New Group",
+    "extensions": {
+      "version": "1",
       "trigger": "@bot"
     }
   }

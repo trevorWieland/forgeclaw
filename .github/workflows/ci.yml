@@ -41,7 +41,7 @@ jobs:
         run: taplo fmt --check
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --features forgeclaw-store/test-hooks -- -D warnings
 
   # ============================================================
   # Test

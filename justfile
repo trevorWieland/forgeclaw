@@ -23,6 +23,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 cargo := env("CARGO", "cargo")
 max_lines := "500"
+toml_globs := "Cargo.toml bin/*/Cargo.toml crates/*/Cargo.toml .cargo/*.toml .config/*.toml rust-toolchain.toml clippy.toml taplo.toml deny.toml rustfmt.toml lefthook.yml"
 
 # ============================================================================
 # Setup
@@ -139,6 +140,15 @@ install:
     {{ cargo }} build --workspace
 
 # ============================================================================
+# Code Generation
+# ============================================================================
+
+# Regenerate IPC JSON Schema files from Rust types
+schemas:
+    @{{ cargo }} run -p forgeclaw-ipc --features json-schema --example gen_schemas --quiet
+    @echo "Schemas regenerated in crates/ipc/schemas/"
+
+# ============================================================================
 # Build
 # ============================================================================
 
@@ -187,17 +197,17 @@ lint:
 # Check formatting (Rust + TOML)
 fmt:
     @{{ cargo }} fmt --check
-    @RUST_LOG=error taplo fmt --check
+    @RUST_LOG=error taplo fmt --check {{ toml_globs }}
 
 # Auto-fix formatting (Rust + TOML)
 fmt-fix:
     @{{ cargo }} fmt
-    @RUST_LOG=error taplo fmt
+    @RUST_LOG=error taplo fmt {{ toml_globs }}
 
-# Auto-fix everything that can be auto-fixed (formatting + clippy suggestions)
-fix:
+# Auto-fix everything that can be auto-fixed (schemas + formatting + clippy suggestions)
+fix: schemas
     @{{ cargo }} fmt
-    @RUST_LOG=error taplo fmt
+    @RUST_LOG=error taplo fmt {{ toml_globs }}
     @{{ cargo }} clippy --workspace --all-targets --fix --allow-dirty --allow-staged --quiet -- -D warnings
 
 # ============================================================================
@@ -236,9 +246,55 @@ check-lines:
             echo "FAIL: $file has $lines lines (max {{ max_lines }})"
             failed=1
         fi
-    done < <(find crates/ -name '*.rs' -print0)
+    done < <(find crates/ bin/ -name '*.rs' -print0 2>/dev/null)
     if [[ "$failed" -eq 1 ]]; then exit 1; fi
     echo "All files within line limit."
+
+# Enforce crate dependency layering (foundation crates must not depend on capability crates)
+check-deps:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Checking crate dependency layering..."
+
+    # Foundation crates: domain logic, no orchestration or I/O
+    foundation=(
+        "forgeclaw-core"
+        "forgeclaw-auth"
+        "forgeclaw-health"
+    )
+
+    # Capability crates: must NOT be depended upon by foundation crates
+    capability=(
+        "forgeclaw-store"
+        "forgeclaw-scheduler"
+        "forgeclaw-router"
+        "forgeclaw-queue"
+        "forgeclaw-container"
+        "forgeclaw-ipc"
+        "forgeclaw-channels"
+        "forgeclaw-providers"
+        "forgeclaw-tanren"
+    )
+
+    failed=0
+    metadata=$({{ cargo }} metadata --format-version 1 --no-deps 2>/dev/null)
+
+    for fnd in "${foundation[@]}"; do
+        deps=$(echo "$metadata" \
+            | jq -r ".packages[] | select(.name == \"$fnd\") | .dependencies[].name" 2>/dev/null || true)
+        for cap in "${capability[@]}"; do
+            if echo "$deps" | grep -qx "$cap"; then
+                echo "FAIL: foundation crate '$fnd' depends on capability crate '$cap'"
+                failed=1
+            fi
+        done
+    done
+
+    if [[ "$failed" -eq 1 ]]; then
+        echo "Crate layering violation detected. Foundation crates must not depend on capability crates."
+        exit 1
+    fi
+    echo "Crate layering rules pass."
 
 # Prohibit inline lint suppression (#[allow/expect])
 check-suppression:
@@ -246,15 +302,17 @@ check-suppression:
     set -euo pipefail
     echo "Checking for inline lint suppression..."
     found=0
-    if grep -rn '#\[allow(' crates/ --include='*.rs' 2>/dev/null; then
+    search_dirs="crates/"
+    [[ -d bin/ ]] && search_dirs="crates/ bin/"
+    if grep -rn '#\[allow(' $search_dirs --include='*.rs' 2>/dev/null; then
         echo "FAIL: Found #[allow(...)] in source. Move to [lints] in Cargo.toml."
         found=1
     fi
-    if grep -rn '#\[expect(' crates/ --include='*.rs' 2>/dev/null; then
+    if grep -rn '#\[expect(' $search_dirs --include='*.rs' 2>/dev/null; then
         echo "FAIL: Found #[expect(...)] in source. Move to [lints] in Cargo.toml."
         found=1
     fi
-    if grep -rn '#!\[allow(' crates/ --include='*.rs' 2>/dev/null; then
+    if grep -rn '#!\[allow(' $search_dirs --include='*.rs' 2>/dev/null; then
         echo "FAIL: Found #![allow(...)] in source. Move to [lints] in Cargo.toml."
         found=1
     fi
@@ -282,5 +340,5 @@ clean:
 # ============================================================================
 
 # Run full CI check locally
-ci: fmt lint deny check-lines check-suppression test doc machete
+ci: fmt lint check check-lines check-suppression check-deps deny test doc machete
     @echo "==> All CI checks passed!"

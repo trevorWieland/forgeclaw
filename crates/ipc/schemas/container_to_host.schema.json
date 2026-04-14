@@ -1,0 +1,721 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ContainerToHost",
+  "description": "A message sent from an agent container to the host.\n\nSerialized as an internally-tagged JSON object with a `type`\ndiscriminator. See [`docs/IPC_PROTOCOL.md`](../../../../docs/IPC_PROTOCOL.md)\n§Container → Host for the wire format.",
+  "oneOf": [
+    {
+      "description": "`ready` — adapter has initialized and is ready to receive work.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "ready"
+        }
+      },
+      "$ref": "#/$defs/ReadyPayload",
+      "required": [
+        "type"
+      ]
+    },
+    {
+      "description": "`output_delta` — incremental text chunk streamed from the model.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "output_delta"
+        }
+      },
+      "$ref": "#/$defs/OutputDeltaPayload",
+      "required": [
+        "type"
+      ]
+    },
+    {
+      "description": "`output_complete` — final result for a job.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "output_complete"
+        }
+      },
+      "$ref": "#/$defs/OutputCompletePayload",
+      "required": [
+        "type"
+      ]
+    },
+    {
+      "description": "`progress` — optional progress signal for long-running work.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "progress"
+        }
+      },
+      "$ref": "#/$defs/ProgressPayload",
+      "required": [
+        "type"
+      ]
+    },
+    {
+      "description": "`command` — agent-to-host command (send message, schedule task,\ndispatch Tanren, etc.).",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "command"
+        }
+      },
+      "$ref": "#/$defs/CommandPayload",
+      "required": [
+        "type"
+      ]
+    },
+    {
+      "description": "`error` — adapter reports an error.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "error"
+        }
+      },
+      "$ref": "#/$defs/ErrorPayload",
+      "required": [
+        "type"
+      ]
+    },
+    {
+      "description": "`heartbeat` — periodic liveness signal.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "heartbeat"
+        }
+      },
+      "$ref": "#/$defs/HeartbeatPayload",
+      "required": [
+        "type"
+      ]
+    }
+  ],
+  "$defs": {
+    "BranchPolicy": {
+      "description": "Branch strategy for self-improvement dispatches.",
+      "oneOf": [
+        {
+          "description": "Create a new branch for the work.",
+          "type": "string",
+          "const": "create"
+        },
+        {
+          "description": "Reuse an existing branch.",
+          "type": "string",
+          "const": "reuse"
+        }
+      ]
+    },
+    "CancelTaskPayload": {
+      "description": "Cancel a previously scheduled task.\n\nAuthorization: main agent may cancel any task; non-main agents may\ncancel only their own tasks.",
+      "type": "object",
+      "properties": {
+        "task_id": {
+          "description": "Task to cancel.",
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        }
+      },
+      "required": [
+        "task_id"
+      ]
+    },
+    "CommandPayload": {
+      "description": "`command` — IPC command from the agent to the host.\n\nWraps [`CommandBody`] with `#[serde(flatten)]` so the serialized\nJSON contains `command` and `payload` fields at the top level\nalongside the `type` discriminator added by\n[`crate::message::ContainerToHost`].",
+      "type": "object",
+      "oneOf": [
+        {
+          "description": "Send a chat message to a group.",
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string",
+              "const": "send_message"
+            },
+            "payload": {
+              "$ref": "#/$defs/SendMessagePayload"
+            }
+          },
+          "required": [
+            "command",
+            "payload"
+          ]
+        },
+        {
+          "description": "Schedule a recurring or one-off task.",
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string",
+              "const": "schedule_task"
+            },
+            "payload": {
+              "$ref": "#/$defs/ScheduleTaskPayload"
+            }
+          },
+          "required": [
+            "command",
+            "payload"
+          ]
+        },
+        {
+          "description": "Pause a previously scheduled task.",
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string",
+              "const": "pause_task"
+            },
+            "payload": {
+              "$ref": "#/$defs/PauseTaskPayload"
+            }
+          },
+          "required": [
+            "command",
+            "payload"
+          ]
+        },
+        {
+          "description": "Cancel a previously scheduled task.",
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string",
+              "const": "cancel_task"
+            },
+            "payload": {
+              "$ref": "#/$defs/CancelTaskPayload"
+            }
+          },
+          "required": [
+            "command",
+            "payload"
+          ]
+        },
+        {
+          "description": "Register a new group (main-only).",
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string",
+              "const": "register_group"
+            },
+            "payload": {
+              "$ref": "#/$defs/RegisterGroupPayload"
+            }
+          },
+          "required": [
+            "command",
+            "payload"
+          ]
+        },
+        {
+          "description": "Dispatch a Tanren job.",
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string",
+              "const": "dispatch_tanren"
+            },
+            "payload": {
+              "$ref": "#/$defs/DispatchTanrenPayload"
+            }
+          },
+          "required": [
+            "command",
+            "payload"
+          ]
+        },
+        {
+          "description": "Dispatch a self-improvement job (main-only).",
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string",
+              "const": "dispatch_self_improvement"
+            },
+            "payload": {
+              "$ref": "#/$defs/DispatchSelfImprovementPayload"
+            }
+          },
+          "required": [
+            "command",
+            "payload"
+          ]
+        }
+      ]
+    },
+    "DispatchSelfImprovementPayload": {
+      "description": "Dispatch a self-improvement job.\n\nAuthorization: main agent only.",
+      "type": "object",
+      "properties": {
+        "acceptance_tests": {
+          "description": "Acceptance tests that must pass for the improvement to land.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "branch_policy": {
+          "description": "Branch strategy for this improvement.",
+          "$ref": "#/$defs/BranchPolicy"
+        },
+        "objective": {
+          "description": "Human-readable objective for the improvement.",
+          "type": "string"
+        },
+        "scopes": {
+          "description": "Scope constraints (e.g. which crates or subsystems).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "objective",
+        "scopes",
+        "acceptance_tests",
+        "branch_policy"
+      ]
+    },
+    "DispatchTanrenPayload": {
+      "description": "Dispatch a Tanren job.\n\nAuthorization: groups with Tanren permission only.",
+      "type": "object",
+      "properties": {
+        "branch": {
+          "description": "Git branch to work on.",
+          "type": "string"
+        },
+        "environment_profile": {
+          "description": "Optional environment profile override.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "phase": {
+          "description": "Tanren execution phase.",
+          "$ref": "#/$defs/TanrenPhase"
+        },
+        "project": {
+          "description": "Target project name.",
+          "type": "string"
+        },
+        "prompt": {
+          "description": "Prompt / instructions for the dispatch.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project",
+        "branch",
+        "phase",
+        "prompt"
+      ]
+    },
+    "ErrorCode": {
+      "description": "Classification of an agent-reported error.\n\nClosed enum on the wire — a value not in this list is a protocol\nerror. See `docs/IPC_PROTOCOL.md` §Error Handling for meanings.",
+      "oneOf": [
+        {
+          "description": "The model provider returned an error (e.g. HTTP 429).",
+          "type": "string",
+          "const": "provider_error"
+        },
+        {
+          "description": "Tool execution inside the agent failed.",
+          "type": "string",
+          "const": "tool_error"
+        },
+        {
+          "description": "The agent adapter hit an internal failure.",
+          "type": "string",
+          "const": "adapter_error"
+        },
+        {
+          "description": "The host sent a malformed message.",
+          "type": "string",
+          "const": "protocol_error"
+        },
+        {
+          "description": "An adapter-side timeout fired.",
+          "type": "string",
+          "const": "timeout"
+        }
+      ]
+    },
+    "ErrorPayload": {
+      "description": "`error` — the agent reports an error to the host.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "description": "Error classification.",
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "fatal": {
+          "description": "Whether the container should be shut down after this error.",
+          "type": "boolean"
+        },
+        "job_id": {
+          "description": "Job identifier, if the error relates to a specific job.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "message": {
+          "description": "Human-readable description of the failure.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "fatal"
+      ]
+    },
+    "GroupExtensions": {
+      "description": "Typed extension envelope for group registration.\n\nEnforces that extensions are a JSON object (not an arbitrary\nscalar or array) and carries a schema version for forward\ncompatibility. Shape details are owned by the `router` crate;\nthis crate transports the envelope.",
+      "type": "object",
+      "properties": {
+        "version": {
+          "description": "Schema version for extension compatibility (e.g. `\"1\"`).",
+          "type": "string"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "version"
+      ]
+    },
+    "HeartbeatPayload": {
+      "description": "`heartbeat` — periodic liveness signal during processing.",
+      "type": "object",
+      "properties": {
+        "timestamp": {
+          "description": "ISO 8601 timestamp when the heartbeat was emitted. Carried as a\nstring so the crate stays neutral to timestamp precision.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "timestamp"
+      ]
+    },
+    "OutputCompletePayload": {
+      "description": "`output_complete` — final result for a job.",
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "description": "Job identifier this completion belongs to.",
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "result": {
+          "description": "Final text output. `None` for tools-only turns.\n\nRequired on the wire even when `null` — adapters must not omit\nthis key. See `docs/IPC_PROTOCOL.md` §`output_complete`.",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Adapter-specific session identifier for resume.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stop_reason": {
+          "description": "Why the model stopped generating.",
+          "$ref": "#/$defs/StopReason"
+        },
+        "token_usage": {
+          "description": "Token accounting for this turn.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TokenUsage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "job_id",
+        "result",
+        "stop_reason"
+      ]
+    },
+    "OutputDeltaPayload": {
+      "description": "`output_delta` — incremental text chunk streamed from the model.",
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "description": "Job identifier this chunk belongs to.",
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "text": {
+          "description": "Incremental text chunk.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "job_id"
+      ]
+    },
+    "PauseTaskPayload": {
+      "description": "Pause a previously scheduled task.\n\nAuthorization: main agent may pause any task; non-main agents may\npause only their own tasks.",
+      "type": "object",
+      "properties": {
+        "task_id": {
+          "description": "Task to pause.",
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        }
+      },
+      "required": [
+        "task_id"
+      ]
+    },
+    "ProgressPayload": {
+      "description": "`progress` — optional progress signal for long-running operations.",
+      "type": "object",
+      "properties": {
+        "detail": {
+          "description": "Optional human-readable detail.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "job_id": {
+          "description": "Job this progress signal belongs to.",
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "percent": {
+          "description": "Optional completion percentage (0-100).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint8",
+          "maximum": 100,
+          "minimum": 0
+        },
+        "stage": {
+          "description": "Logical stage name (e.g. `tool_execution`).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "job_id",
+        "stage"
+      ]
+    },
+    "ReadyPayload": {
+      "description": "`ready` — sent immediately after connect. Signals the adapter has\ninitialized and is ready to receive work.",
+      "type": "object",
+      "properties": {
+        "adapter": {
+          "description": "Name of the agent adapter (e.g. `claude-code`).",
+          "type": "string"
+        },
+        "adapter_version": {
+          "description": "Adapter implementation version.",
+          "type": "string"
+        },
+        "protocol_version": {
+          "description": "IPC protocol version the adapter supports (e.g. `\"1.0\"`).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "adapter",
+        "adapter_version",
+        "protocol_version"
+      ]
+    },
+    "RegisterGroupPayload": {
+      "description": "Register a new group.\n\nAuthorization: main agent only.\n\nThe required `name` field is typed here. Additional group\nconfiguration owned by the `router` crate travels in the\noptional [`GroupExtensions`] envelope.",
+      "type": "object",
+      "properties": {
+        "extensions": {
+          "description": "Additional group configuration, versioned and typed as a\nJSON object. See [`GroupExtensions`].",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GroupExtensions"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "description": "Human-readable group name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "ScheduleTaskPayload": {
+      "description": "Schedule a recurring or one-off task.\n\nAuthorization: main agent may target any group; non-main agents\nmay target only their own group.",
+      "type": "object",
+      "properties": {
+        "context_mode": {
+          "description": "Optional context mode override.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "group": {
+          "description": "Group to schedule the task for.",
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "prompt": {
+          "description": "The prompt to execute on each run.",
+          "type": "string"
+        },
+        "schedule_type": {
+          "description": "Schedule type.",
+          "$ref": "#/$defs/ScheduleType"
+        },
+        "schedule_value": {
+          "description": "Schedule value (cron expression, duration, or timestamp).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "group",
+        "schedule_type",
+        "schedule_value",
+        "prompt"
+      ]
+    },
+    "ScheduleType": {
+      "description": "The type of schedule for a scheduled task.",
+      "oneOf": [
+        {
+          "description": "Cron expression schedule.",
+          "type": "string",
+          "const": "cron"
+        },
+        {
+          "description": "Fixed-interval schedule.",
+          "type": "string",
+          "const": "interval"
+        },
+        {
+          "description": "Single execution at a specific time.",
+          "type": "string",
+          "const": "once"
+        }
+      ]
+    },
+    "SendMessagePayload": {
+      "description": "Send a chat message to a group.\n\nAuthorization: main agent may target any group; non-main agents\nmay target only their own group.",
+      "type": "object",
+      "properties": {
+        "target_group": {
+          "description": "Group to send the message to.",
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "text": {
+          "description": "Message text.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target_group",
+        "text"
+      ]
+    },
+    "StopReason": {
+      "description": "Why the model stopped generating the current turn.\n\nClosed enum on the wire — a value not in this list is a protocol\nerror, not a silent fallback.",
+      "oneOf": [
+        {
+          "description": "The model emitted an end-of-turn signal.",
+          "type": "string",
+          "const": "end_turn"
+        },
+        {
+          "description": "The model hit its maximum output-token cap.",
+          "type": "string",
+          "const": "max_tokens"
+        },
+        {
+          "description": "The model invoked a tool and is waiting for a tool result.",
+          "type": "string",
+          "const": "tool_use"
+        }
+      ]
+    },
+    "TanrenPhase": {
+      "description": "Tanren execution phase.",
+      "oneOf": [
+        {
+          "description": "Execute the primary task.",
+          "type": "string",
+          "const": "do-task"
+        },
+        {
+          "description": "Run gate checks (tests, lints).",
+          "type": "string",
+          "const": "gate"
+        },
+        {
+          "description": "Perform a code audit (wire name: `audit-task`).",
+          "type": "string",
+          "const": "audit-task"
+        }
+      ]
+    },
+    "TokenUsage": {
+      "description": "Token accounting reported alongside an `output_complete` message.",
+      "type": "object",
+      "properties": {
+        "input_tokens": {
+          "description": "Input tokens billed to the provider for this turn.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "output_tokens": {
+          "description": "Output tokens billed to the provider for this turn.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "input_tokens",
+        "output_tokens"
+      ]
+    }
+  }
+}

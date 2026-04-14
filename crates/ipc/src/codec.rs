@@ -52,6 +52,9 @@ pub const LENGTH_PREFIX_BYTES: usize = 4;
 /// a protocol error and the socket is torn down.
 pub const MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
 
+/// Default cap on consecutive unknown-type frames before poisoning.
+pub(crate) const DEFAULT_MAX_UNKNOWN_SKIPS: usize = 32;
+
 /// Length-prefixed JSON frame codec.
 ///
 /// Implements [`tokio_util::codec::Encoder<Bytes>`] and
@@ -205,10 +208,11 @@ pub(crate) fn decode_typed_message<T: DeserializeOwned>(
     bytes: &[u8],
     known_types: &[&str],
 ) -> Result<T, IpcError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| FrameError::InvalidUtf8)?;
-    match serde_json::from_str::<T>(text) {
+    match serde_json::from_slice::<T>(bytes) {
         Ok(msg) => Ok(msg),
         Err(full_err) => {
+            // Distinguish invalid UTF-8 from malformed JSON.
+            let text = std::str::from_utf8(bytes).map_err(|_| FrameError::InvalidUtf8)?;
             // Two-pass: probe the type field structurally.
             if let Ok(TypeProbe { ty }) = serde_json::from_str::<TypeProbe>(text) {
                 if !known_types.contains(&ty.as_str()) {
@@ -232,12 +236,12 @@ pub(crate) fn encode_message<T: Serialize>(msg: &T) -> Result<Bytes, IpcError> {
 }
 
 /// Typed alias — turn a frame into a [`ContainerToHost`].
-pub(crate) fn decode_container_to_host(bytes: &[u8]) -> Result<ContainerToHost, IpcError> {
+pub fn decode_container_to_host(bytes: &[u8]) -> Result<ContainerToHost, IpcError> {
     decode_typed_message::<ContainerToHost>(bytes, ContainerToHost::KNOWN_TYPES)
 }
 
 /// Typed alias — turn a frame into a [`HostToContainer`].
-pub(crate) fn decode_host_to_container(bytes: &[u8]) -> Result<HostToContainer, IpcError> {
+pub fn decode_host_to_container(bytes: &[u8]) -> Result<HostToContainer, IpcError> {
     decode_typed_message::<HostToContainer>(bytes, HostToContainer::KNOWN_TYPES)
 }
 

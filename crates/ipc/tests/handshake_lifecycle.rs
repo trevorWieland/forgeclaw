@@ -1,13 +1,14 @@
 //! End-to-end lifecycle tests over real Unix sockets.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use forgeclaw_core::{GroupId, JobId};
 use forgeclaw_ipc::{
-    ContainerToHost, FrameError, GroupInfo, HeartbeatPayload, HistoricalMessage, HostToContainer,
-    InitConfig, InitContext, InitPayload, IpcClient, IpcError, IpcServer, MessagesPayload,
-    OutputCompletePayload, ProtocolError, ReadyPayload, ShutdownPayload, ShutdownReason,
-    StopReason,
+    ContainerToHost, GroupCapabilities, GroupInfo, HeartbeatPayload, HistoricalMessage,
+    HostToContainer, InitConfig, InitContext, InitPayload, IpcClient, IpcError, IpcServer,
+    MessagesPayload, OutputCompletePayload, ProtocolError, ReadyPayload, ShutdownPayload,
+    ShutdownReason, StopReason,
 };
 use tempfile::tempdir;
 
@@ -23,6 +24,17 @@ fn sample_ready(version: &str) -> ReadyPayload {
     }
 }
 
+const HS_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn sample_group() -> GroupInfo {
+    GroupInfo {
+        id: GroupId::from("group-main"),
+        name: "Main".to_owned(),
+        is_main: true,
+        capabilities: GroupCapabilities::default(),
+    }
+}
+
 fn sample_init() -> InitPayload {
     InitPayload {
         job_id: JobId::from("job-integration-1"),
@@ -32,6 +44,7 @@ fn sample_init() -> InitPayload {
                 id: GroupId::from("group-main"),
                 name: "Main".to_owned(),
                 is_main: true,
+                capabilities: GroupCapabilities::default(),
             },
             timezone: "UTC".to_owned(),
         },
@@ -57,18 +70,18 @@ async fn handshake_happy_path() {
     let accept_task = {
         let server = server;
         tokio::spawn(async move {
-            let mut conn = server.accept().await.expect("accept");
-            let ready = conn
-                .handshake(sample_init())
+            let pending = server.accept(sample_group()).await.expect("accept");
+            let (conn, ready) = pending
+                .handshake(sample_init(), HS_TIMEOUT)
                 .await
                 .expect("server handshake");
             (conn, ready)
         })
     };
 
-    let mut client = IpcClient::connect(&path).await.expect("connect");
-    let init = client
-        .handshake(sample_ready("1.0"))
+    let pending = IpcClient::connect(&path).await.expect("connect");
+    let (_client, init) = pending
+        .handshake(sample_ready("1.0"), HS_TIMEOUT)
         .await
         .expect("client handshake");
 
@@ -85,17 +98,16 @@ async fn handshake_rejects_mismatched_major_version() {
     let server = IpcServer::bind(&path).expect("bind");
 
     let accept_task = tokio::spawn(async move {
-        let mut conn = server.accept().await.expect("accept");
-        conn.handshake(sample_init()).await
+        let pending = server.accept(sample_group()).await.expect("accept");
+        pending.handshake(sample_init(), HS_TIMEOUT).await
     });
 
-    let mut client = IpcClient::connect(&path).await.expect("connect");
-    // Client sends Ready first; the server's handshake will fail
-    // with UnsupportedVersion before it ever sends Init.
-    client
-        .send(&ContainerToHost::Ready(sample_ready("2.0")))
-        .await
-        .expect("client send ready");
+    let client_pending = IpcClient::connect(&path).await.expect("connect");
+    // Client sends Ready with unsupported version "2.0"; the server's
+    // handshake will fail with UnsupportedVersion.
+    let _ = client_pending
+        .handshake(sample_ready("2.0"), HS_TIMEOUT)
+        .await;
 
     let server_result = accept_task.await.expect("join");
     let err = server_result.expect_err("handshake rejected");
@@ -116,9 +128,9 @@ async fn full_duplex_exchange_after_handshake() {
     let server = IpcServer::bind(&path).expect("bind");
 
     let accept_task = tokio::spawn(async move {
-        let mut conn = server.accept().await.expect("accept");
-        let _ready = conn
-            .handshake(sample_init())
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (mut conn, _ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
             .await
             .expect("server handshake");
         // Host sends a shutdown, then receives an output_complete.
@@ -131,9 +143,9 @@ async fn full_duplex_exchange_after_handshake() {
         conn.recv_container().await.expect("recv last msg")
     });
 
-    let mut client = IpcClient::connect(&path).await.expect("connect");
-    let _init = client
-        .handshake(sample_ready("1.0"))
+    let pending = IpcClient::connect(&path).await.expect("connect");
+    let (mut client, _init) = pending
+        .handshake(sample_ready("1.0"), HS_TIMEOUT)
         .await
         .expect("client handshake");
     let shutdown = client.recv().await.expect("recv shutdown");
@@ -172,14 +184,17 @@ async fn heartbeat_exchange_after_handshake() {
     let server = IpcServer::bind(&path).expect("bind");
 
     let accept_task = tokio::spawn(async move {
-        let mut conn = server.accept().await.expect("accept");
-        let _ready = conn.handshake(sample_init()).await.expect("handshake");
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (mut conn, _ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
+            .await
+            .expect("handshake");
         conn.recv_container().await.expect("recv heartbeat")
     });
 
-    let mut client = IpcClient::connect(&path).await.expect("connect");
-    let _init = client
-        .handshake(sample_ready("1.0"))
+    let pending = IpcClient::connect(&path).await.expect("connect");
+    let (mut client, _init) = pending
+        .handshake(sample_ready("1.0"), HS_TIMEOUT)
         .await
         .expect("client handshake");
     client
@@ -199,13 +214,20 @@ async fn peer_disconnect_before_handshake_reports_closed() {
     let path = socket_path(&dir, "ipc.sock");
     let server = IpcServer::bind(&path).expect("bind");
 
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let accept_task = tokio::spawn(async move {
-        let mut conn = server.accept().await.expect("accept");
-        conn.recv_container().await
+        let pending = server.accept(sample_group()).await.expect("accept");
+        // Signal that accept (and peer_cred) has completed.
+        let _ = tx.send(());
+        pending
+            .handshake(sample_init(), HS_TIMEOUT)
+            .await
+            .map(|(_conn, ready)| ready)
     });
 
-    // Open and immediately drop the client socket.
+    // Connect, wait for accept to capture credentials, then drop.
     let client = IpcClient::connect(&path).await.expect("connect");
+    let _ = rx.await;
     drop(client);
 
     let result = accept_task.await.expect("join");
@@ -259,95 +281,6 @@ async fn bind_refuses_regular_file_at_path() {
     );
 }
 
-// --- Raw-socket adversarial input tests ---
-
-/// Write a length-prefixed frame to a raw socket.
-fn raw_send(stream: &mut std::os::unix::net::UnixStream, payload: &[u8]) {
-    use std::io::Write;
-    let len = u32::try_from(payload.len()).expect("payload fits in u32");
-    stream.write_all(&len.to_be_bytes()).expect("write len");
-    stream.write_all(payload).expect("write payload");
-    stream.flush().expect("flush");
-}
-
-async fn raw_recv_error(payload: &'static [u8]) -> IpcError {
-    let dir = tempdir().expect("tempdir");
-    let path = socket_path(&dir, "ipc.sock");
-    let server = IpcServer::bind(&path).expect("bind");
-    let accept_task = tokio::spawn(async move {
-        let mut conn = server.accept().await.expect("accept");
-        conn.recv_container().await
-    });
-    let mut raw = std::os::unix::net::UnixStream::connect(&path).expect("raw connect");
-    raw_send(&mut raw, payload);
-    drop(raw);
-    accept_task.await.expect("join").expect_err("should error")
-}
-
-#[tokio::test]
-async fn raw_invalid_utf8_through_socket() {
-    let err = raw_recv_error(&[0xFF, 0xFE, 0xFD]).await;
-    assert!(matches!(err, IpcError::Frame(FrameError::InvalidUtf8)));
-}
-
-#[tokio::test]
-async fn raw_malformed_json_through_socket() {
-    let err = raw_recv_error(b"{not json at all}").await;
-    assert!(matches!(err, IpcError::Frame(FrameError::MalformedJson(_))));
-}
-
-#[tokio::test]
-async fn raw_missing_required_fields_through_socket() {
-    let err = raw_recv_error(br#"{"type":"ready"}"#).await;
-    assert!(matches!(err, IpcError::Frame(FrameError::MalformedJson(_))));
-}
-
-#[tokio::test]
-async fn unknown_type_skipped_during_handshake() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let dir = tempdir().expect("tempdir");
-    let path = socket_path(&dir, "ipc.sock");
-    let server = IpcServer::bind(&path).expect("bind");
-
-    let accept_task = tokio::spawn(async move {
-        let mut conn = server.accept().await.expect("accept");
-        conn.handshake(sample_init()).await
-    });
-
-    // Use async tokio UnixStream so we don't block the executor.
-    let mut raw = tokio::net::UnixStream::connect(&path)
-        .await
-        .expect("raw connect");
-
-    // Send an unknown-type frame first, then a proper Ready.
-    let unknown_payload = br#"{"type":"experimental_v2","data":42}"#;
-    let unknown_len = u32::try_from(unknown_payload.len()).expect("fits");
-    raw.write_all(&unknown_len.to_be_bytes()).await.expect("w");
-    raw.write_all(unknown_payload).await.expect("w");
-
-    let ready_json =
-        serde_json::to_vec(&ContainerToHost::Ready(sample_ready("1.0"))).expect("serialize ready");
-    let ready_len = u32::try_from(ready_json.len()).expect("fits");
-    raw.write_all(&ready_len.to_be_bytes()).await.expect("w");
-    raw.write_all(&ready_json).await.expect("w");
-    raw.flush().await.expect("flush");
-
-    // Read back the Init response so the server handshake completes.
-    let mut len_buf = [0u8; 4];
-    raw.read_exact(&mut len_buf).await.expect("read init len");
-    let len = u32::from_be_bytes(len_buf) as usize;
-    let mut payload_buf = vec![0u8; len];
-    raw.read_exact(&mut payload_buf)
-        .await
-        .expect("read init payload");
-    drop(raw);
-
-    // Server handshake should have succeeded (skipping the unknown message).
-    let ready = accept_task.await.expect("join").expect("handshake ok");
-    assert_eq!(ready.adapter, "test-adapter");
-}
-
 #[tokio::test]
 async fn messages_exchange_after_init() {
     let dir = tempdir().expect("tempdir");
@@ -355,9 +288,9 @@ async fn messages_exchange_after_init() {
     let server = IpcServer::bind(&path).expect("bind");
 
     let accept_task = tokio::spawn(async move {
-        let mut conn = server.accept().await.expect("accept");
-        let _ready = conn
-            .handshake(sample_init())
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (mut conn, _ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
             .await
             .expect("server handshake");
         // Host sends a follow-up Messages payload.
@@ -374,9 +307,9 @@ async fn messages_exchange_after_init() {
         conn.recv_container().await.expect("recv complete")
     });
 
-    let mut client = IpcClient::connect(&path).await.expect("connect");
-    let _init = client
-        .handshake(sample_ready("1.0"))
+    let pending = IpcClient::connect(&path).await.expect("connect");
+    let (mut client, _init) = pending
+        .handshake(sample_ready("1.0"), HS_TIMEOUT)
         .await
         .expect("client handshake");
     let msg = client.recv().await.expect("recv messages");
@@ -398,30 +331,126 @@ async fn messages_exchange_after_init() {
 }
 
 #[tokio::test]
-async fn post_error_connection_is_poisoned() {
+async fn session_identity_survives_split_with_group_binding() {
     let dir = tempdir().expect("tempdir");
     let path = socket_path(&dir, "ipc.sock");
     let server = IpcServer::bind(&path).expect("bind");
 
     let accept_task = tokio::spawn(async move {
-        let mut conn = server.accept().await.expect("accept");
-        // First recv gets a malformed frame → connection poisoned.
-        let err1 = conn.recv_container().await;
-        assert!(err1.is_err(), "malformed frame should error");
-        // Second recv should immediately return Closed (not garbage).
-        let err2 = conn.recv_container().await;
-        assert!(
-            matches!(err2, Err(IpcError::Closed)),
-            "poisoned connection should return Closed, got {err2:?}"
-        );
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (conn, _ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
+            .await
+            .expect("handshake");
+        // Group should be bound after handshake.
+        {
+            let id = conn.identity().lock().expect("lock");
+            let group = id.group();
+            assert!(group.is_main, "should be main group");
+            assert!(id.is_main());
+        }
+        // Split and verify identity survives on both halves.
+        let (writer, reader) = conn.into_split();
+        {
+            let id = writer.identity().lock().expect("lock");
+            assert_eq!(id.group().id.as_ref(), "group-main");
+        }
+        {
+            let id = reader.identity().lock().expect("lock");
+            assert_eq!(id.group().id.as_ref(), "group-main");
+        }
     });
 
-    let mut raw = std::os::unix::net::UnixStream::connect(&path).expect("raw connect");
-    raw_send(&mut raw, &[0xFF, 0xFE, 0xFD]); // invalid UTF-8
-    // Write a valid-looking frame that should never be processed.
-    let valid = br#"{"type":"ready","adapter":"x","adapter_version":"v","protocol_version":"1.0"}"#;
-    raw_send(&mut raw, valid);
-    drop(raw);
+    let pending = IpcClient::connect(&path).await.expect("connect");
+    let (_client, _init) = pending
+        .handshake(sample_ready("1.0"), HS_TIMEOUT)
+        .await
+        .expect("client handshake");
 
     accept_task.await.expect("join");
+}
+
+#[tokio::test]
+async fn handshake_rejects_group_mismatch() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ipc.sock");
+    let server = IpcServer::bind(&path).expect("bind");
+
+    // init.context.group has a different ID than the group parameter.
+    let mut init = sample_init();
+    init.context.group = GroupInfo {
+        id: GroupId::from("group-other"),
+        name: "Other".to_owned(),
+        is_main: false,
+        capabilities: GroupCapabilities::default(),
+    };
+    let session_group = sample_group(); // group-main
+
+    let accept_task = tokio::spawn(async move {
+        let pending = server.accept(session_group).await.expect("accept");
+        pending.handshake(init, HS_TIMEOUT).await
+    });
+
+    let client_pending = IpcClient::connect(&path).await.expect("connect");
+    // Client handshake will fail because the server rejects after
+    // detecting the mismatch, poisoning the connection.
+    let _ = client_pending
+        .handshake(sample_ready("1.0"), HS_TIMEOUT)
+        .await;
+
+    let err = accept_task
+        .await
+        .expect("join")
+        .expect_err("should reject mismatch");
+    assert!(
+        matches!(err, IpcError::Protocol(ProtocolError::GroupMismatch { .. })),
+        "expected GroupMismatch, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn handshake_overwrites_same_id_different_metadata_from_session_identity() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ipc-meta-drift.sock");
+    let server = IpcServer::bind(&path).expect("bind");
+
+    // Session group has one name and capabilities...
+    let session_group = GroupInfo {
+        id: GroupId::from("group-main"),
+        name: "Main".to_owned(),
+        is_main: true,
+        capabilities: GroupCapabilities::default(),
+    };
+
+    // ...but init carries the same ID with different metadata.
+    let mut init = sample_init();
+    init.context.group = GroupInfo {
+        id: GroupId::from("group-main"),
+        name: "Main (Updated)".to_owned(),
+        is_main: false,
+        capabilities: GroupCapabilities { tanren: true },
+    };
+
+    let accept_task = tokio::spawn(async move {
+        let pending = server.accept(session_group).await.expect("accept");
+        pending.handshake(init, HS_TIMEOUT).await
+    });
+
+    let client_pending = IpcClient::connect(&path).await.expect("connect");
+    let (_client, received_init) = client_pending
+        .handshake(sample_ready("1.0"), HS_TIMEOUT)
+        .await
+        .expect("client handshake");
+
+    let result = accept_task.await.expect("join");
+    assert!(
+        result.is_ok(),
+        "same group ID with different metadata should succeed, got {result:?}"
+    );
+    assert_eq!(received_init.context.group.name, "Main");
+    assert!(received_init.context.group.is_main);
+    assert_eq!(
+        received_init.context.group.capabilities,
+        GroupCapabilities::default(),
+    );
 }

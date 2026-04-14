@@ -2,11 +2,13 @@
 //! full-duplex, and peer-observable teardown in split mode.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use forgeclaw_core::{GroupId, JobId};
 use forgeclaw_ipc::{
-    ContainerToHost, GroupInfo, HostToContainer, InitConfig, InitContext, InitPayload, IpcClient,
-    IpcServer, OutputDeltaPayload, ReadyPayload, ShutdownPayload, ShutdownReason,
+    ContainerToHost, GroupCapabilities, GroupInfo, HostToContainer, InitConfig, InitContext,
+    InitPayload, IpcClient, IpcServer, OutputDeltaPayload, ReadyPayload, ShutdownPayload,
+    ShutdownReason,
 };
 use tempfile::tempdir;
 
@@ -22,6 +24,17 @@ fn sample_ready(version: &str) -> ReadyPayload {
     }
 }
 
+const HS_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn sample_group() -> GroupInfo {
+    GroupInfo {
+        id: GroupId::from("group-main"),
+        name: "Main".to_owned(),
+        is_main: true,
+        capabilities: GroupCapabilities::default(),
+    }
+}
+
 fn sample_init() -> InitPayload {
     InitPayload {
         job_id: JobId::from("job-integration-1"),
@@ -31,6 +44,7 @@ fn sample_init() -> InitPayload {
                 id: GroupId::from("group-main"),
                 name: "Main".to_owned(),
                 is_main: true,
+                capabilities: GroupCapabilities::default(),
             },
             timezone: "UTC".to_owned(),
         },
@@ -53,15 +67,15 @@ async fn concurrent_send_recv_through_split() {
     let server = IpcServer::bind(&path).expect("bind");
 
     let accept_task = tokio::spawn(async move {
-        let mut conn = server.accept().await.expect("accept");
-        let _ready = conn
-            .handshake(sample_init())
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (conn, _ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
             .await
             .expect("server handshake");
         let (mut writer, mut reader) = conn.into_split();
 
         let write_task = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
             writer
                 .send_host(&HostToContainer::Shutdown(ShutdownPayload {
                     reason: ShutdownReason::HostShutdown,
@@ -76,9 +90,9 @@ async fn concurrent_send_recv_through_split() {
         write_task.await.expect("write task");
     });
 
-    let mut client = IpcClient::connect(&path).await.expect("connect");
-    let _init = client
-        .handshake(sample_ready("1.0"))
+    let pending_client = IpcClient::connect(&path).await.expect("connect");
+    let (mut client, _init) = pending_client
+        .handshake(sample_ready("1.0"), HS_TIMEOUT)
         .await
         .expect("client handshake");
 
@@ -104,9 +118,9 @@ async fn split_preserves_pipelined_buffered_bytes() {
     let server = IpcServer::bind(&path).expect("bind");
 
     let accept_task = tokio::spawn(async move {
-        let mut conn = server.accept().await.expect("accept");
-        let _ready = conn
-            .handshake(sample_init())
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (conn, _ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
             .await
             .expect("server handshake");
         let (_writer, mut reader) = conn.into_split();
@@ -159,9 +173,9 @@ async fn split_reader_error_immediately_closes_transport() {
     // write half *directly* — without the writer ever running again.
     // The writer is held but never called.
     let accept_task = tokio::spawn(async move {
-        let mut conn = server.accept().await.expect("accept");
-        let _ready = conn
-            .handshake(sample_init())
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (conn, _ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
             .await
             .expect("server handshake");
         let (_writer, mut reader) = conn.into_split();

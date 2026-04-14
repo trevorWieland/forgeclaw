@@ -20,6 +20,7 @@
 //! codec — policy (log-and-continue vs tear-down) is left to the
 //! caller, per `docs/IPC_PROTOCOL.md` §Error Handling.
 
+pub mod authorized;
 pub mod command;
 pub mod container_to_host;
 pub mod host_to_container;
@@ -27,19 +28,26 @@ pub mod shared;
 
 use serde::{Deserialize, Serialize};
 
+pub use authorized::{
+    AuthorizedCommand, GroupCommand, MainGroupCommand, OwnershipPending,
+    PrivilegedAuthorizedCommand, ScopedAuthorizedCommand,
+};
 pub use command::{
     BranchPolicy, CancelTaskPayload, CommandBody, CommandPayload, DispatchSelfImprovementPayload,
-    DispatchTanrenPayload, PauseTaskPayload, RegisterGroupPayload, ScheduleTaskPayload,
-    ScheduleType, SendMessagePayload, TanrenPhase,
+    DispatchTanrenPayload, GroupExtensions, PauseTaskPayload, RegisterGroupPayload,
+    ScheduleTaskPayload, ScheduleType, SendMessagePayload, TanrenPhase,
 };
 pub use container_to_host::{
-    ErrorPayload, HeartbeatPayload, OutputCompletePayload, OutputDeltaPayload, ProgressPayload,
-    ReadyPayload,
+    ErrorPayload, HeartbeatPayload, OutputCompletePayload, OutputDeltaPayload, Percent,
+    PercentError, ProgressPayload, ReadyPayload,
 };
 pub use host_to_container::{
     InitConfig, InitContext, InitPayload, MessagesPayload, ShutdownPayload,
 };
-pub use shared::{ErrorCode, GroupInfo, HistoricalMessage, ShutdownReason, StopReason, TokenUsage};
+pub use shared::{
+    ErrorCode, GroupCapabilities, GroupInfo, HistoricalMessage, ShutdownReason, StopReason,
+    TokenUsage,
+};
 
 /// A message sent from an agent container to the host.
 ///
@@ -47,6 +55,7 @@ pub use shared::{ErrorCode, GroupInfo, HistoricalMessage, ShutdownReason, StopRe
 /// discriminator. See [`docs/IPC_PROTOCOL.md`](../../../../docs/IPC_PROTOCOL.md)
 /// §Container → Host for the wire format.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContainerToHost {
     /// `ready` — adapter has initialized and is ready to receive work.
@@ -95,6 +104,25 @@ impl ContainerToHost {
             Self::Heartbeat(_) => "heartbeat",
         }
     }
+
+    /// If this is a `command` message, classify its body into
+    /// the privilege-separated type system.
+    ///
+    /// Returns `None` for non-command messages. Used internally
+    /// by the server's `recv_command` to apply the authorization
+    /// matrix.
+    #[must_use]
+    pub(crate) fn classify_command(self) -> Option<command::ClassifiedCommand> {
+        match self {
+            Self::Command(cmd) => Some(cmd.body.classify()),
+            Self::Ready(_)
+            | Self::OutputDelta(_)
+            | Self::OutputComplete(_)
+            | Self::Progress(_)
+            | Self::Error(_)
+            | Self::Heartbeat(_) => None,
+        }
+    }
 }
 
 /// A message sent from the host to an agent container.
@@ -103,6 +131,7 @@ impl ContainerToHost {
 /// discriminator. See [`docs/IPC_PROTOCOL.md`](../../../../docs/IPC_PROTOCOL.md)
 /// §Host → Container for the wire format.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostToContainer {
     /// `init` — initial context and configuration for a job.
@@ -137,7 +166,7 @@ mod tests {
         InitConfig, InitContext, InitPayload, MessagesPayload, OutputCompletePayload,
         OutputDeltaPayload, ProgressPayload, ReadyPayload, SendMessagePayload, ShutdownPayload,
     };
-    use crate::message::shared::{GroupInfo, ShutdownReason, StopReason};
+    use crate::message::shared::{GroupCapabilities, GroupInfo, ShutdownReason, StopReason};
     use forgeclaw_core::{GroupId, JobId};
     use serde_json::json;
 
@@ -268,6 +297,7 @@ mod tests {
                     id: GroupId::from("group-main"),
                     name: "Main".to_owned(),
                     is_main: true,
+                    capabilities: GroupCapabilities::default(),
                 },
                 timezone: "UTC".to_owned(),
             },
@@ -321,6 +351,7 @@ mod tests {
                     id: GroupId::from("g"),
                     name: "n".to_owned(),
                     is_main: false,
+                    capabilities: GroupCapabilities::default(),
                 },
                 timezone: "UTC".to_owned(),
             },

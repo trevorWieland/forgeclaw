@@ -1,16 +1,16 @@
 //! Container-side Unix socket client.
 //!
-//! Mirrors [`crate::server::IpcConnection`] but from the container's
-//! perspective: [`IpcClient::connect`] dials the server, then
-//! [`IpcClient::handshake`] sends the initial [`ReadyPayload`] and
-//! awaits the host's [`InitPayload`] reply.
-//!
-//! After handshake, call [`IpcClient::into_split`] to get
-//! independent read/write halves for full-duplex operation.
+//! [`IpcClient::connect`] returns a [`PendingClient`]; a successful
+//! handshake promotes it to an [`IpcClient`] with the full
+//! post-handshake API.
 //!
 //! On any fatal error the client is automatically poisoned: the
 //! underlying socket is shut down and all subsequent calls return
 //! [`IpcError::Closed`].
+
+mod pending;
+
+pub use pending::PendingClient;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -22,30 +22,43 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, FramedRead, FramedWrite};
 
-use crate::codec::{FrameCodec, decode_host_to_container, encode_message};
+use crate::codec::{
+    DEFAULT_MAX_UNKNOWN_SKIPS, FrameCodec, decode_host_to_container, encode_message,
+};
 use crate::error::{IpcError, ProtocolError};
-use crate::message::{ContainerToHost, HostToContainer, InitPayload, ReadyPayload};
+use crate::message::{ContainerToHost, HostToContainer};
 use crate::util::{SharedWriteHalf, ShutdownHandle, truncate_for_log};
 
-/// Container-side IPC client.
+/// An established container-side IPC client.
 ///
-/// On any fatal error the underlying socket is shut down and the
-/// client is poisoned — all subsequent calls return
+/// Created by [`PendingClient::handshake`] after a successful
+/// handshake. On any fatal error the underlying socket is shut down
+/// and the client is poisoned — all subsequent calls return
 /// [`IpcError::Closed`].
 #[derive(Debug)]
 pub struct IpcClient {
     framed: Framed<UnixStream, FrameCodec>,
     poisoned: bool,
+    unknown_skip_count: usize,
 }
 
 impl IpcClient {
     /// Connect to an IPC server previously bound at `path`.
-    pub async fn connect(path: impl AsRef<Path>) -> Result<Self, IpcError> {
+    ///
+    /// Returns a [`PendingClient`] that must complete the handshake
+    /// before send/recv operations become available.
+    pub async fn connect(path: impl AsRef<Path>) -> Result<PendingClient, IpcError> {
         let stream = UnixStream::connect(path.as_ref()).await?;
-        Ok(Self {
-            framed: Framed::new(stream, FrameCodec::new()),
+        Ok(PendingClient::from_stream(stream))
+    }
+
+    /// Construct from an already-handshaked transport.
+    pub(crate) fn from_parts(framed: Framed<UnixStream, FrameCodec>) -> Self {
+        Self {
+            framed,
             poisoned: false,
-        })
+            unknown_skip_count: 0,
+        }
     }
 
     fn check_poisoned(&self) -> Result<(), IpcError> {
@@ -73,8 +86,13 @@ impl IpcClient {
         result
     }
 
-    /// Receive a [`HostToContainer`] message.
-    pub async fn recv(&mut self) -> Result<HostToContainer, IpcError> {
+    /// Receive a single [`HostToContainer`] frame without
+    /// forward-compatibility skipping.
+    ///
+    /// Returns [`ProtocolError::UnknownMessageType`] for unrecognized
+    /// `type` discriminators. Most callers should use [`recv`](Self::recv)
+    /// instead, which silently skips unknown types per the spec.
+    pub async fn recv_strict(&mut self) -> Result<HostToContainer, IpcError> {
         self.check_poisoned()?;
         let frame = match self.framed.next().await.transpose() {
             Ok(Some(f)) => f,
@@ -96,36 +114,37 @@ impl IpcClient {
         result
     }
 
-    /// Forward-compatible receive: skip unknown message types.
-    pub async fn recv_lossy(&mut self) -> Result<HostToContainer, IpcError> {
+    /// Receive a [`HostToContainer`] message.
+    ///
+    /// This is the spec-compliant default: unknown message types are
+    /// silently skipped (with a warning log) up to 32 consecutive
+    /// frames. Use [`recv_strict`](Self::recv_strict) if you need raw
+    /// decode errors for every frame.
+    pub async fn recv(&mut self) -> Result<HostToContainer, IpcError> {
         loop {
-            match self.recv().await {
-                Ok(msg) => return Ok(msg),
+            match self.recv_strict().await {
+                Ok(msg) => {
+                    self.unknown_skip_count = 0;
+                    return Ok(msg);
+                }
                 Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
+                    self.unknown_skip_count += 1;
+                    if self.unknown_skip_count > DEFAULT_MAX_UNKNOWN_SKIPS {
+                        let err = IpcError::Protocol(ProtocolError::TooManyUnknownMessages {
+                            count: self.unknown_skip_count,
+                            limit: DEFAULT_MAX_UNKNOWN_SKIPS,
+                        });
+                        self.poison().await;
+                        return Err(err);
+                    }
                     tracing::warn!(
                         target: "forgeclaw_ipc::client",
                         message_type = %truncate_for_log(&ty),
+                        skip_count = self.unknown_skip_count,
                         "ignoring unknown message type (forward compatibility)"
                     );
                 }
                 Err(e) => return Err(e),
-            }
-        }
-    }
-
-    /// Perform the container-side handshake. Poisons on failure.
-    pub async fn handshake(&mut self, ready: ReadyPayload) -> Result<InitPayload, IpcError> {
-        self.send(&ContainerToHost::Ready(ready)).await?;
-        let first = self.recv_lossy().await?;
-        match first {
-            HostToContainer::Init(payload) => Ok(payload),
-            other => {
-                let err = IpcError::Protocol(ProtocolError::UnexpectedMessage {
-                    expected: "init",
-                    got: other.type_name(),
-                });
-                self.poison().await;
-                Err(err)
             }
         }
     }
@@ -156,6 +175,7 @@ impl IpcClient {
                 reader,
                 poisoned,
                 shutdown_handle,
+                unknown_skip_count: 0,
             },
         )
     }
@@ -200,6 +220,7 @@ pub struct IpcClientReader {
     reader: FramedRead<tokio::net::unix::OwnedReadHalf, FrameCodec>,
     poisoned: Arc<AtomicBool>,
     shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
+    unknown_skip_count: usize,
 }
 
 impl IpcClientReader {
@@ -208,8 +229,13 @@ impl IpcClientReader {
         self.shutdown_handle.trigger().await;
     }
 
-    /// Receive a [`HostToContainer`] message.
-    pub async fn recv(&mut self) -> Result<HostToContainer, IpcError> {
+    /// Receive a single [`HostToContainer`] frame without
+    /// forward-compatibility skipping.
+    ///
+    /// Returns [`ProtocolError::UnknownMessageType`] for unrecognized
+    /// `type` discriminators. Most callers should use [`recv`](Self::recv)
+    /// instead, which silently skips unknown types per the spec.
+    pub async fn recv_strict(&mut self) -> Result<HostToContainer, IpcError> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(IpcError::Closed);
         }
@@ -233,15 +259,33 @@ impl IpcClientReader {
         result
     }
 
-    /// Forward-compatible receive: skip unknown message types.
-    pub async fn recv_lossy(&mut self) -> Result<HostToContainer, IpcError> {
+    /// Receive a [`HostToContainer`] message.
+    ///
+    /// This is the spec-compliant default: unknown message types are
+    /// silently skipped (with a warning log) up to 32 consecutive
+    /// frames. Use [`recv_strict`](Self::recv_strict) if you need raw
+    /// decode errors for every frame.
+    pub async fn recv(&mut self) -> Result<HostToContainer, IpcError> {
         loop {
-            match self.recv().await {
-                Ok(msg) => return Ok(msg),
+            match self.recv_strict().await {
+                Ok(msg) => {
+                    self.unknown_skip_count = 0;
+                    return Ok(msg);
+                }
                 Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
+                    self.unknown_skip_count += 1;
+                    if self.unknown_skip_count > DEFAULT_MAX_UNKNOWN_SKIPS {
+                        let err = IpcError::Protocol(ProtocolError::TooManyUnknownMessages {
+                            count: self.unknown_skip_count,
+                            limit: DEFAULT_MAX_UNKNOWN_SKIPS,
+                        });
+                        self.poison().await;
+                        return Err(err);
+                    }
                     tracing::warn!(
                         target: "forgeclaw_ipc::client",
                         message_type = %truncate_for_log(&ty),
+                        skip_count = self.unknown_skip_count,
                         "ignoring unknown message type (forward compatibility)"
                     );
                 }

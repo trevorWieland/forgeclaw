@@ -1,15 +1,24 @@
 pre-commit:
-  parallel: true
+  piped: true
   commands:
+    schemas:
+      priority: 1
+      run: |
+        export PATH="$HOME/.cargo/bin:$PATH"
+        just schemas
+        git add crates/ipc/schemas/
     fmt:
+      priority: 2
       run: |
         export PATH="$HOME/.cargo/bin:$PATH"
         cargo fmt --check
     clippy:
+      priority: 3
       run: |
         export PATH="$HOME/.cargo/bin:$PATH"
         cargo clippy --workspace --all-targets --quiet -- -D warnings
     taplo:
+      priority: 4
       run: |
         export PATH="$HOME/.cargo/bin:$PATH"
-        RUST_LOG=error taplo fmt --check
+        RUST_LOG=error taplo fmt --check Cargo.toml bin/*/Cargo.toml crates/*/Cargo.toml .cargo/*.toml .config/*.toml rust-toolchain.toml clippy.toml taplo.toml deny.toml rustfmt.toml lefthook.yml

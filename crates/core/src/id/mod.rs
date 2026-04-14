@@ -40,6 +40,31 @@ macro_rules! define_id {
             #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
             pub struct $name(String);
 
+            #[cfg(feature = "json-schema")]
+            impl schemars::JsonSchema for $name {
+                fn inline_schema() -> bool {
+                    true
+                }
+
+                fn schema_name() -> std::borrow::Cow<'static, str> {
+                    stringify!($name).into()
+                }
+
+                fn json_schema(
+                    _gen: &mut schemars::SchemaGenerator,
+                ) -> schemars::Schema {
+                    schemars::json_schema!({
+                        "type": "string",
+                        "minLength": 1,
+                        "pattern": "\\S",
+                        "description": concat!(
+                            stringify!($name),
+                            " — must be non-empty and contain at least one non-whitespace character."
+                        )
+                    })
+                }
+            }
+
             impl $name {
                 /// Create a validated ID, rejecting empty or whitespace-only
                 /// values.

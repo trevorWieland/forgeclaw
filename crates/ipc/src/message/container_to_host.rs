@@ -4,14 +4,105 @@
 //! [`docs/IPC_PROTOCOL.md`](../../../../docs/IPC_PROTOCOL.md)
 //! §Container → Host.
 
+use std::fmt;
+
 use forgeclaw_core::JobId;
 use serde::{Deserialize, Serialize};
 
 use super::shared::{ErrorCode, StopReason, TokenUsage};
 
+/// Deserialize an `Option<T>` that must be present in the JSON (but
+/// may be `null`). Adding `deserialize_with` prevents serde's default
+/// "missing key → None" behavior: the key must exist on the wire,
+/// while `null` still maps to `None`.
+fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+/// Error returned when a percentage value exceeds the valid 0-100 range.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("percentage {value} exceeds maximum of 100")]
+pub struct PercentError {
+    /// The invalid value that was rejected.
+    pub value: u8,
+}
+
+/// A completion percentage bounded to 0-100.
+///
+/// Used in [`ProgressPayload`] to enforce the documented range at
+/// both deserialization time and in the exported JSON Schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct Percent(u8);
+
+impl Percent {
+    /// Maximum valid percentage value.
+    pub const MAX: u8 = 100;
+
+    /// Create a validated percentage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PercentError`] if `value` exceeds 100.
+    pub fn new(value: u8) -> Result<Self, PercentError> {
+        if value > Self::MAX {
+            return Err(PercentError { value });
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the inner value.
+    #[must_use]
+    pub fn value(self) -> u8 {
+        self.0
+    }
+}
+
+impl fmt::Display for Percent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}%", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Percent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let v = u8::deserialize(deserializer)?;
+        Self::new(v).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "json-schema")]
+impl schemars::JsonSchema for Percent {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Percent".into()
+    }
+
+    fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Completion percentage bounded to 0-100."
+        })
+    }
+}
+
 /// `ready` — sent immediately after connect. Signals the adapter has
 /// initialized and is ready to receive work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct ReadyPayload {
     /// Name of the agent adapter (e.g. `claude-code`).
     pub adapter: String,
@@ -23,6 +114,7 @@ pub struct ReadyPayload {
 
 /// `output_delta` — incremental text chunk streamed from the model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct OutputDeltaPayload {
     /// Incremental text chunk.
     pub text: String,
@@ -32,10 +124,16 @@ pub struct OutputDeltaPayload {
 
 /// `output_complete` — final result for a job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct OutputCompletePayload {
     /// Job identifier this completion belongs to.
     pub job_id: JobId,
     /// Final text output. `None` for tools-only turns.
+    ///
+    /// Required on the wire even when `null` — adapters must not omit
+    /// this key. See `docs/IPC_PROTOCOL.md` §`output_complete`.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    #[cfg_attr(feature = "json-schema", schemars(required))]
     pub result: Option<String>,
     /// Adapter-specific session identifier for resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -49,6 +147,7 @@ pub struct OutputCompletePayload {
 
 /// `progress` — optional progress signal for long-running operations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct ProgressPayload {
     /// Job this progress signal belongs to.
     pub job_id: JobId,
@@ -59,11 +158,12 @@ pub struct ProgressPayload {
     pub detail: Option<String>,
     /// Optional completion percentage (0-100).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub percent: Option<u8>,
+    pub percent: Option<Percent>,
 }
 
 /// `error` — the agent reports an error to the host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct ErrorPayload {
     /// Error classification.
     pub code: ErrorCode,
@@ -78,6 +178,7 @@ pub struct ErrorPayload {
 
 /// `heartbeat` — periodic liveness signal during processing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct HeartbeatPayload {
     /// ISO 8601 timestamp when the heartbeat was emitted. Carried as a
     /// string so the crate stays neutral to timestamp precision.
@@ -194,5 +295,31 @@ mod tests {
         let json = serde_json::to_value(&h).expect("serialize");
         let back: HeartbeatPayload = serde_json::from_value(json).expect("deserialize");
         assert_eq!(back, h);
+    }
+
+    #[test]
+    fn output_complete_rejects_missing_result() {
+        let json = json!({
+            "job_id": "job-1",
+            "stop_reason": "end_turn"
+        });
+        let err = serde_json::from_value::<OutputCompletePayload>(json)
+            .expect_err("missing result should fail");
+        assert!(
+            err.to_string().contains("result"),
+            "error should mention result field: {err}"
+        );
+    }
+
+    #[test]
+    fn output_complete_accepts_null_result() {
+        let json = json!({
+            "job_id": "job-1",
+            "result": null,
+            "stop_reason": "end_turn"
+        });
+        let parsed: OutputCompletePayload =
+            serde_json::from_value(json).expect("null result should pass");
+        assert_eq!(parsed.result, None);
     }
 }

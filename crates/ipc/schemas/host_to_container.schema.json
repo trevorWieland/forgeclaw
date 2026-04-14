@@ -1,0 +1,285 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HostToContainer",
+  "description": "A message sent from the host to an agent container.\n\nSerialized as an internally-tagged JSON object with a `type`\ndiscriminator. See [`docs/IPC_PROTOCOL.md`](../../../../docs/IPC_PROTOCOL.md)\n§Host → Container for the wire format.",
+  "oneOf": [
+    {
+      "description": "`init` — initial context and configuration for a job.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "init"
+        }
+      },
+      "$ref": "#/$defs/InitPayload",
+      "required": [
+        "type"
+      ]
+    },
+    {
+      "description": "`messages` — follow-up messages for an in-flight job.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "messages"
+        }
+      },
+      "$ref": "#/$defs/MessagesPayload",
+      "required": [
+        "type"
+      ]
+    },
+    {
+      "description": "`shutdown` — request graceful shutdown.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "shutdown"
+        }
+      },
+      "$ref": "#/$defs/ShutdownPayload",
+      "required": [
+        "type"
+      ]
+    }
+  ],
+  "$defs": {
+    "GroupCapabilities": {
+      "description": "Capabilities granted to a group, determining which command\nfamilies are available beyond the base scoped set.",
+      "type": "object",
+      "properties": {
+        "tanren": {
+          "description": "Whether this group may dispatch Tanren jobs.",
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "GroupInfo": {
+      "description": "Summary of the group the agent is serving for this job.",
+      "type": "object",
+      "properties": {
+        "capabilities": {
+          "description": "Capabilities granted to this group. Determines which command\nfamilies the IPC layer will accept from sessions bound to\nthis group.",
+          "$ref": "#/$defs/GroupCapabilities",
+          "default": {
+            "tanren": false
+          }
+        },
+        "id": {
+          "description": "Stable group identifier (e.g. `group-main`).",
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "is_main": {
+          "description": "Whether this group is the `main` group with elevated privileges.",
+          "type": "boolean"
+        },
+        "name": {
+          "description": "Human-readable group name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "is_main"
+      ]
+    },
+    "HistoricalMessage": {
+      "description": "A historical chat message included in the `init.context.messages`\narray or the `messages` follow-up envelope.",
+      "type": "object",
+      "properties": {
+        "sender": {
+          "description": "Display name of the message sender.",
+          "type": "string"
+        },
+        "text": {
+          "description": "Raw message text.",
+          "type": "string"
+        },
+        "timestamp": {
+          "description": "ISO 8601 timestamp, carried as a string so the crate stays\nneutral with respect to timestamp precision and timezone format.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sender",
+        "text",
+        "timestamp"
+      ]
+    },
+    "InitConfig": {
+      "description": "Provider-proxy and adapter configuration carried inside an `init`\nmessage.",
+      "type": "object",
+      "properties": {
+        "max_tokens": {
+          "description": "Maximum output tokens for this job.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "model": {
+          "description": "Model identifier to request from the provider.",
+          "type": "string"
+        },
+        "provider_proxy_token": {
+          "description": "Bearer token the adapter should present to the provider proxy.",
+          "type": "string"
+        },
+        "provider_proxy_url": {
+          "description": "Base URL the adapter should target for provider calls.",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Adapter session identifier to resume (if any).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_seconds": {
+          "description": "Hard timeout (in seconds) for the whole job.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "tools_enabled": {
+          "description": "Whether tool use is permitted for this job.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "provider_proxy_url",
+        "provider_proxy_token",
+        "model",
+        "max_tokens",
+        "tools_enabled",
+        "timeout_seconds"
+      ]
+    },
+    "InitContext": {
+      "description": "Context bundle carried inside an `init` message.",
+      "type": "object",
+      "properties": {
+        "group": {
+          "description": "Summary of the group the agent is serving.",
+          "$ref": "#/$defs/GroupInfo"
+        },
+        "messages": {
+          "description": "Historical messages making up the current context window.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HistoricalMessage"
+          }
+        },
+        "timezone": {
+          "description": "IANA timezone name for resolving relative time references.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "messages",
+        "group",
+        "timezone"
+      ]
+    },
+    "InitPayload": {
+      "description": "`init` — initial context and configuration for processing a job.",
+      "type": "object",
+      "properties": {
+        "config": {
+          "description": "Provider proxy URL/token, model, limits.",
+          "$ref": "#/$defs/InitConfig"
+        },
+        "context": {
+          "description": "Message history, group info, timezone.",
+          "$ref": "#/$defs/InitContext"
+        },
+        "job_id": {
+          "description": "Unique job identifier for correlation with downstream messages.",
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        }
+      },
+      "required": [
+        "job_id",
+        "context",
+        "config"
+      ]
+    },
+    "MessagesPayload": {
+      "description": "`messages` — follow-up messages that arrived while the container\nwas processing.",
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "description": "Job identifier this follow-up belongs to.",
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "messages": {
+          "description": "New historical messages to append to the context window.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HistoricalMessage"
+          }
+        }
+      },
+      "required": [
+        "job_id",
+        "messages"
+      ]
+    },
+    "ShutdownPayload": {
+      "description": "`shutdown` — request graceful shutdown.",
+      "type": "object",
+      "properties": {
+        "deadline_ms": {
+          "description": "Deadline in milliseconds. After this deadline the host will\nforcibly terminate the container.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "reason": {
+          "description": "Why the host is asking for shutdown.",
+          "$ref": "#/$defs/ShutdownReason"
+        }
+      },
+      "required": [
+        "reason",
+        "deadline_ms"
+      ]
+    },
+    "ShutdownReason": {
+      "description": "Why the host is asking the container to shut down.\n\nClosed enum on the wire — a value not in this list is a protocol\nerror.",
+      "oneOf": [
+        {
+          "description": "The container was idle beyond its configured idle TTL.",
+          "type": "string",
+          "const": "idle_timeout"
+        },
+        {
+          "description": "The host itself is shutting down.",
+          "type": "string",
+          "const": "host_shutdown"
+        },
+        {
+          "description": "The warm pool evicted this container.",
+          "type": "string",
+          "const": "eviction"
+        },
+        {
+          "description": "A failed job triggered a recover-by-restart path.",
+          "type": "string",
+          "const": "error_recovery"
+        }
+      ]
+    }
+  }
+}

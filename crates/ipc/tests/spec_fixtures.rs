@@ -9,7 +9,7 @@
 //! the deserialize step fails here before the drift reaches
 //! downstream crates.
 
-use forgeclaw_ipc::{ContainerToHost, HostToContainer};
+use forgeclaw_ipc::{CommandPayload, ContainerToHost, HostToContainer};
 use serde_json::Value;
 
 fn roundtrip_container_to_host(raw: &str, label: &str) {
@@ -140,4 +140,45 @@ fn command_dispatch_self_improvement_fixture_roundtrip() {
         include_str!("../fixtures/command_dispatch_self_improvement.json"),
         "command_dispatch_self_improvement",
     );
+}
+
+// --- Negative tests for typed extensions ---
+
+#[test]
+fn register_group_extensions_rejects_array() {
+    let json = serde_json::json!({
+        "command": "register_group",
+        "payload": {
+            "name": "g",
+            "extensions": [1, 2, 3]
+        }
+    });
+    serde_json::from_value::<CommandPayload>(json).expect_err("array extensions should fail");
+}
+
+#[test]
+fn register_group_extensions_rejects_string() {
+    let json = serde_json::json!({
+        "command": "register_group",
+        "payload": {
+            "name": "g",
+            "extensions": "not-an-object"
+        }
+    });
+    serde_json::from_value::<CommandPayload>(json).expect_err("string extensions should fail");
+}
+
+#[test]
+fn register_group_extensions_rejects_missing_version() {
+    let json = serde_json::json!({
+        "command": "register_group",
+        "payload": {
+            "name": "g",
+            "extensions": {
+                "trigger": "@bot"
+            }
+        }
+    });
+    serde_json::from_value::<CommandPayload>(json)
+        .expect_err("extensions without version should fail");
 }

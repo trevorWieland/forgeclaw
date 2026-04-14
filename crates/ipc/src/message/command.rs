@@ -4,16 +4,17 @@
 //! [`docs/IPC_PROTOCOL.md`](../../../../docs/IPC_PROTOCOL.md)
 //! §Container → Host → `command`.
 //!
-//! Authorization and validation (e.g. "main-only", "own group only")
-//! are policy — they live in later crates (`router`, `scheduler`,
-//! `tanren`), not here. This crate provides the compile-time typed
-//! contract; callers enforce invariants at runtime.
+//! This module provides the transport-level typed contract. IPC-boundary
+//! authorization (main-only, own-group, capability checks) is enforced at
+//! the server layer via [`AuthorizedCommand`](crate::message::authorized::AuthorizedCommand).
+//! Only external ownership resolution remains deferred via [`OwnershipPending`](crate::message::authorized::OwnershipPending).
 
 use forgeclaw_core::{GroupId, TaskId};
 use serde::{Deserialize, Serialize};
 
 /// The type of schedule for a scheduled task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduleType {
     /// Cron expression schedule.
@@ -26,18 +27,20 @@ pub enum ScheduleType {
 
 /// Tanren execution phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum TanrenPhase {
     /// Execute the primary task.
     DoTask,
     /// Run gate checks (tests, lints).
     Gate,
-    /// Perform a code audit.
-    Audit,
+    /// Perform a code audit (wire name: `audit-task`).
+    AuditTask,
 }
 
 /// Branch strategy for self-improvement dispatches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum BranchPolicy {
     /// Create a new branch for the work.
@@ -51,6 +54,7 @@ pub enum BranchPolicy {
 /// Authorization: main agent may target any group; non-main agents
 /// may target only their own group.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct SendMessagePayload {
     /// Group to send the message to.
     pub target_group: GroupId,
@@ -63,6 +67,7 @@ pub struct SendMessagePayload {
 /// Authorization: main agent may target any group; non-main agents
 /// may target only their own group.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct ScheduleTaskPayload {
     /// Group to schedule the task for.
     pub group: GroupId,
@@ -82,6 +87,7 @@ pub struct ScheduleTaskPayload {
 /// Authorization: main agent may pause any task; non-main agents may
 /// pause only their own tasks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct PauseTaskPayload {
     /// Task to pause.
     pub task_id: TaskId,
@@ -92,29 +98,51 @@ pub struct PauseTaskPayload {
 /// Authorization: main agent may cancel any task; non-main agents may
 /// cancel only their own tasks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct CancelTaskPayload {
     /// Task to cancel.
     pub task_id: TaskId,
+}
+
+/// Typed extension envelope for group registration.
+///
+/// Enforces that extensions are a JSON object (not an arbitrary
+/// scalar or array) and carries a schema version for forward
+/// compatibility. Shape details are owned by the `router` crate;
+/// this crate transports the envelope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct GroupExtensions {
+    /// Schema version for extension compatibility (e.g. `"1"`).
+    pub version: String,
+    /// Extension data as a JSON object.
+    #[serde(flatten)]
+    pub data: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Register a new group.
 ///
 /// Authorization: main agent only.
 ///
-/// The group spec is kept as opaque JSON because the full group
-/// configuration shape is owned by the `router` crate — this crate
-/// only transports it.
+/// The required `name` field is typed here. Additional group
+/// configuration owned by the `router` crate travels in the
+/// optional [`GroupExtensions`] envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct RegisterGroupPayload {
-    /// Group configuration. Shape is defined by the `router` crate;
-    /// this crate transports it as an opaque JSON value.
-    pub group_spec: serde_json::Value,
+    /// Human-readable group name.
+    pub name: String,
+    /// Additional group configuration, versioned and typed as a
+    /// JSON object. See [`GroupExtensions`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<GroupExtensions>,
 }
 
 /// Dispatch a Tanren job.
 ///
 /// Authorization: groups with Tanren permission only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct DispatchTanrenPayload {
     /// Target project name.
     pub project: String,
@@ -133,13 +161,14 @@ pub struct DispatchTanrenPayload {
 ///
 /// Authorization: main agent only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct DispatchSelfImprovementPayload {
     /// Human-readable objective for the improvement.
     pub objective: String,
-    /// Scope constraint (e.g. which crate or subsystem).
-    pub scope: String,
+    /// Scope constraints (e.g. which crates or subsystems).
+    pub scopes: Vec<String>,
     /// Acceptance tests that must pass for the improvement to land.
-    pub acceptance_tests: String,
+    pub acceptance_tests: Vec<String>,
     /// Branch strategy for this improvement.
     pub branch_policy: BranchPolicy,
 }
@@ -150,6 +179,7 @@ pub struct DispatchSelfImprovementPayload {
 /// typed payload struct matching the shapes documented in
 /// `docs/IPC_PROTOCOL.md`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "command", content = "payload", rename_all = "snake_case")]
 pub enum CommandBody {
     /// Send a chat message to a group.
@@ -168,6 +198,81 @@ pub enum CommandBody {
     DispatchSelfImprovement(DispatchSelfImprovementPayload),
 }
 
+impl CommandBody {
+    /// Returns `true` if this command requires main-group privilege.
+    #[must_use]
+    pub fn is_privileged(&self) -> bool {
+        matches!(
+            self,
+            Self::RegisterGroup(_) | Self::DispatchSelfImprovement(_)
+        )
+    }
+
+    /// Classify into the privilege-separated type system.
+    ///
+    /// Used internally by the server to apply the authorization
+    /// matrix before returning an [`AuthorizedCommand`].
+    #[must_use]
+    pub(crate) fn classify(self) -> ClassifiedCommand {
+        match self {
+            Self::SendMessage(p) => ClassifiedCommand::Scoped(ScopedCommand::SendMessage(p)),
+            Self::ScheduleTask(p) => ClassifiedCommand::Scoped(ScopedCommand::ScheduleTask(p)),
+            Self::PauseTask(p) => ClassifiedCommand::Scoped(ScopedCommand::PauseTask(p)),
+            Self::CancelTask(p) => ClassifiedCommand::Scoped(ScopedCommand::CancelTask(p)),
+            Self::DispatchTanren(p) => ClassifiedCommand::Scoped(ScopedCommand::DispatchTanren(p)),
+            Self::RegisterGroup(p) => {
+                ClassifiedCommand::Privileged(PrivilegedCommand::RegisterGroup(p))
+            }
+            Self::DispatchSelfImprovement(p) => {
+                ClassifiedCommand::Privileged(PrivilegedCommand::DispatchSelfImprovement(p))
+            }
+        }
+    }
+}
+
+/// Commands available to any agent (with scope checks enforced by
+/// the router). These commands target a group or task that the
+/// agent may or may not own — authorization is policy, not
+/// transport.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ScopedCommand {
+    /// Send a chat message to a group.
+    SendMessage(SendMessagePayload),
+    /// Schedule a recurring or one-off task.
+    ScheduleTask(ScheduleTaskPayload),
+    /// Pause a previously scheduled task.
+    PauseTask(PauseTaskPayload),
+    /// Cancel a previously scheduled task.
+    CancelTask(CancelTaskPayload),
+    /// Dispatch a Tanren job.
+    DispatchTanren(DispatchTanrenPayload),
+}
+
+/// Commands restricted to the main agent. Attempting to issue
+/// these from a non-main group is a protocol violation.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PrivilegedCommand {
+    /// Register a new group.
+    RegisterGroup(RegisterGroupPayload),
+    /// Dispatch a self-improvement job.
+    DispatchSelfImprovement(DispatchSelfImprovementPayload),
+}
+
+/// A command classified by privilege level (internal).
+///
+/// Constructed via [`CommandBody::classify`]. Used internally by
+/// [`crate::server::IpcConnectionReader::recv_command`] to apply the
+/// full authorization matrix before returning an
+/// [`AuthorizedCommand`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ClassifiedCommand {
+    /// A scoped command any agent may attempt (subject to
+    /// authorization checks in the router).
+    Scoped(ScopedCommand),
+    /// A privileged command only the main agent may issue.
+    Privileged(PrivilegedCommand),
+}
+
 /// `command` — IPC command from the agent to the host.
 ///
 /// Wraps [`CommandBody`] with `#[serde(flatten)]` so the serialized
@@ -175,6 +280,7 @@ pub enum CommandBody {
 /// alongside the `type` discriminator added by
 /// [`crate::message::ContainerToHost`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct CommandPayload {
     /// The command discriminator and its associated payload.
     #[serde(flatten)]
@@ -266,17 +372,40 @@ mod tests {
 
     #[test]
     fn register_group_roundtrip() {
-        let spec = json!({"name": "New Group", "trigger": "@bot"});
+        let ext = GroupExtensions {
+            version: "1".to_owned(),
+            data: {
+                let mut m = serde_json::Map::new();
+                m.insert("trigger".to_owned(), json!("@bot"));
+                m
+            },
+        };
         let cmd = CommandPayload {
             body: CommandBody::RegisterGroup(RegisterGroupPayload {
-                group_spec: spec.clone(),
+                name: "New Group".to_owned(),
+                extensions: Some(ext),
             }),
         };
         let json = serde_json::to_value(&cmd).expect("serialize");
         assert_eq!(json["command"], "register_group");
-        assert_eq!(json["payload"]["group_spec"], spec);
+        assert_eq!(json["payload"]["name"], "New Group");
+        assert_eq!(json["payload"]["extensions"]["version"], "1");
+        assert_eq!(json["payload"]["extensions"]["trigger"], "@bot");
         let back: CommandPayload = serde_json::from_value(json).expect("deserialize");
         assert_eq!(back, cmd);
+    }
+
+    #[test]
+    fn register_group_omits_extensions_when_none() {
+        let cmd = CommandPayload {
+            body: CommandBody::RegisterGroup(RegisterGroupPayload {
+                name: "Minimal Group".to_owned(),
+                extensions: None,
+            }),
+        };
+        let json = serde_json::to_value(&cmd).expect("serialize");
+        let payload = json["payload"].as_object().expect("payload object");
+        assert!(!payload.contains_key("extensions"));
     }
 
     #[test]
@@ -302,14 +431,70 @@ mod tests {
         let cmd = CommandPayload {
             body: CommandBody::DispatchSelfImprovement(DispatchSelfImprovementPayload {
                 objective: "Add retry logic".to_owned(),
-                scope: "crates/ipc".to_owned(),
-                acceptance_tests: "cargo nextest run -p forgeclaw-ipc".to_owned(),
+                scopes: vec!["crates/ipc".to_owned()],
+                acceptance_tests: vec!["cargo nextest run -p forgeclaw-ipc".to_owned()],
                 branch_policy: BranchPolicy::Create,
             }),
         };
         let json = serde_json::to_value(&cmd).expect("serialize");
         assert_eq!(json["command"], "dispatch_self_improvement");
+        assert!(json["payload"]["scopes"].is_array());
+        assert!(json["payload"]["acceptance_tests"].is_array());
         let back: CommandPayload = serde_json::from_value(json).expect("deserialize");
         assert_eq!(back, cmd);
+    }
+
+    #[test]
+    fn classify_returns_scoped_for_group_commands() {
+        let scoped_commands = [
+            CommandBody::SendMessage(SendMessagePayload {
+                target_group: GroupId::from("g"),
+                text: "t".to_owned(),
+            }),
+            CommandBody::ScheduleTask(ScheduleTaskPayload {
+                group: GroupId::from("g"),
+                schedule_type: ScheduleType::Once,
+                schedule_value: "v".to_owned(),
+                prompt: "p".to_owned(),
+                context_mode: None,
+            }),
+            CommandBody::PauseTask(PauseTaskPayload {
+                task_id: TaskId::from("t"),
+            }),
+            CommandBody::CancelTask(CancelTaskPayload {
+                task_id: TaskId::from("t"),
+            }),
+            CommandBody::DispatchTanren(DispatchTanrenPayload {
+                project: "p".to_owned(),
+                branch: "b".to_owned(),
+                phase: TanrenPhase::DoTask,
+                prompt: "pr".to_owned(),
+                environment_profile: None,
+            }),
+        ];
+        for cmd in scoped_commands {
+            assert!(!cmd.is_privileged());
+            assert!(matches!(cmd.classify(), ClassifiedCommand::Scoped(_)));
+        }
+    }
+
+    #[test]
+    fn classify_returns_privileged_for_main_commands() {
+        let privileged_commands = [
+            CommandBody::RegisterGroup(RegisterGroupPayload {
+                name: "g".to_owned(),
+                extensions: None,
+            }),
+            CommandBody::DispatchSelfImprovement(DispatchSelfImprovementPayload {
+                objective: "o".to_owned(),
+                scopes: vec!["s".to_owned()],
+                acceptance_tests: vec!["t".to_owned()],
+                branch_policy: BranchPolicy::Create,
+            }),
+        ];
+        for cmd in privileged_commands {
+            assert!(cmd.is_privileged());
+            assert!(matches!(cmd.classify(), ClassifiedCommand::Privileged(_)));
+        }
     }
 }

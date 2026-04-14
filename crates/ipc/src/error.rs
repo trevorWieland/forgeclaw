@@ -20,6 +20,8 @@
 //! carry byte counts. This keeps logs safe to emit without reviewing
 //! payloads first.
 
+use forgeclaw_core::GroupId;
+
 /// Framing-layer errors.
 ///
 /// Any of these variants signals that the connection is no longer in a
@@ -108,6 +110,47 @@ pub enum ProtocolError {
     /// experimental message types.
     #[error("unknown message type: {0}")]
     UnknownMessageType(String),
+
+    /// The peer sent too many consecutive frames with unknown message
+    /// types, exceeding the configured skip limit.
+    ///
+    /// This is fatal — the connection is poisoned when this fires.
+    #[error("too many unknown messages: {count} consecutive (limit {limit})")]
+    TooManyUnknownMessages {
+        /// How many consecutive unknown messages were received.
+        count: usize,
+        /// The configured limit.
+        limit: usize,
+    },
+
+    /// A command was rejected because the session lacks the required
+    /// authorization.
+    ///
+    /// This is non-fatal — the connection remains open for further
+    /// messages (the rejected command is simply dropped).
+    #[error("unauthorized: command {command} — {reason}")]
+    Unauthorized {
+        /// The wire name of the command that was rejected.
+        command: &'static str,
+        /// Why the command was rejected.
+        reason: &'static str,
+    },
+
+    /// The group identity in the `init` payload diverges from the
+    /// host-authoritative group identity passed to `handshake`.
+    ///
+    /// This is fatal — the handshake cannot proceed with inconsistent
+    /// group state.
+    #[error(
+        "group mismatch: init carried group {init_group_id}, \
+         but session group is {session_group_id}"
+    )]
+    GroupMismatch {
+        /// The group ID from `init.context.group`.
+        init_group_id: GroupId,
+        /// The group ID the host passed as the authoritative identity.
+        session_group_id: GroupId,
+    },
 }
 
 /// Top-level IPC crate error.
@@ -137,6 +180,10 @@ pub enum IpcError {
     /// The peer closed the connection cleanly between frames.
     #[error("connection closed")]
     Closed,
+
+    /// A timed operation (handshake, recv) exceeded its deadline.
+    #[error("operation timed out after {0:?}")]
+    Timeout(std::time::Duration),
 }
 
 impl IpcError {
@@ -154,16 +201,19 @@ impl IpcError {
     /// longer in a recoverable state and should be torn down.
     ///
     /// Fatal errors include all framing errors (the stream is
-    /// desynchronized), I/O failures, version mismatches, and
-    /// unexpected messages during handshake. Non-fatal:
+    /// desynchronized), I/O failures, timeouts, version mismatches,
+    /// and unexpected messages during handshake. Non-fatal:
     /// [`ProtocolError::UnknownMessageType`] (forward compatibility),
     /// [`IpcError::Closed`] (already done), and
     /// [`IpcError::Serialize`] (encode-side only).
     #[must_use]
     pub fn is_fatal(&self) -> bool {
         match self {
-            Self::Io(_) | Self::Frame(_) => true,
-            Self::Protocol(p) => !matches!(p, ProtocolError::UnknownMessageType(_)),
+            Self::Io(_) | Self::Frame(_) | Self::Timeout(_) => true,
+            Self::Protocol(p) => !matches!(
+                p,
+                ProtocolError::UnknownMessageType(_) | ProtocolError::Unauthorized { .. }
+            ),
             Self::Serialize(_) | Self::Closed => false,
         }
     }
@@ -260,5 +310,66 @@ mod tests {
         let p = ProtocolError::UnknownMessageType("x".to_owned());
         let ipc: IpcError = p.into();
         assert!(matches!(ipc, IpcError::Protocol(_)));
+    }
+
+    #[test]
+    fn too_many_unknown_messages_display() {
+        let err = ProtocolError::TooManyUnknownMessages {
+            count: 33,
+            limit: 32,
+        };
+        assert_eq!(
+            err.to_string(),
+            "too many unknown messages: 33 consecutive (limit 32)"
+        );
+    }
+
+    #[test]
+    fn too_many_unknown_messages_is_fatal() {
+        let err = IpcError::Protocol(ProtocolError::TooManyUnknownMessages {
+            count: 33,
+            limit: 32,
+        });
+        assert!(err.is_fatal());
+    }
+
+    #[test]
+    fn unauthorized_display() {
+        let err = ProtocolError::Unauthorized {
+            command: "register_group",
+            reason: "requires main-group privilege",
+        };
+        let s = err.to_string();
+        assert!(s.contains("register_group"));
+        assert!(s.contains("requires main-group privilege"));
+    }
+
+    #[test]
+    fn unauthorized_is_not_fatal() {
+        let err = IpcError::Protocol(ProtocolError::Unauthorized {
+            command: "register_group",
+            reason: "requires main-group privilege",
+        });
+        assert!(!err.is_fatal());
+    }
+
+    #[test]
+    fn group_mismatch_display() {
+        let err = ProtocolError::GroupMismatch {
+            init_group_id: "group-a".into(),
+            session_group_id: "group-b".into(),
+        };
+        let s = err.to_string();
+        assert!(s.contains("group-a"));
+        assert!(s.contains("group-b"));
+    }
+
+    #[test]
+    fn group_mismatch_is_fatal() {
+        let err = IpcError::Protocol(ProtocolError::GroupMismatch {
+            init_group_id: "group-a".into(),
+            session_group_id: "group-b".into(),
+        });
+        assert!(err.is_fatal());
     }
 }

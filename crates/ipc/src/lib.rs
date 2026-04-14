@@ -38,29 +38,39 @@
 //! socket close
 //! ```
 //!
-//! Both [`server::IpcConnection::handshake`] and
-//! [`client::IpcClient::handshake`] encapsulate the Ready → Init leg
-//! in a single call, so higher-level crates never have to reach into
-//! the send/recv primitives just to establish a session.
+//! Both [`server::PendingConnection::handshake`] and
+//! [`client::PendingClient::handshake`] encapsulate the Ready → Init
+//! leg in a single call that consumes the pending type and returns the
+//! established connection, so higher-level crates never have to reach
+//! into the send/recv primitives just to establish a session.
 
 pub mod client;
 pub mod codec;
 pub mod error;
 pub mod message;
+pub mod peer_cred;
 pub mod server;
 pub(crate) mod util;
 pub mod version;
 
-pub use client::{IpcClient, IpcClientReader, IpcClientWriter};
-pub use codec::{FrameCodec, LENGTH_PREFIX_BYTES, MAX_FRAME_BYTES};
+pub use client::{IpcClient, IpcClientReader, IpcClientWriter, PendingClient};
+pub use codec::{
+    FrameCodec, LENGTH_PREFIX_BYTES, MAX_FRAME_BYTES, decode_container_to_host,
+    decode_host_to_container,
+};
 pub use error::{FrameError, IpcError, ProtocolError};
 pub use message::{
-    BranchPolicy, CancelTaskPayload, CommandBody, CommandPayload, ContainerToHost,
-    DispatchSelfImprovementPayload, DispatchTanrenPayload, ErrorCode, ErrorPayload, GroupInfo,
-    HeartbeatPayload, HistoricalMessage, HostToContainer, InitConfig, InitContext, InitPayload,
-    MessagesPayload, OutputCompletePayload, OutputDeltaPayload, PauseTaskPayload, ProgressPayload,
-    ReadyPayload, RegisterGroupPayload, ScheduleTaskPayload, ScheduleType, SendMessagePayload,
-    ShutdownPayload, ShutdownReason, StopReason, TanrenPhase, TokenUsage,
+    AuthorizedCommand, BranchPolicy, CancelTaskPayload, CommandBody, CommandPayload,
+    ContainerToHost, DispatchSelfImprovementPayload, DispatchTanrenPayload, ErrorCode,
+    ErrorPayload, GroupCapabilities, GroupCommand, GroupExtensions, GroupInfo, HeartbeatPayload,
+    HistoricalMessage, HostToContainer, InitConfig, InitContext, InitPayload, MainGroupCommand,
+    MessagesPayload, OutputCompletePayload, OutputDeltaPayload, OwnershipPending, PauseTaskPayload,
+    Percent, PercentError, PrivilegedAuthorizedCommand, ProgressPayload, ReadyPayload,
+    RegisterGroupPayload, ScheduleTaskPayload, ScheduleType, ScopedAuthorizedCommand,
+    SendMessagePayload, ShutdownPayload, ShutdownReason, StopReason, TanrenPhase, TokenUsage,
 };
-pub use server::{IpcConnection, IpcConnectionReader, IpcConnectionWriter, IpcServer};
+pub use peer_cred::{PeerCredentials, SessionIdentity};
+pub use server::{
+    IpcConnection, IpcConnectionReader, IpcConnectionWriter, IpcServer, PendingConnection,
+};
 pub use version::{PROTOCOL_VERSION, is_compatible};

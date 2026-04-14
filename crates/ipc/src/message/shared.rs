@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 /// A historical chat message included in the `init.context.messages`
 /// array or the `messages` follow-up envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct HistoricalMessage {
     /// Display name of the message sender.
     pub sender: String,
@@ -19,8 +20,19 @@ pub struct HistoricalMessage {
     pub timestamp: String,
 }
 
+/// Capabilities granted to a group, determining which command
+/// families are available beyond the base scoped set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct GroupCapabilities {
+    /// Whether this group may dispatch Tanren jobs.
+    #[serde(default)]
+    pub tanren: bool,
+}
+
 /// Summary of the group the agent is serving for this job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct GroupInfo {
     /// Stable group identifier (e.g. `group-main`).
     pub id: GroupId,
@@ -28,10 +40,16 @@ pub struct GroupInfo {
     pub name: String,
     /// Whether this group is the `main` group with elevated privileges.
     pub is_main: bool,
+    /// Capabilities granted to this group. Determines which command
+    /// families the IPC layer will accept from sessions bound to
+    /// this group.
+    #[serde(default)]
+    pub capabilities: GroupCapabilities,
 }
 
 /// Token accounting reported alongside an `output_complete` message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct TokenUsage {
     /// Input tokens billed to the provider for this turn.
     pub input_tokens: u64,
@@ -44,6 +62,7 @@ pub struct TokenUsage {
 /// Closed enum on the wire — a value not in this list is a protocol
 /// error, not a silent fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
     /// The model emitted an end-of-turn signal.
@@ -59,6 +78,7 @@ pub enum StopReason {
 /// Closed enum on the wire — a value not in this list is a protocol
 /// error. See `docs/IPC_PROTOCOL.md` §Error Handling for meanings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     /// The model provider returned an error (e.g. HTTP 429).
@@ -78,6 +98,7 @@ pub enum ErrorCode {
 /// Closed enum on the wire — a value not in this list is a protocol
 /// error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ShutdownReason {
     /// The container was idle beyond its configured idle TTL.
@@ -92,7 +113,10 @@ pub enum ShutdownReason {
 
 #[cfg(test)]
 mod tests {
-    use super::{ErrorCode, GroupInfo, HistoricalMessage, ShutdownReason, StopReason, TokenUsage};
+    use super::{
+        ErrorCode, GroupCapabilities, GroupInfo, HistoricalMessage, ShutdownReason, StopReason,
+        TokenUsage,
+    };
     use forgeclaw_core::GroupId;
 
     #[test]
@@ -163,9 +187,30 @@ mod tests {
             id: GroupId::from("group-main"),
             name: "Main Group".to_owned(),
             is_main: true,
+            capabilities: GroupCapabilities::default(),
         };
         let json = serde_json::to_string(&g).expect("serialize");
         let back: GroupInfo = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, g);
+    }
+
+    #[test]
+    fn group_info_capabilities_default_on_missing() {
+        let json = r#"{"id":"group-a","name":"A","is_main":false}"#;
+        let g: GroupInfo = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(g.capabilities, GroupCapabilities::default());
+    }
+
+    #[test]
+    fn group_capabilities_tanren_roundtrip() {
+        let g = GroupInfo {
+            id: GroupId::from("group-tanren"),
+            name: "Tanren Group".to_owned(),
+            is_main: false,
+            capabilities: GroupCapabilities { tanren: true },
+        };
+        let json = serde_json::to_string(&g).expect("serialize");
+        let back: GroupInfo = serde_json::from_str(&json).expect("deserialize");
+        assert!(back.capabilities.tanren);
     }
 }

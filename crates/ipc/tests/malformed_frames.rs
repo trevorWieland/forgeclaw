@@ -65,14 +65,10 @@ fn zero_length_header_is_rejected() {
 
 #[test]
 fn valid_frame_with_invalid_utf8_surfaces_through_typed_decode() {
-    // The codec itself is byte-oriented; UTF-8 validation happens in
-    // the typed helpers. Here we frame some invalid-UTF-8 bytes,
-    // decode at the framing layer, then hand the payload to the
-    // top-level decode path via a full encode+decode roundtrip
-    // through a typed wrapper — the easiest way to do this is via
-    // the public IpcClient/IpcServer handshake path, but for a focused
-    // unit test we can poke at the crate's own internals through the
-    // trait implementations.
+    // Frame invalid-UTF-8 bytes and run them through the crate's
+    // public two-pass decode path (not just std::str::from_utf8).
+    use forgeclaw_ipc::decode_container_to_host;
+
     let bad_payload: &[u8] = &[0xFF, 0xFE, 0xFD];
     let mut codec = FrameCodec::new();
     let mut buf = frame_bytes(bad_payload);
@@ -80,9 +76,11 @@ fn valid_frame_with_invalid_utf8_surfaces_through_typed_decode() {
         .decode(&mut buf)
         .expect("decode is Ok at frame layer")
         .expect("frame present");
-    // Frame-layer OK; now attempt UTF-8 conversion as a smoke test
-    // that this kind of payload is what the top-level decode refuses.
-    assert!(std::str::from_utf8(&frame).is_err());
+    let err = decode_container_to_host(&frame).expect_err("should reject invalid UTF-8");
+    assert!(
+        matches!(err, IpcError::Frame(FrameError::InvalidUtf8)),
+        "expected InvalidUtf8, got {err:?}"
+    );
 }
 
 #[test]
@@ -132,10 +130,23 @@ fn malformed_json_after_valid_frame_is_malformed_not_unknown() {
 
 #[test]
 fn frame_with_unknown_type_classifies_as_protocol_error() {
-    // The two-pass structural decoder uses KNOWN_TYPES to classify
-    // unknown message types — it does NOT depend on serde's error
-    // message wording. This test verifies the end result.
-    let _mapped = IpcError::Protocol(ProtocolError::UnknownMessageType("bogus_type".to_owned()));
-    // Full decode path is tested in codec.rs unit tests and
-    // handshake_lifecycle.rs integration tests.
+    // Frame valid JSON with an unrecognized `type` field and run it
+    // through the crate's public two-pass decode path.
+    use forgeclaw_ipc::decode_container_to_host;
+
+    let payload = br#"{"type":"bogus_type","data":42}"#;
+    let mut codec = FrameCodec::new();
+    let mut buf = frame_bytes(payload);
+    let frame = codec
+        .decode(&mut buf)
+        .expect("frame layer ok")
+        .expect("frame present");
+    let err = decode_container_to_host(&frame).expect_err("should reject unknown type");
+    assert!(
+        matches!(
+            err,
+            IpcError::Protocol(ProtocolError::UnknownMessageType(ref ty)) if ty == "bogus_type"
+        ),
+        "expected UnknownMessageType(\"bogus_type\"), got {err:?}"
+    );
 }

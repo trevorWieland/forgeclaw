@@ -9,7 +9,10 @@
     "group": {
       "id": "group-main",
       "name": "Main Group",
-      "is_main": true
+      "is_main": true,
+      "capabilities": {
+        "tanren": false
+      }
     },
     "timezone": "America/New_York"
   },

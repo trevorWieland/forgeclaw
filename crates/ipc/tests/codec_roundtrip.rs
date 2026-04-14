@@ -14,10 +14,11 @@ use forgeclaw_core::{GroupId, JobId, TaskId};
 use forgeclaw_ipc::{
     BranchPolicy, CancelTaskPayload, CommandBody, CommandPayload, ContainerToHost,
     DispatchSelfImprovementPayload, DispatchTanrenPayload, ErrorCode, ErrorPayload, FrameCodec,
-    GroupInfo, HeartbeatPayload, HistoricalMessage, HostToContainer, InitConfig, InitContext,
-    InitPayload, MessagesPayload, OutputCompletePayload, OutputDeltaPayload, PauseTaskPayload,
-    ProgressPayload, ReadyPayload, RegisterGroupPayload, ScheduleTaskPayload, ScheduleType,
-    SendMessagePayload, ShutdownPayload, ShutdownReason, StopReason, TanrenPhase, TokenUsage,
+    GroupCapabilities, GroupInfo, HeartbeatPayload, HistoricalMessage, HostToContainer, InitConfig,
+    InitContext, InitPayload, MessagesPayload, OutputCompletePayload, OutputDeltaPayload,
+    PauseTaskPayload, ProgressPayload, ReadyPayload, RegisterGroupPayload, ScheduleTaskPayload,
+    ScheduleType, SendMessagePayload, ShutdownPayload, ShutdownReason, StopReason, TanrenPhase,
+    TokenUsage,
 };
 use proptest::prelude::*;
 use tokio_util::codec::{Decoder, Encoder};
@@ -122,7 +123,7 @@ fn progress_strategy() -> impl Strategy<Value = ProgressPayload> {
             job_id,
             stage,
             detail,
-            percent,
+            percent: percent.map(|v| forgeclaw_ipc::Percent::new(v).expect("test value <= 100")),
         })
 }
 
@@ -163,7 +164,15 @@ fn command_strategy() -> impl Strategy<Value = CommandPayload> {
         task_id_strategy()
             .prop_map(|tid| CommandBody::CancelTask(CancelTaskPayload { task_id: tid })),
         Just(CommandBody::RegisterGroup(RegisterGroupPayload {
-            group_spec: serde_json::json!({"name": "g"}),
+            name: "g".to_owned(),
+            extensions: Some(forgeclaw_ipc::GroupExtensions {
+                version: "1".to_owned(),
+                data: {
+                    let mut m = serde_json::Map::new();
+                    m.insert("k".to_owned(), serde_json::json!("v"));
+                    m
+                },
+            }),
         })),
         (
             short_string(),
@@ -171,7 +180,7 @@ fn command_strategy() -> impl Strategy<Value = CommandPayload> {
             prop_oneof![
                 Just(TanrenPhase::DoTask),
                 Just(TanrenPhase::Gate),
-                Just(TanrenPhase::Audit),
+                Just(TanrenPhase::AuditTask),
             ],
             bounded_string(),
             proptest::option::of(short_string()),
@@ -194,8 +203,8 @@ fn command_strategy() -> impl Strategy<Value = CommandPayload> {
             .prop_map(|(obj, sc, at, bp)| {
                 CommandBody::DispatchSelfImprovement(DispatchSelfImprovementPayload {
                     objective: obj,
-                    scope: sc,
-                    acceptance_tests: at,
+                    scopes: vec![sc],
+                    acceptance_tests: vec![at],
                     branch_policy: bp,
                 })
             }),
@@ -249,6 +258,7 @@ fn group_info_strategy() -> impl Strategy<Value = GroupInfo> {
         id,
         name,
         is_main,
+        capabilities: GroupCapabilities::default(),
     })
 }
 
