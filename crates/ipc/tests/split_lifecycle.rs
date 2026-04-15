@@ -6,21 +6,38 @@ use std::time::Duration;
 
 use forgeclaw_core::{GroupId, JobId};
 use forgeclaw_ipc::{
-    ContainerToHost, GroupCapabilities, GroupInfo, HostToContainer, InitConfig, InitContext,
-    InitPayload, IpcClient, IpcError, IpcServer, MessagesPayload, OutputCompletePayload,
-    OutputDeltaPayload, ProtocolError, ReadyPayload, ShutdownPayload, ShutdownReason, StopReason,
+    CommandBody, CommandPayload, ContainerToHost, GroupCapabilities, GroupInfo, HistoricalMessages,
+    HostToContainer, InitConfig, InitContext, InitPayload, IpcClient, IpcError, IpcInboundEvent,
+    IpcServer, MessagesPayload, OutputCompletePayload, OutputDeltaPayload, ProtocolError,
+    ReadyPayload, SendMessagePayload, ShutdownPayload, ShutdownReason, StopReason,
 };
 use tempfile::tempdir;
 
 fn socket_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
-    dir.path().join(name)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let socket_dir = dir.path().join("s");
+        std::fs::create_dir_all(&socket_dir).expect("mkdir s");
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod s");
+        {
+            let short_name = if name.len() > 32 { &name[..32] } else { name };
+            socket_dir.join(short_name)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        dir.path().join(name)
+    }
 }
 
 fn sample_ready(version: &str) -> ReadyPayload {
     ReadyPayload {
-        adapter: "test-adapter".to_owned(),
-        adapter_version: "0.1.0".to_owned(),
-        protocol_version: version.to_owned(),
+        adapter: "test-adapter".parse().expect("valid adapter"),
+        adapter_version: "0.1.0".parse().expect("valid adapter version"),
+        protocol_version: version.parse().expect("valid protocol version"),
     }
 }
 
@@ -29,7 +46,7 @@ const HS_TIMEOUT: Duration = Duration::from_secs(5);
 fn sample_group() -> GroupInfo {
     GroupInfo {
         id: GroupId::from("group-main"),
-        name: "Main".to_owned(),
+        name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
     }
@@ -39,24 +56,42 @@ fn sample_init() -> InitPayload {
     InitPayload {
         job_id: JobId::from("job-integration-1"),
         context: InitContext {
-            messages: vec![],
+            messages: HistoricalMessages::default(),
             group: GroupInfo {
                 id: GroupId::from("group-main"),
-                name: "Main".to_owned(),
+                name: "Main".parse().expect("valid name"),
                 is_main: true,
                 capabilities: GroupCapabilities::default(),
             },
-            timezone: "UTC".to_owned(),
+            timezone: "UTC".parse().expect("valid timezone"),
         },
         config: InitConfig {
-            provider_proxy_url: "http://proxy.local".to_owned(),
-            provider_proxy_token: "token".to_owned(),
-            model: "claude-sonnet-4-6".to_owned(),
+            provider_proxy_url: "http://proxy.local".parse().expect("valid proxy url"),
+            provider_proxy_token: "token".parse().expect("valid proxy token"),
+            model: "claude-sonnet-4-6".parse().expect("valid model"),
             max_tokens: 1000,
             session_id: None,
             tools_enabled: true,
             timeout_seconds: 600,
         },
+    }
+}
+
+async fn recv_message_reader(
+    reader: &mut forgeclaw_ipc::IpcConnectionReader,
+) -> Result<ContainerToHost, IpcError> {
+    match reader.recv_event().await? {
+        IpcInboundEvent::Message(msg) => Ok(msg),
+        IpcInboundEvent::Command(_) => Err(IpcError::Protocol(ProtocolError::UnexpectedMessage {
+            expected: "message",
+            got: "command",
+        })),
+        IpcInboundEvent::Unauthorized(rej) => {
+            Err(IpcError::Protocol(ProtocolError::UnexpectedMessage {
+                expected: "message",
+                got: rej.command,
+            }))
+        }
     }
 }
 
@@ -85,7 +120,7 @@ async fn concurrent_send_recv_through_split() {
                 .expect("send shutdown");
         });
 
-        let msg = reader.recv_container().await.expect("recv delta");
+        let msg = recv_message_reader(&mut reader).await.expect("recv delta");
         assert!(matches!(msg, ContainerToHost::OutputDelta(_)));
         write_task.await.expect("write task");
     });
@@ -98,7 +133,7 @@ async fn concurrent_send_recv_through_split() {
 
     client
         .send(&ContainerToHost::OutputDelta(OutputDeltaPayload {
-            text: "partial output".to_owned(),
+            text: "partial output".parse().expect("valid text"),
             job_id: JobId::from("job-integration-1"),
         }))
         .await
@@ -124,7 +159,9 @@ async fn split_preserves_pipelined_buffered_bytes() {
             .await
             .expect("server handshake");
         let (_writer, mut reader) = conn.into_split();
-        reader.recv_container().await.expect("recv pipelined msg")
+        recv_message_reader(&mut reader)
+            .await
+            .expect("recv pipelined msg")
     });
 
     // Pipeline Ready + delta back-to-back via raw socket.
@@ -134,7 +171,7 @@ async fn split_preserves_pipelined_buffered_bytes() {
     let ready =
         serde_json::to_vec(&ContainerToHost::Ready(sample_ready("1.0"))).expect("serialize ready");
     let delta = serde_json::to_vec(&ContainerToHost::OutputDelta(OutputDeltaPayload {
-        text: "pipelined".to_owned(),
+        text: "pipelined".parse().expect("valid text"),
         job_id: JobId::from("job-integration-1"),
     }))
     .expect("serialize delta");
@@ -180,7 +217,7 @@ async fn split_reader_error_immediately_closes_transport() {
             .expect("server handshake");
         let (_writer, mut reader) = conn.into_split();
         // Reader gets invalid UTF-8 → triggers shutdown via handle.
-        let err = reader.recv_container().await;
+        let err = recv_message_reader(&mut reader).await;
         assert!(err.is_err(), "invalid frame should error");
         // Keep _writer alive but never call send_host(). The peer
         // should still see EOF because the reader shut down the
@@ -228,12 +265,11 @@ async fn split_reader_rejects_output_delta_after_idle() {
             .await
             .expect("server handshake");
         let (_writer, mut reader) = conn.into_split();
-        let first = reader.recv_container().await.expect("first message");
-        assert!(matches!(first, ContainerToHost::OutputComplete(_)));
-        reader
-            .recv_container()
+        let first = recv_message_reader(&mut reader)
             .await
-            .expect_err("late delta should fail")
+            .expect("first message");
+        assert!(matches!(first, ContainerToHost::OutputComplete(_)));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     });
 
     let pending_client = IpcClient::connect(&path).await.expect("connect");
@@ -253,20 +289,61 @@ async fn split_reader_rejects_output_delta_after_idle() {
         .expect("send complete");
     client
         .send(&ContainerToHost::OutputDelta(OutputDeltaPayload {
-            text: "late".to_owned(),
+            text: "late".parse().expect("valid text"),
             job_id: JobId::from("job-integration-1"),
         }))
         .await
-        .expect("send late delta");
+        .expect_err("send late delta should fail client-side");
 
-    let err = accept_task.await.expect("join");
-    assert!(
-        matches!(
-            err,
-            IpcError::Protocol(ProtocolError::LifecycleViolation { .. })
-        ),
-        "expected lifecycle violation, got {err:?}"
-    );
+    accept_task.await.expect("join");
+}
+
+#[tokio::test]
+async fn split_reader_rejects_command_after_output_complete_until_messages() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ipc-split-lifecycle-idle-command.sock");
+    let server = IpcServer::bind(&path).expect("bind");
+
+    let accept_task = tokio::spawn(async move {
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (conn, _ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
+            .await
+            .expect("server handshake");
+        let (_writer, mut reader) = conn.into_split();
+        let first = recv_message_reader(&mut reader)
+            .await
+            .expect("first message");
+        assert!(matches!(first, ContainerToHost::OutputComplete(_)));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    });
+
+    let pending_client = IpcClient::connect(&path).await.expect("connect");
+    let (mut client, _init) = pending_client
+        .handshake(sample_ready("1.0"), HS_TIMEOUT)
+        .await
+        .expect("client handshake");
+    client
+        .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
+            job_id: JobId::from("job-integration-1"),
+            result: None,
+            session_id: None,
+            token_usage: None,
+            stop_reason: StopReason::EndTurn,
+        }))
+        .await
+        .expect("send complete");
+    client
+        .send(&ContainerToHost::Command(CommandPayload {
+            body: CommandBody::SendMessage(SendMessagePayload {
+                target_group: GroupId::from("group-main"),
+                text: "late command".parse().expect("valid text"),
+            }),
+        }))
+        .await
+        .expect_err("send command should fail client-side");
+
+    accept_task.await.expect("join");
 }
 
 #[tokio::test]
@@ -292,7 +369,7 @@ async fn split_writer_rejects_messages_after_shutdown() {
         writer
             .send_host(&HostToContainer::Messages(MessagesPayload {
                 job_id: JobId::from("job-integration-1"),
-                messages: vec![],
+                messages: HistoricalMessages::default(),
             }))
             .await
             .expect_err("messages after shutdown should fail")
@@ -336,12 +413,11 @@ async fn split_reader_rejects_repeated_output_complete_while_draining() {
             }))
             .await
             .expect("send shutdown");
-        let first = reader.recv_container().await.expect("first complete");
-        assert!(matches!(first, ContainerToHost::OutputComplete(_)));
-        reader
-            .recv_container()
+        let first = recv_message_reader(&mut reader)
             .await
-            .expect_err("second complete should fail")
+            .expect("first complete");
+        assert!(matches!(first, ContainerToHost::OutputComplete(_)));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     });
 
     let pending_client = IpcClient::connect(&path).await.expect("connect");
@@ -351,25 +427,26 @@ async fn split_reader_rejects_repeated_output_complete_while_draining() {
         .expect("client handshake");
     let received = client.recv().await.expect("recv shutdown");
     assert!(matches!(received, HostToContainer::Shutdown(_)));
-    for _ in 0..2 {
-        client
-            .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
-                job_id: JobId::from("job-integration-1"),
-                result: None,
-                session_id: None,
-                token_usage: None,
-                stop_reason: StopReason::EndTurn,
-            }))
-            .await
-            .expect("send complete");
-    }
+    client
+        .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
+            job_id: JobId::from("job-integration-1"),
+            result: None,
+            session_id: None,
+            token_usage: None,
+            stop_reason: StopReason::EndTurn,
+        }))
+        .await
+        .expect("first completion");
+    client
+        .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
+            job_id: JobId::from("job-integration-1"),
+            result: None,
+            session_id: None,
+            token_usage: None,
+            stop_reason: StopReason::EndTurn,
+        }))
+        .await
+        .expect_err("second completion should fail client-side");
 
-    let err = accept_task.await.expect("join");
-    assert!(
-        matches!(
-            err,
-            IpcError::Protocol(ProtocolError::LifecycleViolation { .. })
-        ),
-        "expected lifecycle violation, got {err:?}"
-    );
+    accept_task.await.expect("join");
 }

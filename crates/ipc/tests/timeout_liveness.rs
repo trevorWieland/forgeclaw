@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use forgeclaw_core::{GroupId, JobId};
 use forgeclaw_ipc::{
-    ContainerToHost, GroupCapabilities, GroupInfo, HostToContainer, InitConfig, InitContext,
-    InitPayload, IpcClient, IpcError, IpcServer, ProtocolError, ReadyPayload, ShutdownPayload,
-    ShutdownReason,
+    ContainerToHost, GroupCapabilities, GroupInfo, HistoricalMessages, HostToContainer, InitConfig,
+    InitContext, InitPayload, IpcClient, IpcError, IpcServer, ProtocolError, ReadyPayload,
+    ShutdownPayload, ShutdownReason,
 };
 use tempfile::tempdir;
 use tokio::io::AsyncWriteExt;
@@ -15,21 +15,37 @@ use tokio::io::AsyncWriteExt;
 const HS_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn socket_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
-    dir.path().join(name)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let socket_dir = dir.path().join("s");
+        std::fs::create_dir_all(&socket_dir).expect("mkdir s");
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod s");
+        {
+            let short_name = if name.len() > 32 { &name[..32] } else { name };
+            socket_dir.join(short_name)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        dir.path().join(name)
+    }
 }
 
 fn sample_ready(version: &str) -> ReadyPayload {
     ReadyPayload {
-        adapter: "test-adapter".to_owned(),
-        adapter_version: "0.1.0".to_owned(),
-        protocol_version: version.to_owned(),
+        adapter: "test-adapter".parse().expect("valid adapter"),
+        adapter_version: "0.1.0".parse().expect("valid adapter version"),
+        protocol_version: version.parse().expect("valid protocol version"),
     }
 }
 
 fn sample_group() -> GroupInfo {
     GroupInfo {
         id: GroupId::from("group-main"),
-        name: "Main".to_owned(),
+        name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
     }
@@ -39,14 +55,14 @@ fn sample_init() -> InitPayload {
     InitPayload {
         job_id: JobId::from("job-integration-1"),
         context: InitContext {
-            messages: vec![],
+            messages: HistoricalMessages::default(),
             group: sample_group(),
-            timezone: "UTC".to_owned(),
+            timezone: "UTC".parse().expect("valid timezone"),
         },
         config: InitConfig {
-            provider_proxy_url: "http://proxy.local".to_owned(),
-            provider_proxy_token: "token".to_owned(),
-            model: "claude-sonnet-4-6".to_owned(),
+            provider_proxy_url: "http://proxy.local".parse().expect("valid proxy url"),
+            provider_proxy_token: "token".parse().expect("valid proxy token"),
+            model: "claude-sonnet-4-6".parse().expect("valid model"),
             max_tokens: 1000,
             session_id: None,
             tools_enabled: true,
@@ -56,9 +72,23 @@ fn sample_init() -> InitPayload {
 }
 
 fn oversized_init() -> InitPayload {
+    use forgeclaw_ipc::HistoricalMessage;
+
     let mut init = sample_init();
-    // Large enough to force backpressure if peer stops reading.
-    init.config.provider_proxy_token = "x".repeat(9_000_000);
+    // Maximal semantically valid payload to force backpressure if peer
+    // stops reading during handshake send.
+    let msg = HistoricalMessage {
+        sender: "A".parse().expect("valid sender"),
+        text: "x"
+            .repeat(32 * 1024)
+            .parse()
+            .expect("valid historical message"),
+        timestamp: "2026-04-03T10:00:00Z".parse().expect("valid timestamp"),
+    };
+    init.context.messages = std::iter::repeat_n(msg, 256)
+        .collect::<Vec<_>>()
+        .try_into()
+        .expect("messages within bound");
     init
 }
 
@@ -113,7 +143,7 @@ async fn heartbeat_timeout_during_processing_unsplit() {
             .handshake(sample_init(), HS_TIMEOUT)
             .await
             .expect("handshake");
-        let err = conn.recv_container().await.expect_err("should timeout");
+        let err = conn.recv_event().await.expect_err("should timeout");
         conn.send_host(&HostToContainer::Shutdown(ShutdownPayload {
             reason: ShutdownReason::HostShutdown,
             deadline_ms: 1_000,
@@ -160,7 +190,7 @@ async fn heartbeat_timeout_during_processing_split_reader() {
             .await
             .expect("handshake");
         let (mut writer, mut reader) = conn.into_split();
-        let err = reader.recv_container().await.expect_err("should timeout");
+        let err = reader.recv_event().await.expect_err("should timeout");
         writer
             .send_host(&HostToContainer::Shutdown(ShutdownPayload {
                 reason: ShutdownReason::HostShutdown,
@@ -193,4 +223,101 @@ async fn heartbeat_timeout_during_processing_split_reader() {
     );
     let shutdown = client.recv().await.expect("recv shutdown");
     assert!(matches!(shutdown, HostToContainer::Shutdown(_)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_deadline_timeout_while_draining_unsplit() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ipc-draining-unsplit.sock");
+    let server = IpcServer::bind(&path).expect("bind");
+
+    let accept_task = tokio::spawn(async move {
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (mut conn, _ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
+            .await
+            .expect("handshake");
+        conn.send_host(&HostToContainer::Shutdown(ShutdownPayload {
+            reason: ShutdownReason::HostShutdown,
+            deadline_ms: 1_500,
+        }))
+        .await
+        .expect("send shutdown");
+        conn.recv_event()
+            .await
+            .expect_err("drain timeout should fire")
+    });
+
+    let pending = IpcClient::connect(&path).await.expect("connect");
+    let (mut client, _init) = pending
+        .handshake(sample_ready("1.0"), HS_TIMEOUT)
+        .await
+        .expect("client handshake");
+    let shutdown = client.recv().await.expect("recv shutdown");
+    assert!(matches!(shutdown, HostToContainer::Shutdown(_)));
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(1_600)).await;
+
+    let err = accept_task.await.expect("join");
+    assert!(
+        matches!(
+            err,
+            IpcError::Protocol(ProtocolError::ShutdownDeadlineExceeded {
+                phase: "draining",
+                deadline_ms: 1_500
+            })
+        ),
+        "expected ShutdownDeadlineExceeded, got {err:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_deadline_timeout_while_draining_split_reader() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ipc-draining-split.sock");
+    let server = IpcServer::bind(&path).expect("bind");
+
+    let accept_task = tokio::spawn(async move {
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (conn, _ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
+            .await
+            .expect("handshake");
+        let (mut writer, mut reader) = conn.into_split();
+        writer
+            .send_host(&HostToContainer::Shutdown(ShutdownPayload {
+                reason: ShutdownReason::HostShutdown,
+                deadline_ms: 1_250,
+            }))
+            .await
+            .expect("send shutdown");
+        reader
+            .recv_event()
+            .await
+            .expect_err("drain timeout should fire")
+    });
+
+    let pending = IpcClient::connect(&path).await.expect("connect");
+    let (mut client, _init) = pending
+        .handshake(sample_ready("1.0"), HS_TIMEOUT)
+        .await
+        .expect("client handshake");
+    let shutdown = client.recv().await.expect("recv shutdown");
+    assert!(matches!(shutdown, HostToContainer::Shutdown(_)));
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(1_400)).await;
+
+    let err = accept_task.await.expect("join");
+    assert!(
+        matches!(
+            err,
+            IpcError::Protocol(ProtocolError::ShutdownDeadlineExceeded {
+                phase: "draining",
+                deadline_ms: 1_250
+            })
+        ),
+        "expected ShutdownDeadlineExceeded, got {err:?}"
+    );
 }

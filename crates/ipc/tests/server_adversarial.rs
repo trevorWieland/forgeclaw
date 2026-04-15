@@ -8,29 +8,46 @@ use std::time::Duration;
 
 use forgeclaw_core::{GroupId, JobId};
 use forgeclaw_ipc::{
-    ContainerToHost, FrameError, GroupCapabilities, GroupInfo, InitConfig, InitContext,
-    InitPayload, IpcClient, IpcError, IpcServer, ProtocolError, ReadyPayload,
+    ContainerToHost, FrameError, GroupCapabilities, GroupInfo, HistoricalMessages, InitConfig,
+    InitContext, InitPayload, IpcClient, IpcError, IpcInboundEvent, IpcServer, ProtocolError,
+    ReadyPayload,
 };
 use tempfile::tempdir;
 
 fn socket_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
-    dir.path().join(name)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let socket_dir = dir.path().join("s");
+        std::fs::create_dir_all(&socket_dir).expect("mkdir s");
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod s");
+        {
+            let short_name = if name.len() > 32 { &name[..32] } else { name };
+            socket_dir.join(short_name)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        dir.path().join(name)
+    }
 }
 
 const HS_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn sample_ready(version: &str) -> ReadyPayload {
     ReadyPayload {
-        adapter: "test-adapter".to_owned(),
-        adapter_version: "0.1.0".to_owned(),
-        protocol_version: version.to_owned(),
+        adapter: "test-adapter".parse().expect("valid adapter"),
+        adapter_version: "0.1.0".parse().expect("valid adapter version"),
+        protocol_version: version.parse().expect("valid protocol version"),
     }
 }
 
 fn sample_group() -> GroupInfo {
     GroupInfo {
         id: GroupId::from("group-main"),
-        name: "Main".to_owned(),
+        name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
     }
@@ -40,19 +57,37 @@ fn sample_init() -> InitPayload {
     InitPayload {
         job_id: JobId::from("job-integration-1"),
         context: InitContext {
-            messages: vec![],
+            messages: HistoricalMessages::default(),
             group: sample_group(),
-            timezone: "UTC".to_owned(),
+            timezone: "UTC".parse().expect("valid timezone"),
         },
         config: InitConfig {
-            provider_proxy_url: "http://proxy.local".to_owned(),
-            provider_proxy_token: "token".to_owned(),
-            model: "claude-sonnet-4-6".to_owned(),
+            provider_proxy_url: "http://proxy.local".parse().expect("valid proxy url"),
+            provider_proxy_token: "token".parse().expect("valid proxy token"),
+            model: "claude-sonnet-4-6".parse().expect("valid model"),
             max_tokens: 1000,
             session_id: None,
             tools_enabled: true,
             timeout_seconds: 600,
         },
+    }
+}
+
+async fn recv_message(
+    conn: &mut forgeclaw_ipc::IpcConnection,
+) -> Result<ContainerToHost, IpcError> {
+    match conn.recv_event().await? {
+        IpcInboundEvent::Message(msg) => Ok(msg),
+        IpcInboundEvent::Command(_) => Err(IpcError::Protocol(ProtocolError::UnexpectedMessage {
+            expected: "message",
+            got: "command",
+        })),
+        IpcInboundEvent::Unauthorized(rej) => {
+            Err(IpcError::Protocol(ProtocolError::UnexpectedMessage {
+                expected: "message",
+                got: rej.command,
+            }))
+        }
     }
 }
 
@@ -165,19 +200,30 @@ async fn unknown_type_byte_budget_enforced_during_handshake() {
         .await
         .expect("raw connect");
 
-    // Single unknown frame > 1 MiB (but < max frame) should fail the
-    // cumulative unknown-byte budget.
-    let mut payload = vec![b' '; 1_049_000];
-    let prefix = br#"{"type":"experimental_large","data":"#;
-    payload[..prefix.len()].copy_from_slice(prefix);
-    let suffix = br#""}"#;
-    let suffix_start = payload.len() - suffix.len();
-    payload[suffix_start..].copy_from_slice(suffix);
-
-    let len = u32::try_from(payload.len()).expect("fits");
-    raw.write_all(&len.to_be_bytes()).await.expect("write len");
-    raw.write_all(&payload).await.expect("write payload");
-    raw.flush().await.expect("flush");
+    // Send parseable unknown-type frames until cumulative unknown
+    // bytes exceed the 1 MiB budget.
+    let data = "x".repeat(70_000);
+    for i in 0..20 {
+        let payload = format!(r#"{{"type":"experimental_large_{i}","data":"{data}"}}"#);
+        let len = u32::try_from(payload.len()).expect("fits");
+        if let Err(e) = raw.write_all(&len.to_be_bytes()).await {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                break;
+            }
+            assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "write len: {e}");
+        }
+        if let Err(e) = raw.write_all(payload.as_bytes()).await {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                break;
+            }
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::BrokenPipe,
+                "write payload: {e}"
+            );
+        }
+    }
+    let _ = raw.flush().await;
     drop(raw);
 
     let err = accept_task
@@ -368,8 +414,8 @@ async fn unknown_budget_resets_after_recognized_message() {
             .handshake(sample_init(), HS_TIMEOUT)
             .await
             .expect("handshake");
-        let first = conn.recv_container().await.expect("first known message");
-        let second = conn.recv_container().await.expect("second known message");
+        let first = recv_message(&mut conn).await.expect("first known message");
+        let second = recv_message(&mut conn).await.expect("second known message");
         (first, second)
     });
 
@@ -403,7 +449,7 @@ async fn unknown_budget_resets_after_recognized_message() {
     // Known message resets unknown budget.
     let delta = serde_json::to_vec(&ContainerToHost::OutputDelta(
         forgeclaw_ipc::OutputDeltaPayload {
-            text: "delta".to_owned(),
+            text: "delta".parse().expect("valid text"),
             job_id: JobId::from("job-integration-1"),
         },
     ))
@@ -422,7 +468,7 @@ async fn unknown_budget_resets_after_recognized_message() {
     let complete = serde_json::to_vec(&ContainerToHost::OutputComplete(
         forgeclaw_ipc::OutputCompletePayload {
             job_id: JobId::from("job-integration-1"),
-            result: Some("done".to_owned()),
+            result: Some("done".parse().expect("valid result")),
             session_id: None,
             token_usage: None,
             stop_reason: forgeclaw_ipc::StopReason::EndTurn,

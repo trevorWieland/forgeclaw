@@ -75,6 +75,18 @@ fn deserialize_rejects_whitespace_only() {
     );
 }
 
+#[test]
+fn deserialize_rejects_over_max_len() {
+    let json = format!("\"{}\"", "x".repeat(129));
+    let result: Result<GroupId, _> = serde_json::from_str(&json);
+    assert!(result.is_err(), "deserialization should reject >128 chars");
+    let msg = result.expect_err("should fail").to_string();
+    assert!(
+        msg.contains("128"),
+        "error should mention 128-char bound: {msg}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Validated construction (new)
 // ---------------------------------------------------------------------------
@@ -126,6 +138,23 @@ fn new_preserves_leading_trailing_whitespace() {
 fn new_from_owned_string() {
     let id = GroupId::new("my-group".to_owned()).expect("should succeed");
     assert_eq!(id.as_ref(), "my-group");
+}
+
+#[test]
+fn new_accepts_exactly_128_chars() {
+    let value = "x".repeat(128);
+    let id = GroupId::new(value.clone()).expect("should succeed");
+    assert_eq!(id.as_ref(), value);
+}
+
+#[test]
+fn new_rejects_over_128_chars() {
+    let err = GroupId::new("x".repeat(129)).expect_err("should fail");
+    assert!(
+        err.reason.contains("128"),
+        "error should mention 128-char bound: {}",
+        err.reason
+    );
 }
 
 #[test]
@@ -205,8 +234,11 @@ mod proptest_ids {
         }
 
         #[test]
-        fn validated_accepts_non_whitespace(s in r".+\S.+") {
-            // Strings with at least one non-whitespace char should be accepted.
+        fn validated_accepts_non_whitespace_within_max_len(
+            s in proptest::string::string_regex(r"(?s).{1,128}").expect("valid regex"),
+        ) {
+            prop_assume!(s.chars().any(|c| !c.is_whitespace()));
+            // Strings with at least one non-whitespace char and <=128 chars should be accepted.
             prop_assert!(GroupId::new(s).is_ok());
         }
     }

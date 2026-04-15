@@ -8,22 +8,38 @@ use std::time::Duration;
 use forgeclaw_core::GroupId;
 use forgeclaw_ipc::{
     AuthorizedCommand, CommandBody, CommandPayload, ContainerToHost, GroupCapabilities, GroupInfo,
-    InitConfig, InitContext, InitPayload, IpcClient, IpcError, IpcServer, ProtocolError,
-    ReadyPayload, ScopedAuthorizedCommand,
+    HistoricalMessages, InitConfig, InitContext, InitPayload, IpcClient, IpcError, IpcServer,
+    ProtocolError, ReadyPayload, ScopedAuthorizedCommand,
 };
 use tempfile::tempdir;
 
 fn socket_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
-    dir.path().join(name)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let socket_dir = dir.path().join("s");
+        std::fs::create_dir_all(&socket_dir).expect("mkdir s");
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod s");
+        {
+            let short_name = if name.len() > 32 { &name[..32] } else { name };
+            socket_dir.join(short_name)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        dir.path().join(name)
+    }
 }
 
 const HS_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn sample_ready() -> ReadyPayload {
     ReadyPayload {
-        adapter: "test-adapter".to_owned(),
-        adapter_version: "0.1.0".to_owned(),
-        protocol_version: "1.0".to_owned(),
+        adapter: "test-adapter".parse().expect("valid adapter"),
+        adapter_version: "0.1.0".parse().expect("valid adapter version"),
+        protocol_version: "1.0".parse().expect("valid protocol version"),
     }
 }
 
@@ -31,14 +47,14 @@ fn sample_init(group: &GroupInfo) -> InitPayload {
     InitPayload {
         job_id: forgeclaw_core::JobId::from("job-own-1"),
         context: InitContext {
-            messages: vec![],
+            messages: HistoricalMessages::default(),
             group: group.clone(),
-            timezone: "UTC".to_owned(),
+            timezone: "UTC".parse().expect("valid timezone"),
         },
         config: InitConfig {
-            provider_proxy_url: "http://proxy.local".to_owned(),
-            provider_proxy_token: "token".to_owned(),
-            model: "claude-sonnet-4-6".to_owned(),
+            provider_proxy_url: "http://proxy.local".parse().expect("valid proxy url"),
+            provider_proxy_token: "token".parse().expect("valid proxy token"),
+            model: "claude-sonnet-4-6".parse().expect("valid model"),
             max_tokens: 1000,
             session_id: None,
             tools_enabled: true,
@@ -84,7 +100,7 @@ async fn pause_task_returns_ownership_pending() {
 
     let group = GroupInfo {
         id: GroupId::from("group-worker"),
-        name: "Worker".to_owned(),
+        name: "Worker".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities::default(),
     };
@@ -122,7 +138,7 @@ async fn ownership_pending_verify_rejects_cross_group() {
 
     let group = GroupInfo {
         id: GroupId::from("group-worker"),
-        name: "Worker".to_owned(),
+        name: "Worker".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities::default(),
     };
@@ -161,7 +177,7 @@ async fn ownership_pending_main_always_passes() {
 
     let group = GroupInfo {
         id: GroupId::from("group-main"),
-        name: "Main".to_owned(),
+        name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
     };

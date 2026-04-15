@@ -10,7 +10,9 @@
 //! - Major version bumps are breaking — the host rejects adapters whose major
 //!   version does not match.
 //!
-//! Callers check peer version via [`is_compatible`] inside the handshake path.
+//! Handshake code should derive a [`NegotiatedProtocolVersion`] via
+//! [`negotiate`] and persist it in connection state so minor-sensitive
+//! behavior can be gated explicitly.
 
 /// The protocol version implemented by this crate.
 ///
@@ -18,6 +20,31 @@
 /// container-side adapter built against this crate will advertise in its
 /// `Ready` message.
 pub const PROTOCOL_VERSION: &str = "1.0";
+
+/// Negotiated protocol version for a live connection.
+///
+/// Negotiation succeeds only when major versions match. The negotiated
+/// minor is the minimum of local and peer minor versions, so behavior
+/// gates can safely branch on "supported by both sides."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NegotiatedProtocolVersion {
+    major: u32,
+    minor: u32,
+}
+
+impl NegotiatedProtocolVersion {
+    /// Returns the negotiated major version.
+    #[must_use]
+    pub fn major(self) -> u32 {
+        self.major
+    }
+
+    /// Returns the negotiated minor version.
+    #[must_use]
+    pub fn minor(self) -> u32 {
+        self.minor
+    }
+}
 
 /// Compares a peer's advertised protocol version against [`PROTOCOL_VERSION`].
 ///
@@ -31,13 +58,24 @@ pub const PROTOCOL_VERSION: &str = "1.0";
 /// components (e.g. `"1."`) are all rejected.
 #[must_use]
 pub fn is_compatible(peer: &str) -> bool {
-    let Some((peer_major, _)) = parse_version(peer) else {
-        return false;
-    };
-    let Some((local_major, _)) = parse_version(PROTOCOL_VERSION) else {
-        return false;
-    };
-    peer_major == local_major
+    negotiate(peer).is_some()
+}
+
+/// Negotiate a runtime protocol version with a peer.
+///
+/// Returns `None` when either side's version is malformed or majors do
+/// not match.
+#[must_use]
+pub fn negotiate(peer: &str) -> Option<NegotiatedProtocolVersion> {
+    let (peer_major, peer_minor) = parse_version(peer)?;
+    let (local_major, local_minor) = parse_version(PROTOCOL_VERSION)?;
+    if peer_major != local_major {
+        return None;
+    }
+    Some(NegotiatedProtocolVersion {
+        major: local_major,
+        minor: peer_minor.min(local_minor),
+    })
 }
 
 /// Parse a `"major.minor"` version string into its two numeric
@@ -58,7 +96,7 @@ fn parse_version(version: &str) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PROTOCOL_VERSION, is_compatible, parse_version};
+    use super::{PROTOCOL_VERSION, is_compatible, negotiate, parse_version};
 
     #[test]
     fn local_version_is_one_zero() {
@@ -106,6 +144,7 @@ mod tests {
 
     #[test]
     fn same_major_different_minor_is_compatible() {
+        assert!(is_compatible("1.0"));
         assert!(is_compatible("1.5"));
         assert!(is_compatible("1.99"));
     }
@@ -125,5 +164,22 @@ mod tests {
         assert!(!is_compatible("1.foo"));
         assert!(!is_compatible("1.0.3"));
         assert!(!is_compatible(".1"));
+    }
+
+    #[test]
+    fn negotiate_uses_shared_major_and_lower_minor() {
+        let v = negotiate("1.0").expect("compatible");
+        assert_eq!(v.major(), 1);
+        assert_eq!(v.minor(), 0);
+
+        let v = negotiate("1.9").expect("compatible");
+        assert_eq!(v.major(), 1);
+        assert_eq!(v.minor(), 0);
+    }
+
+    #[test]
+    fn negotiate_rejects_malformed_or_major_mismatch() {
+        assert!(negotiate("2.0").is_none());
+        assert!(negotiate("invalid").is_none());
     }
 }

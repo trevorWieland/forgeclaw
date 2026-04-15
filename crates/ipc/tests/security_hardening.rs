@@ -8,14 +8,31 @@ use std::time::Duration;
 use forgeclaw_core::{GroupId, JobId};
 use forgeclaw_ipc::{
     AuthorizedCommand, CommandBody, CommandPayload, ContainerToHost, DispatchTanrenPayload,
-    GroupCapabilities, GroupInfo, InitConfig, InitContext, InitPayload, IpcClient, IpcError,
-    IpcServer, PrivilegedAuthorizedCommand, ProtocolError, ReadyPayload, RegisterGroupPayload,
-    ScheduleTaskPayload, ScheduleType, ScopedAuthorizedCommand, SendMessagePayload,
+    GroupCapabilities, GroupInfo, HistoricalMessages, InitConfig, InitContext, InitPayload,
+    IpcClient, IpcError, IpcServer, PrivilegedAuthorizedCommand, ProtocolError, ReadyPayload,
+    RegisterGroupPayload, ScheduleTaskPayload, ScheduleType, ScopedAuthorizedCommand,
+    SendMessagePayload,
 };
 use tempfile::tempdir;
 
 fn socket_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
-    dir.path().join(name)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let socket_dir = dir.path().join("s");
+        std::fs::create_dir_all(&socket_dir).expect("mkdir s");
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod s");
+        {
+            let short_name = if name.len() > 32 { &name[..32] } else { name };
+            socket_dir.join(short_name)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        dir.path().join(name)
+    }
 }
 
 #[tokio::test]
@@ -28,7 +45,7 @@ async fn too_many_unknown_frames_poisons_connection() {
 
     let group = GroupInfo {
         id: GroupId::from("group-main"),
-        name: "Main".to_owned(),
+        name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
     };
@@ -75,11 +92,11 @@ async fn too_many_unknown_frames_poisons_connection() {
 
 const HS_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn sample_ready() -> ReadyPayload {
+fn sample_ready(version: &str) -> ReadyPayload {
     ReadyPayload {
-        adapter: "test-adapter".to_owned(),
-        adapter_version: "0.1.0".to_owned(),
-        protocol_version: "1.0".to_owned(),
+        adapter: "test-adapter".parse().expect("valid adapter"),
+        adapter_version: "0.1.0".parse().expect("valid adapter version"),
+        protocol_version: version.parse().expect("valid protocol version"),
     }
 }
 
@@ -87,14 +104,14 @@ fn sample_init(group: &GroupInfo) -> InitPayload {
     InitPayload {
         job_id: JobId::from("job-auth-1"),
         context: InitContext {
-            messages: vec![],
+            messages: HistoricalMessages::default(),
             group: group.clone(),
-            timezone: "UTC".to_owned(),
+            timezone: "UTC".parse().expect("valid timezone"),
         },
         config: InitConfig {
-            provider_proxy_url: "http://proxy.local".to_owned(),
-            provider_proxy_token: "token".to_owned(),
-            model: "claude-sonnet-4-6".to_owned(),
+            provider_proxy_url: "http://proxy.local".parse().expect("valid proxy url"),
+            provider_proxy_token: "token".parse().expect("valid proxy token"),
+            model: "claude-sonnet-4-6".parse().expect("valid model"),
             max_tokens: 1000,
             session_id: None,
             tools_enabled: true,
@@ -126,7 +143,7 @@ async fn setup_auth_test(
 
     let pending_client = IpcClient::connect(&path_clone).await.expect("connect");
     let (mut client, _init) = pending_client
-        .handshake(sample_ready(), HS_TIMEOUT)
+        .handshake(sample_ready("1.0"), HS_TIMEOUT)
         .await
         .expect("client handshake");
     client.send(&command).await.expect("send");
@@ -144,13 +161,13 @@ async fn privileged_command_rejected_for_non_main_session() {
 
     let group = GroupInfo {
         id: GroupId::from("group-worker"),
-        name: "Worker".to_owned(),
+        name: "Worker".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities::default(),
     };
     let command = ContainerToHost::Command(CommandPayload {
         body: CommandBody::RegisterGroup(RegisterGroupPayload {
-            name: "new-group".to_owned(),
+            name: "new-group".parse().expect("valid name"),
             extensions: None,
         }),
     });
@@ -177,13 +194,13 @@ async fn privileged_command_accepted_for_main_session() {
 
     let group = GroupInfo {
         id: GroupId::from("group-main"),
-        name: "Main".to_owned(),
+        name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
     };
     let command = ContainerToHost::Command(CommandPayload {
         body: CommandBody::RegisterGroup(RegisterGroupPayload {
-            name: "new-group".to_owned(),
+            name: "new-group".parse().expect("valid name"),
             extensions: None,
         }),
     });
@@ -209,14 +226,14 @@ async fn send_message_own_group_accepted_for_non_main() {
 
     let group = GroupInfo {
         id: GroupId::from("group-worker"),
-        name: "Worker".to_owned(),
+        name: "Worker".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities::default(),
     };
     let command = ContainerToHost::Command(CommandPayload {
         body: CommandBody::SendMessage(SendMessagePayload {
             target_group: GroupId::from("group-worker"),
-            text: "hello".to_owned(),
+            text: "hello".parse().expect("valid text"),
         }),
     });
 
@@ -239,14 +256,14 @@ async fn send_message_cross_group_rejected_for_non_main() {
 
     let group = GroupInfo {
         id: GroupId::from("group-worker"),
-        name: "Worker".to_owned(),
+        name: "Worker".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities::default(),
     };
     let command = ContainerToHost::Command(CommandPayload {
         body: CommandBody::SendMessage(SendMessagePayload {
             target_group: GroupId::from("group-other"),
-            text: "hello".to_owned(),
+            text: "hello".parse().expect("valid text"),
         }),
     });
 
@@ -272,14 +289,14 @@ async fn send_message_cross_group_accepted_for_main() {
 
     let group = GroupInfo {
         id: GroupId::from("group-main"),
-        name: "Main".to_owned(),
+        name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
     };
     let command = ContainerToHost::Command(CommandPayload {
         body: CommandBody::SendMessage(SendMessagePayload {
             target_group: GroupId::from("group-other"),
-            text: "hello from main".to_owned(),
+            text: "hello from main".parse().expect("valid text"),
         }),
     });
 
@@ -302,7 +319,7 @@ async fn schedule_task_cross_group_rejected_for_non_main() {
 
     let group = GroupInfo {
         id: GroupId::from("group-worker"),
-        name: "Worker".to_owned(),
+        name: "Worker".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities::default(),
     };
@@ -310,8 +327,8 @@ async fn schedule_task_cross_group_rejected_for_non_main() {
         body: CommandBody::ScheduleTask(ScheduleTaskPayload {
             group: GroupId::from("group-other"),
             schedule_type: ScheduleType::Once,
-            schedule_value: "2026-04-12T00:00:00Z".to_owned(),
-            prompt: "p".to_owned(),
+            schedule_value: "2026-04-12T00:00:00Z".parse().expect("valid schedule"),
+            prompt: "p".parse().expect("valid prompt"),
             context_mode: None,
         }),
     });
@@ -340,16 +357,16 @@ async fn dispatch_tanren_rejected_without_capability() {
 
     let group = GroupInfo {
         id: GroupId::from("group-worker"),
-        name: "Worker".to_owned(),
+        name: "Worker".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities { tanren: false },
     };
     let command = ContainerToHost::Command(CommandPayload {
         body: CommandBody::DispatchTanren(DispatchTanrenPayload {
-            project: "forgeclaw".to_owned(),
-            branch: "main".to_owned(),
+            project: "forgeclaw".parse().expect("valid project"),
+            branch: "main".parse().expect("valid branch"),
             phase: forgeclaw_ipc::TanrenPhase::DoTask,
-            prompt: "do thing".to_owned(),
+            prompt: "do thing".parse().expect("valid prompt"),
             environment_profile: None,
         }),
     });
@@ -376,16 +393,16 @@ async fn dispatch_tanren_accepted_with_capability() {
 
     let group = GroupInfo {
         id: GroupId::from("group-tanren"),
-        name: "Tanren".to_owned(),
+        name: "Tanren".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities { tanren: true },
     };
     let command = ContainerToHost::Command(CommandPayload {
         body: CommandBody::DispatchTanren(DispatchTanrenPayload {
-            project: "forgeclaw".to_owned(),
-            branch: "main".to_owned(),
+            project: "forgeclaw".parse().expect("valid project"),
+            branch: "main".parse().expect("valid branch"),
             phase: forgeclaw_ipc::TanrenPhase::DoTask,
-            prompt: "do thing".to_owned(),
+            prompt: "do thing".parse().expect("valid prompt"),
             environment_profile: None,
         }),
     });
@@ -409,16 +426,16 @@ async fn dispatch_tanren_rejected_for_main_without_capability() {
 
     let group = GroupInfo {
         id: GroupId::from("group-main"),
-        name: "Main".to_owned(),
+        name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities { tanren: false },
     };
     let command = ContainerToHost::Command(CommandPayload {
         body: CommandBody::DispatchTanren(DispatchTanrenPayload {
-            project: "forgeclaw".to_owned(),
-            branch: "main".to_owned(),
+            project: "forgeclaw".parse().expect("valid project"),
+            branch: "main".parse().expect("valid branch"),
             phase: forgeclaw_ipc::TanrenPhase::DoTask,
-            prompt: "do thing".to_owned(),
+            prompt: "do thing".parse().expect("valid prompt"),
             environment_profile: None,
         }),
     });
@@ -445,16 +462,16 @@ async fn dispatch_tanren_accepted_for_main_with_capability() {
 
     let group = GroupInfo {
         id: GroupId::from("group-main"),
-        name: "Main".to_owned(),
+        name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities { tanren: true },
     };
     let command = ContainerToHost::Command(CommandPayload {
         body: CommandBody::DispatchTanren(DispatchTanrenPayload {
-            project: "forgeclaw".to_owned(),
-            branch: "main".to_owned(),
+            project: "forgeclaw".parse().expect("valid project"),
+            branch: "main".parse().expect("valid branch"),
             phase: forgeclaw_ipc::TanrenPhase::DoTask,
-            prompt: "do thing".to_owned(),
+            prompt: "do thing".parse().expect("valid prompt"),
             environment_profile: None,
         }),
     });

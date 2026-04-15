@@ -14,11 +14,11 @@ use forgeclaw_core::{GroupId, JobId, TaskId};
 use forgeclaw_ipc::{
     BranchPolicy, CancelTaskPayload, CommandBody, CommandPayload, ContainerToHost,
     DispatchSelfImprovementPayload, DispatchTanrenPayload, ErrorCode, ErrorPayload, FrameCodec,
-    GroupCapabilities, GroupInfo, HeartbeatPayload, HistoricalMessage, HostToContainer, InitConfig,
-    InitContext, InitPayload, MessagesPayload, OutputCompletePayload, OutputDeltaPayload,
-    PauseTaskPayload, ProgressPayload, ReadyPayload, RegisterGroupPayload, ScheduleTaskPayload,
-    ScheduleType, SendMessagePayload, ShutdownPayload, ShutdownReason, StopReason, TanrenPhase,
-    TokenUsage,
+    GroupCapabilities, GroupInfo, HeartbeatPayload, HistoricalMessage, HostToContainer,
+    IanaTimezone, InitConfig, InitContext, InitPayload, IpcTimestamp, MessagesPayload,
+    OutputCompletePayload, OutputDeltaPayload, PauseTaskPayload, ProgressPayload, ReadyPayload,
+    RegisterGroupPayload, ScheduleTaskPayload, ScheduleType, SendMessagePayload, ShutdownPayload,
+    ShutdownReason, StopReason, TanrenPhase, TokenUsage,
 };
 use proptest::prelude::*;
 use tokio_util::codec::{Decoder, Encoder};
@@ -34,6 +34,26 @@ fn bounded_string() -> impl Strategy<Value = String> {
 
 fn short_string() -> impl Strategy<Value = String> {
     "[a-zA-Z0-9_-]{1,32}".prop_map(String::from)
+}
+
+fn timestamp_strategy() -> impl Strategy<Value = IpcTimestamp> {
+    prop_oneof![
+        Just("2026-04-03T10:00:00Z".parse().expect("valid timestamp")),
+        Just("2026-04-03T10:00:00.123Z".parse().expect("valid timestamp")),
+        Just(
+            "2026-04-03T10:00:00+00:00"
+                .parse()
+                .expect("valid timestamp")
+        ),
+    ]
+}
+
+fn timezone_strategy() -> impl Strategy<Value = IanaTimezone> {
+    prop_oneof![
+        Just("UTC".parse().expect("valid timezone")),
+        Just("America/New_York".parse().expect("valid timezone")),
+        Just("Europe/London".parse().expect("valid timezone")),
+    ]
 }
 
 fn job_id_strategy() -> impl Strategy<Value = JobId> {
@@ -80,17 +100,19 @@ fn token_usage_strategy() -> impl Strategy<Value = TokenUsage> {
 
 fn ready_strategy() -> impl Strategy<Value = ReadyPayload> {
     (short_string(), short_string()).prop_map(|(adapter, adapter_version)| ReadyPayload {
-        adapter,
-        adapter_version,
+        adapter: adapter.parse().expect("valid adapter"),
+        adapter_version: adapter_version.parse().expect("valid adapter version"),
         // Fixed at the crate's supported version so the handshake
         // path in other tests can also reuse this strategy.
-        protocol_version: "1.0".to_owned(),
+        protocol_version: "1.0".parse().expect("valid protocol version"),
     })
 }
 
 fn output_delta_strategy() -> impl Strategy<Value = OutputDeltaPayload> {
-    (bounded_string(), job_id_strategy())
-        .prop_map(|(text, job_id)| OutputDeltaPayload { text, job_id })
+    (bounded_string(), job_id_strategy()).prop_map(|(text, job_id)| OutputDeltaPayload {
+        text: text.parse().expect("valid output delta"),
+        job_id,
+    })
 }
 
 fn output_complete_strategy() -> impl Strategy<Value = OutputCompletePayload> {
@@ -104,8 +126,8 @@ fn output_complete_strategy() -> impl Strategy<Value = OutputCompletePayload> {
         .prop_map(|(job_id, result, session_id, token_usage, stop_reason)| {
             OutputCompletePayload {
                 job_id,
-                result,
-                session_id,
+                result: result.map(|r| r.parse().expect("valid output result")),
+                session_id: session_id.map(|s| s.parse().expect("valid session id")),
                 token_usage,
                 stop_reason,
             }
@@ -121,8 +143,8 @@ fn progress_strategy() -> impl Strategy<Value = ProgressPayload> {
     )
         .prop_map(|(job_id, stage, detail, percent)| ProgressPayload {
             job_id,
-            stage,
-            detail,
+            stage: stage.parse().expect("valid stage"),
+            detail: detail.map(|d| d.parse().expect("valid detail")),
             percent: percent.map(|v| forgeclaw_ipc::Percent::new(v).expect("test value <= 100")),
         })
 }
@@ -136,7 +158,7 @@ fn command_strategy() -> impl Strategy<Value = CommandPayload> {
         (group_id_strategy(), bounded_string()).prop_map(|(tg, t)| {
             CommandBody::SendMessage(SendMessagePayload {
                 target_group: tg,
-                text: t,
+                text: t.parse().expect("valid message text"),
             })
         }),
         (
@@ -154,9 +176,9 @@ fn command_strategy() -> impl Strategy<Value = CommandPayload> {
                 CommandBody::ScheduleTask(ScheduleTaskPayload {
                     group: g,
                     schedule_type: st,
-                    schedule_value: sv,
-                    prompt: p,
-                    context_mode: cm,
+                    schedule_value: sv.parse().expect("valid schedule value"),
+                    prompt: p.parse().expect("valid prompt"),
+                    context_mode: cm.map(|mode| mode.parse().expect("valid context mode")),
                 })
             }),
         task_id_strategy()
@@ -164,15 +186,16 @@ fn command_strategy() -> impl Strategy<Value = CommandPayload> {
         task_id_strategy()
             .prop_map(|tid| CommandBody::CancelTask(CancelTaskPayload { task_id: tid })),
         Just(CommandBody::RegisterGroup(RegisterGroupPayload {
-            name: "g".to_owned(),
-            extensions: Some(forgeclaw_ipc::GroupExtensions {
-                version: "1".to_owned(),
-                data: {
-                    let mut m = serde_json::Map::new();
-                    m.insert("k".to_owned(), serde_json::json!("v"));
-                    m
-                },
-            }),
+            name: "g".parse().expect("valid name"),
+            extensions: Some({
+                let mut ext = forgeclaw_ipc::GroupExtensions::new(
+                    forgeclaw_ipc::GroupExtensionsVersion::new("1")
+                        .expect("version should be valid"),
+                );
+                ext.insert("k", serde_json::json!("v"))
+                    .expect("non-reserved key");
+                ext
+            },),
         })),
         (
             short_string(),
@@ -187,11 +210,12 @@ fn command_strategy() -> impl Strategy<Value = CommandPayload> {
         )
             .prop_map(|(proj, br, ph, pr, ep)| {
                 CommandBody::DispatchTanren(DispatchTanrenPayload {
-                    project: proj,
-                    branch: br,
+                    project: proj.parse().expect("valid project"),
+                    branch: br.parse().expect("valid branch"),
                     phase: ph,
-                    prompt: pr,
-                    environment_profile: ep,
+                    prompt: pr.parse().expect("valid prompt"),
+                    environment_profile: ep
+                        .map(|profile| profile.parse().expect("valid environment profile")),
                 })
             }),
         (
@@ -202,9 +226,13 @@ fn command_strategy() -> impl Strategy<Value = CommandPayload> {
         )
             .prop_map(|(obj, sc, at, bp)| {
                 CommandBody::DispatchSelfImprovement(DispatchSelfImprovementPayload {
-                    objective: obj,
-                    scopes: vec![sc],
-                    acceptance_tests: vec![at],
+                    objective: obj.parse().expect("valid objective"),
+                    scopes: vec![sc.parse().expect("valid scope")]
+                        .try_into()
+                        .expect("scopes within bound"),
+                    acceptance_tests: vec![at.parse().expect("valid acceptance test")]
+                        .try_into()
+                        .expect("acceptance tests within bound"),
                     branch_policy: bp,
                 })
             }),
@@ -221,14 +249,14 @@ fn error_payload_strategy() -> impl Strategy<Value = ErrorPayload> {
     )
         .prop_map(|(code, message, fatal, job_id)| ErrorPayload {
             code,
-            message,
+            message: message.parse().expect("valid error message"),
             fatal,
             job_id,
         })
 }
 
 fn heartbeat_strategy() -> impl Strategy<Value = HeartbeatPayload> {
-    short_string().prop_map(|timestamp| HeartbeatPayload { timestamp })
+    timestamp_strategy().prop_map(|timestamp| HeartbeatPayload { timestamp })
 }
 
 fn container_to_host_strategy() -> impl Strategy<Value = ContainerToHost> {
@@ -244,19 +272,19 @@ fn container_to_host_strategy() -> impl Strategy<Value = ContainerToHost> {
 }
 
 fn historical_message_strategy() -> impl Strategy<Value = HistoricalMessage> {
-    (short_string(), bounded_string(), short_string()).prop_map(|(sender, text, timestamp)| {
-        HistoricalMessage {
-            sender,
-            text,
+    (short_string(), bounded_string(), timestamp_strategy()).prop_map(
+        |(sender, text, timestamp)| HistoricalMessage {
+            sender: sender.parse().expect("valid sender"),
+            text: text.parse().expect("valid historical text"),
             timestamp,
-        }
-    })
+        },
+    )
 }
 
 fn group_info_strategy() -> impl Strategy<Value = GroupInfo> {
     (group_id_strategy(), short_string(), any::<bool>()).prop_map(|(id, name, is_main)| GroupInfo {
         id,
-        name,
+        name: name.parse().expect("valid name"),
         is_main,
         capabilities: GroupCapabilities::default(),
     })
@@ -266,10 +294,10 @@ fn init_context_strategy() -> impl Strategy<Value = InitContext> {
     (
         proptest::collection::vec(historical_message_strategy(), 0..4),
         group_info_strategy(),
-        short_string(),
+        timezone_strategy(),
     )
         .prop_map(|(messages, group, timezone)| InitContext {
-            messages,
+            messages: messages.try_into().expect("messages within bound"),
             group,
             timezone,
         })
@@ -295,11 +323,13 @@ fn init_config_strategy() -> impl Strategy<Value = InitConfig> {
                 tools_enabled,
                 timeout_seconds,
             )| InitConfig {
-                provider_proxy_url,
-                provider_proxy_token,
-                model,
+                provider_proxy_url: format!("https://{provider_proxy_url}.example")
+                    .parse()
+                    .expect("valid proxy url"),
+                provider_proxy_token: provider_proxy_token.parse().expect("valid proxy token"),
+                model: model.parse().expect("valid model"),
                 max_tokens,
-                session_id,
+                session_id: session_id.map(|id| id.parse().expect("valid session id")),
                 tools_enabled,
                 timeout_seconds,
             },
@@ -324,7 +354,10 @@ fn messages_payload_strategy() -> impl Strategy<Value = MessagesPayload> {
         job_id_strategy(),
         proptest::collection::vec(historical_message_strategy(), 0..4),
     )
-        .prop_map(|(job_id, messages)| MessagesPayload { job_id, messages })
+        .prop_map(|(job_id, messages)| MessagesPayload {
+            job_id,
+            messages: messages.try_into().expect("messages within bound"),
+        })
 }
 
 fn shutdown_payload_strategy() -> impl Strategy<Value = ShutdownPayload> {

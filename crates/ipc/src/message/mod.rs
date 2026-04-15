@@ -21,9 +21,12 @@
 //! caller, per `docs/IPC_PROTOCOL.md` §Error Handling.
 
 pub mod authorized;
+mod collections;
 pub mod command;
 pub mod container_to_host;
 pub mod host_to_container;
+pub(crate) mod limits;
+pub mod semantic;
 pub mod shared;
 
 use serde::{Deserialize, Serialize};
@@ -32,10 +35,12 @@ pub use authorized::{
     AuthorizedCommand, GroupCommand, MainGroupCommand, OwnershipPending,
     PrivilegedAuthorizedCommand, ScopedAuthorizedCommand,
 };
+pub use collections::{BoundedCollectionError, HistoricalMessages, SelfImprovementListItems};
 pub use command::{
     BranchPolicy, CancelTaskPayload, CommandBody, CommandPayload, DispatchSelfImprovementPayload,
-    DispatchTanrenPayload, GroupExtensions, PauseTaskPayload, RegisterGroupPayload,
-    ScheduleTaskPayload, ScheduleType, SendMessagePayload, TanrenPhase,
+    DispatchTanrenPayload, GroupExtensions, GroupExtensionsError, GroupExtensionsVersion,
+    GroupExtensionsVersionError, PauseTaskPayload, RegisterGroupPayload, ScheduleTaskPayload,
+    ScheduleType, SendMessagePayload, TanrenPhase,
 };
 pub use container_to_host::{
     ErrorPayload, HeartbeatPayload, OutputCompletePayload, OutputDeltaPayload, Percent,
@@ -44,6 +49,12 @@ pub use container_to_host::{
 pub use host_to_container::{
     InitConfig, InitContext, InitPayload, MessagesPayload, ShutdownPayload,
 };
+pub use semantic::{
+    AbsoluteHttpUrl, AbsoluteHttpUrlError, BoundedTextError, IdentifierText, ListItemText,
+    MessageText, ModelText, OutputDeltaText, OutputResultText, PromptText, ScheduleValueText,
+    SessionIdText, ShortText, TokenText,
+};
+pub use semantic::{IanaTimezone, IpcTimestamp, TimestampError, TimezoneError};
 pub use shared::{
     ErrorCode, GroupCapabilities, GroupInfo, HistoricalMessage, ShutdownReason, StopReason,
     TokenUsage,
@@ -104,25 +115,6 @@ impl ContainerToHost {
             Self::Heartbeat(_) => "heartbeat",
         }
     }
-
-    /// If this is a `command` message, classify its body into
-    /// the privilege-separated type system.
-    ///
-    /// Returns `None` for non-command messages. Used internally
-    /// by the server's `recv_command` to apply the authorization
-    /// matrix.
-    #[must_use]
-    pub(crate) fn classify_command(self) -> Option<command::ClassifiedCommand> {
-        match self {
-            Self::Command(cmd) => Some(cmd.body.classify()),
-            Self::Ready(_)
-            | Self::OutputDelta(_)
-            | Self::OutputComplete(_)
-            | Self::Progress(_)
-            | Self::Error(_)
-            | Self::Heartbeat(_) => None,
-        }
-    }
 }
 
 /// A message sent from the host to an agent container.
@@ -162,9 +154,10 @@ impl HostToContainer {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandBody, CommandPayload, ContainerToHost, HeartbeatPayload, HostToContainer,
-        InitConfig, InitContext, InitPayload, MessagesPayload, OutputCompletePayload,
-        OutputDeltaPayload, ProgressPayload, ReadyPayload, SendMessagePayload, ShutdownPayload,
+        CommandBody, CommandPayload, ContainerToHost, HeartbeatPayload, HistoricalMessages,
+        HostToContainer, InitConfig, InitContext, InitPayload, MessagesPayload,
+        OutputCompletePayload, OutputDeltaPayload, ProgressPayload, ReadyPayload,
+        SendMessagePayload, ShutdownPayload,
     };
     use crate::message::shared::{GroupCapabilities, GroupInfo, ShutdownReason, StopReason};
     use forgeclaw_core::{GroupId, JobId};
@@ -173,9 +166,9 @@ mod tests {
     #[test]
     fn container_to_host_ready_tag() {
         let msg = ContainerToHost::Ready(ReadyPayload {
-            adapter: "claude-code".to_owned(),
-            adapter_version: "1.0.0".to_owned(),
-            protocol_version: "1.0".to_owned(),
+            adapter: "claude-code".parse().expect("valid adapter"),
+            adapter_version: "1.0.0".parse().expect("valid adapter version"),
+            protocol_version: "1.0".parse().expect("valid protocol version"),
         });
         let json = serde_json::to_value(&msg).expect("serialize");
         assert_eq!(json["type"], "ready");
@@ -187,7 +180,7 @@ mod tests {
     #[test]
     fn container_to_host_output_delta_tag() {
         let msg = ContainerToHost::OutputDelta(OutputDeltaPayload {
-            text: "x".to_owned(),
+            text: "x".parse().expect("valid text"),
             job_id: JobId::from("job-1"),
         });
         let json = serde_json::to_value(&msg).expect("serialize");
@@ -227,7 +220,7 @@ mod tests {
         let msg = ContainerToHost::Command(CommandPayload {
             body: CommandBody::SendMessage(SendMessagePayload {
                 target_group: GroupId::from("group-main"),
-                text: "hello".to_owned(),
+                text: "hello".parse().expect("valid text"),
             }),
         });
         let json = serde_json::to_value(&msg).expect("serialize");
@@ -243,15 +236,15 @@ mod tests {
         let cases: &[(ContainerToHost, &str)] = &[
             (
                 ContainerToHost::Ready(ReadyPayload {
-                    adapter: "a".to_owned(),
-                    adapter_version: "v".to_owned(),
-                    protocol_version: "1.0".to_owned(),
+                    adapter: "a".parse().expect("valid adapter"),
+                    adapter_version: "v".parse().expect("valid adapter version"),
+                    protocol_version: "1.0".parse().expect("valid protocol version"),
                 }),
                 "ready",
             ),
             (
                 ContainerToHost::OutputDelta(OutputDeltaPayload {
-                    text: String::new(),
+                    text: String::new().parse().expect("valid output delta"),
                     job_id: JobId::from("j"),
                 }),
                 "output_delta",
@@ -269,7 +262,7 @@ mod tests {
             (
                 ContainerToHost::Progress(ProgressPayload {
                     job_id: JobId::from("j"),
-                    stage: "x".to_owned(),
+                    stage: "x".parse().expect("valid stage"),
                     detail: None,
                     percent: None,
                 }),
@@ -277,7 +270,7 @@ mod tests {
             ),
             (
                 ContainerToHost::Heartbeat(HeartbeatPayload {
-                    timestamp: "t".to_owned(),
+                    timestamp: "2026-04-03T10:00:00Z".parse().expect("valid timestamp"),
                 }),
                 "heartbeat",
             ),
@@ -292,19 +285,19 @@ mod tests {
         let msg = HostToContainer::Init(InitPayload {
             job_id: JobId::from("job-abc123"),
             context: InitContext {
-                messages: vec![],
+                messages: HistoricalMessages::default(),
                 group: GroupInfo {
                     id: GroupId::from("group-main"),
-                    name: "Main".to_owned(),
+                    name: "Main".parse().expect("valid name"),
                     is_main: true,
                     capabilities: GroupCapabilities::default(),
                 },
-                timezone: "UTC".to_owned(),
+                timezone: "UTC".parse().expect("valid timezone"),
             },
             config: InitConfig {
-                provider_proxy_url: "http://proxy".to_owned(),
-                provider_proxy_token: "token".to_owned(),
-                model: "model".to_owned(),
+                provider_proxy_url: "http://proxy".parse().expect("valid proxy url"),
+                provider_proxy_token: "token".parse().expect("valid proxy token"),
+                model: "model".parse().expect("valid model"),
                 max_tokens: 1000,
                 session_id: None,
                 tools_enabled: true,
@@ -321,7 +314,7 @@ mod tests {
     fn host_to_container_messages_tag() {
         let msg = HostToContainer::Messages(MessagesPayload {
             job_id: JobId::from("j"),
-            messages: vec![],
+            messages: HistoricalMessages::default(),
         });
         assert_eq!(
             serde_json::to_value(&msg).expect("serialize")["type"],
@@ -346,19 +339,19 @@ mod tests {
         let init = HostToContainer::Init(InitPayload {
             job_id: JobId::from("j"),
             context: InitContext {
-                messages: vec![],
+                messages: HistoricalMessages::default(),
                 group: GroupInfo {
                     id: GroupId::from("g"),
-                    name: "n".to_owned(),
+                    name: "n".parse().expect("valid name"),
                     is_main: false,
                     capabilities: GroupCapabilities::default(),
                 },
-                timezone: "UTC".to_owned(),
+                timezone: "UTC".parse().expect("valid timezone"),
             },
             config: InitConfig {
-                provider_proxy_url: "u".to_owned(),
-                provider_proxy_token: "t".to_owned(),
-                model: "m".to_owned(),
+                provider_proxy_url: "https://u.example".parse().expect("valid proxy url"),
+                provider_proxy_token: "t".parse().expect("valid proxy token"),
+                model: "m".parse().expect("valid model"),
                 max_tokens: 1,
                 session_id: None,
                 tools_enabled: false,
@@ -369,7 +362,7 @@ mod tests {
         assert_eq!(
             HostToContainer::Messages(MessagesPayload {
                 job_id: JobId::from("j"),
-                messages: vec![],
+                messages: HistoricalMessages::default(),
             })
             .type_name(),
             "messages"

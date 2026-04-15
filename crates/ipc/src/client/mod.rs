@@ -9,6 +9,7 @@
 //! [`IpcError::Closed`].
 
 mod pending;
+mod protocol;
 
 pub use pending::PendingClient;
 
@@ -17,18 +18,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
+use forgeclaw_core::JobId;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, FramedRead, FramedWrite};
 
 use crate::codec::{
-    DEFAULT_MAX_UNKNOWN_SKIPS, FrameCodec, decode_host_to_container, encode_message,
+    DEFAULT_MAX_UNKNOWN_SKIPS, FrameCodec, decode_host_to_container, encode_container_to_host,
 };
 use crate::error::{IpcError, ProtocolError};
 use crate::message::{ContainerToHost, HostToContainer};
 use crate::policy::{DEFAULT_MAX_UNKNOWN_BYTES, UnknownFrameBudget};
+use crate::recv_policy::UnknownTypePolicy;
 use crate::util::{SharedWriteHalf, ShutdownHandle, truncate_for_log};
+
+use self::protocol::{ClientConnectionState, enforce_inbound_state, enforce_outbound_state};
 
 /// An established container-side IPC client.
 ///
@@ -42,6 +47,7 @@ pub struct IpcClient {
     poisoned: bool,
     unknown_budget: UnknownFrameBudget,
     last_frame_len: usize,
+    state: Arc<std::sync::Mutex<ClientConnectionState>>,
 }
 
 impl IpcClient {
@@ -55,12 +61,15 @@ impl IpcClient {
     }
 
     /// Construct from an already-handshaked transport.
-    pub(crate) fn from_parts(framed: Framed<UnixStream, FrameCodec>) -> Self {
+    pub(crate) fn from_parts(framed: Framed<UnixStream, FrameCodec>, active_job_id: JobId) -> Self {
         Self {
             framed,
             poisoned: false,
             unknown_budget: UnknownFrameBudget::default(),
             last_frame_len: 0,
+            state: Arc::new(std::sync::Mutex::new(ClientConnectionState::new(
+                active_job_id,
+            ))),
         }
     }
 
@@ -71,6 +80,14 @@ impl IpcClient {
         Ok(())
     }
 
+    fn with_state_mut<T>(
+        &self,
+        f: impl FnOnce(&mut ClientConnectionState) -> Result<T, IpcError>,
+    ) -> Result<T, IpcError> {
+        let mut state = self.state.lock().map_err(|_| IpcError::Closed)?;
+        f(&mut state)
+    }
+
     async fn poison(&mut self) {
         self.poisoned = true;
         let _ = self.framed.get_mut().shutdown().await;
@@ -79,23 +96,37 @@ impl IpcClient {
     /// Send a [`ContainerToHost`] message.
     pub async fn send(&mut self, msg: &ContainerToHost) -> Result<(), IpcError> {
         self.check_poisoned()?;
-        let bytes: Bytes = encode_message(msg)?;
+        let close_after_send = match self.with_state_mut(|state| enforce_outbound_state(state, msg))
+        {
+            Ok(action) => action,
+            Err(e) => {
+                if e.is_fatal() {
+                    self.poison().await;
+                }
+                return Err(e);
+            }
+        };
+        let bytes: Bytes = match encode_container_to_host(msg) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                if e.is_fatal() {
+                    self.poison().await;
+                }
+                return Err(e);
+            }
+        };
         let result = self.framed.send(bytes).await;
         if let Err(ref e) = result {
             if e.is_fatal() {
                 self.poison().await;
             }
+        } else if close_after_send.should_close_after_frame() {
+            self.poison().await;
         }
         result
     }
 
-    /// Receive a single [`HostToContainer`] frame without
-    /// forward-compatibility skipping.
-    ///
-    /// Returns [`ProtocolError::UnknownMessageType`] for unrecognized
-    /// `type` discriminators. Most callers should use [`recv`](Self::recv)
-    /// instead, which silently skips unknown types per the spec.
-    pub async fn recv_strict(&mut self) -> Result<HostToContainer, IpcError> {
+    async fn recv_one(&mut self) -> Result<HostToContainer, IpcError> {
         self.check_poisoned()?;
         let frame = match self.framed.next().await.transpose() {
             Ok(Some(f)) => f,
@@ -109,13 +140,64 @@ impl IpcClient {
             }
         };
         self.last_frame_len = frame.len();
-        let result = decode_host_to_container(&frame);
-        if let Err(ref e) = result {
-            if e.is_fatal() {
-                self.poison().await;
+        let msg = match decode_host_to_container(&frame) {
+            Ok(msg) => msg,
+            Err(e) => {
+                if e.is_fatal() {
+                    self.poison().await;
+                }
+                return Err(e);
             }
+        };
+        let close_after_recv = match self.with_state_mut(|state| enforce_inbound_state(state, &msg))
+        {
+            Ok(action) => action,
+            Err(e) => {
+                if e.is_fatal() {
+                    self.poison().await;
+                }
+                return Err(e);
+            }
+        };
+        if close_after_recv.should_close_after_frame() {
+            self.poison().await;
         }
-        result
+        Ok(msg)
+    }
+
+    /// Receive a [`HostToContainer`] message with explicit unknown-type
+    /// handling policy.
+    pub async fn recv_with_policy(
+        &mut self,
+        policy: UnknownTypePolicy,
+    ) -> Result<HostToContainer, IpcError> {
+        match policy {
+            UnknownTypePolicy::Strict => self.recv_one().await,
+            UnknownTypePolicy::SkipBounded => loop {
+                match self.recv_one().await {
+                    Ok(msg) => {
+                        self.unknown_budget.reset();
+                        return Ok(msg);
+                    }
+                    Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
+                        if let Err(err) = self.unknown_budget.on_unknown(self.last_frame_len) {
+                            self.poison().await;
+                            return Err(err);
+                        }
+                        tracing::warn!(
+                            target: "forgeclaw_ipc::client",
+                            message_type = %truncate_for_log(&ty),
+                            skip_count = self.unknown_budget.count(),
+                            skip_count_limit = DEFAULT_MAX_UNKNOWN_SKIPS,
+                            skip_bytes = self.unknown_budget.bytes(),
+                            skip_bytes_limit = DEFAULT_MAX_UNKNOWN_BYTES,
+                            "ignoring unknown message type (forward compatibility)"
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
+            },
+        }
     }
 
     /// Receive a [`HostToContainer`] message.
@@ -125,33 +207,8 @@ impl IpcClient {
     /// - 32 consecutive frames, and
     /// - 1 MiB cumulative bytes across the current unknown streak.
     ///
-    /// Use [`recv_strict`](Self::recv_strict) if you need raw decode
-    /// errors for every frame.
     pub async fn recv(&mut self) -> Result<HostToContainer, IpcError> {
-        loop {
-            match self.recv_strict().await {
-                Ok(msg) => {
-                    self.unknown_budget.reset();
-                    return Ok(msg);
-                }
-                Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
-                    if let Err(err) = self.unknown_budget.on_unknown(self.last_frame_len) {
-                        self.poison().await;
-                        return Err(err);
-                    }
-                    tracing::warn!(
-                        target: "forgeclaw_ipc::client",
-                        message_type = %truncate_for_log(&ty),
-                        skip_count = self.unknown_budget.count(),
-                        skip_count_limit = DEFAULT_MAX_UNKNOWN_SKIPS,
-                        skip_bytes = self.unknown_budget.bytes(),
-                        skip_bytes_limit = DEFAULT_MAX_UNKNOWN_BYTES,
-                        "ignoring unknown message type (forward compatibility)"
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        self.recv_with_policy(UnknownTypePolicy::SkipBounded).await
     }
 
     /// Split into independent read and write halves for full-duplex.
@@ -175,6 +232,8 @@ impl IpcClient {
             IpcClientWriter {
                 writer,
                 poisoned: Arc::clone(&poisoned),
+                state: Arc::clone(&self.state),
+                shutdown_handle: shutdown_handle.clone(),
             },
             IpcClientReader {
                 reader,
@@ -182,6 +241,7 @@ impl IpcClient {
                 shutdown_handle,
                 unknown_budget: UnknownFrameBudget::default(),
                 last_frame_len: 0,
+                state: self.state,
             },
         )
     }
@@ -198,20 +258,54 @@ impl IpcClient {
 pub struct IpcClientWriter {
     writer: FramedWrite<SharedWriteHalf<tokio::net::unix::OwnedWriteHalf>, FrameCodec>,
     poisoned: Arc<AtomicBool>,
+    state: Arc<std::sync::Mutex<ClientConnectionState>>,
+    shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
 }
 
 impl IpcClientWriter {
+    fn with_state_mut<T>(
+        &self,
+        f: impl FnOnce(&mut ClientConnectionState) -> Result<T, IpcError>,
+    ) -> Result<T, IpcError> {
+        let mut state = self.state.lock().map_err(|_| IpcError::Closed)?;
+        f(&mut state)
+    }
+
     /// Send a [`ContainerToHost`] message.
     pub async fn send(&mut self, msg: &ContainerToHost) -> Result<(), IpcError> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(IpcError::Closed);
         }
-        let bytes: Bytes = encode_message(msg)?;
+        let close_after_send = match self.with_state_mut(|state| enforce_outbound_state(state, msg))
+        {
+            Ok(action) => action,
+            Err(e) => {
+                if e.is_fatal() {
+                    self.poisoned.store(true, Ordering::Release);
+                    self.shutdown_handle.trigger().await;
+                }
+                return Err(e);
+            }
+        };
+        let bytes: Bytes = match encode_container_to_host(msg) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                if e.is_fatal() {
+                    self.poisoned.store(true, Ordering::Release);
+                    self.shutdown_handle.trigger().await;
+                }
+                return Err(e);
+            }
+        };
         let result = self.writer.send(bytes).await;
         if let Err(ref e) = result {
             if e.is_fatal() {
                 self.poisoned.store(true, Ordering::Release);
+                self.shutdown_handle.trigger().await;
             }
+        } else if close_after_send.should_close_after_frame() {
+            self.poisoned.store(true, Ordering::Release);
+            self.shutdown_handle.trigger().await;
         }
         result
     }
@@ -228,21 +322,24 @@ pub struct IpcClientReader {
     shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
     unknown_budget: UnknownFrameBudget,
     last_frame_len: usize,
+    state: Arc<std::sync::Mutex<ClientConnectionState>>,
 }
 
 impl IpcClientReader {
+    fn with_state_mut<T>(
+        &self,
+        f: impl FnOnce(&mut ClientConnectionState) -> Result<T, IpcError>,
+    ) -> Result<T, IpcError> {
+        let mut state = self.state.lock().map_err(|_| IpcError::Closed)?;
+        f(&mut state)
+    }
+
     async fn poison(&mut self) {
         self.poisoned.store(true, Ordering::Release);
         self.shutdown_handle.trigger().await;
     }
 
-    /// Receive a single [`HostToContainer`] frame without
-    /// forward-compatibility skipping.
-    ///
-    /// Returns [`ProtocolError::UnknownMessageType`] for unrecognized
-    /// `type` discriminators. Most callers should use [`recv`](Self::recv)
-    /// instead, which silently skips unknown types per the spec.
-    pub async fn recv_strict(&mut self) -> Result<HostToContainer, IpcError> {
+    async fn recv_one(&mut self) -> Result<HostToContainer, IpcError> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(IpcError::Closed);
         }
@@ -258,13 +355,64 @@ impl IpcClientReader {
             }
         };
         self.last_frame_len = frame.len();
-        let result = decode_host_to_container(&frame);
-        if let Err(ref e) = result {
-            if e.is_fatal() {
-                self.poison().await;
+        let msg = match decode_host_to_container(&frame) {
+            Ok(msg) => msg,
+            Err(e) => {
+                if e.is_fatal() {
+                    self.poison().await;
+                }
+                return Err(e);
             }
+        };
+        let close_after_recv = match self.with_state_mut(|state| enforce_inbound_state(state, &msg))
+        {
+            Ok(action) => action,
+            Err(e) => {
+                if e.is_fatal() {
+                    self.poison().await;
+                }
+                return Err(e);
+            }
+        };
+        if close_after_recv.should_close_after_frame() {
+            self.poison().await;
         }
-        result
+        Ok(msg)
+    }
+
+    /// Receive a [`HostToContainer`] message with explicit unknown-type
+    /// handling policy.
+    pub async fn recv_with_policy(
+        &mut self,
+        policy: UnknownTypePolicy,
+    ) -> Result<HostToContainer, IpcError> {
+        match policy {
+            UnknownTypePolicy::Strict => self.recv_one().await,
+            UnknownTypePolicy::SkipBounded => loop {
+                match self.recv_one().await {
+                    Ok(msg) => {
+                        self.unknown_budget.reset();
+                        return Ok(msg);
+                    }
+                    Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
+                        if let Err(err) = self.unknown_budget.on_unknown(self.last_frame_len) {
+                            self.poison().await;
+                            return Err(err);
+                        }
+                        tracing::warn!(
+                            target: "forgeclaw_ipc::client",
+                            message_type = %truncate_for_log(&ty),
+                            skip_count = self.unknown_budget.count(),
+                            skip_count_limit = DEFAULT_MAX_UNKNOWN_SKIPS,
+                            skip_bytes = self.unknown_budget.bytes(),
+                            skip_bytes_limit = DEFAULT_MAX_UNKNOWN_BYTES,
+                            "ignoring unknown message type (forward compatibility)"
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
+            },
+        }
     }
 
     /// Receive a [`HostToContainer`] message.
@@ -274,32 +422,7 @@ impl IpcClientReader {
     /// - 32 consecutive frames, and
     /// - 1 MiB cumulative bytes across the current unknown streak.
     ///
-    /// Use [`recv_strict`](Self::recv_strict) if you need raw decode
-    /// errors for every frame.
     pub async fn recv(&mut self) -> Result<HostToContainer, IpcError> {
-        loop {
-            match self.recv_strict().await {
-                Ok(msg) => {
-                    self.unknown_budget.reset();
-                    return Ok(msg);
-                }
-                Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
-                    if let Err(err) = self.unknown_budget.on_unknown(self.last_frame_len) {
-                        self.poison().await;
-                        return Err(err);
-                    }
-                    tracing::warn!(
-                        target: "forgeclaw_ipc::client",
-                        message_type = %truncate_for_log(&ty),
-                        skip_count = self.unknown_budget.count(),
-                        skip_count_limit = DEFAULT_MAX_UNKNOWN_SKIPS,
-                        skip_bytes = self.unknown_budget.bytes(),
-                        skip_bytes_limit = DEFAULT_MAX_UNKNOWN_BYTES,
-                        "ignoring unknown message type (forward compatibility)"
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        self.recv_with_policy(UnknownTypePolicy::SkipBounded).await
     }
 }

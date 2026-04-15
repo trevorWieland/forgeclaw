@@ -30,12 +30,15 @@ fn truncated_length_header_is_none_until_full_header() {
 }
 
 #[test]
-fn partial_payload_returns_none_and_reserves() {
+fn partial_payload_returns_none_without_eager_capacity_growth() {
     let mut codec = FrameCodec::new();
     // Length = 10 but only 4 payload bytes are present.
-    let mut buf = BytesMut::from(&[0u8, 0, 0, 10, b'a', b'b', b'c', b'd'][..]);
+    let mut buf = BytesMut::with_capacity(8);
+    buf.extend_from_slice(&[0u8, 0, 0, 10, b'a', b'b', b'c', b'd']);
+    let initial_capacity = buf.capacity();
     let res = codec.decode(&mut buf).expect("decode returns Ok");
     assert!(res.is_none(), "should wait for more bytes");
+    assert_eq!(buf.capacity(), initial_capacity);
 }
 
 #[test]

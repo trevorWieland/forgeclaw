@@ -27,14 +27,13 @@
 //! [`tokio_util::codec::LengthDelimitedCodec`]) so the wire contract
 //! is obvious at the call site rather than hidden in builder options.
 
+use crate::error::{FrameError, IpcError, ProtocolError};
+use crate::message::{ContainerToHost, HostToContainer};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::io::Write;
 use tokio_util::codec::{Decoder, Encoder};
-#[path = "codec_type_probe.rs"]
-mod type_probe;
-use crate::error::{FrameError, IpcError, ProtocolError};
-use crate::message::{ContainerToHost, HostToContainer};
 
 /// Result alias used across the crate.
 pub(crate) type CodecResult<T> = Result<T, IpcError>;
@@ -139,9 +138,10 @@ impl Decoder for FrameCodec {
 
         let total_frame = LENGTH_PREFIX_BYTES + declared;
         if src.len() < total_frame {
-            // Reserve up-front so subsequent reads fill the right
-            // buffer without reallocating mid-frame.
-            src.reserve(total_frame - src.len());
+            // Wait for the remainder without reserving the full
+            // declared frame size up front. This avoids memory
+            // amplification from peers that declare large frames but
+            // trickle or stall payload bytes.
             return Ok(None);
         }
 
@@ -180,8 +180,8 @@ impl Decoder for FrameCodec {
 }
 
 /// A minimal probe that extracts just the `type` field from a JSON
-/// object, used by the two-pass decode to structurally distinguish
-/// unknown message types from malformed known messages.
+/// object, used to structurally distinguish unknown message types from
+/// malformed known messages.
 #[derive(serde::Deserialize)]
 struct TypeProbe {
     #[serde(rename = "type")]
@@ -190,10 +190,11 @@ struct TypeProbe {
 
 /// Decode a frame payload into a typed protocol message.
 ///
-/// Uses a two-pass structural approach to classify decode failures:
+/// Uses a single structural fallback to classify decode failures:
 ///
-/// 1. Attempt full deserialization into `T`.
-/// 2. On failure, probe the `type` field:
+/// 1. Attempt full deserialization into `T` (hot path).
+/// 2. On failure, classify:
+///    - Invalid UTF-8 => [`FrameError::InvalidUtf8`].
 ///    - If the `type` value is not in `known_types`, return
 ///      [`ProtocolError::UnknownMessageType`].
 ///    - Otherwise (known type, bad payload), return
@@ -205,17 +206,13 @@ pub(crate) fn decode_typed_message<T: DeserializeOwned>(
     bytes: &[u8],
     known_types: &[&str],
 ) -> Result<T, IpcError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| FrameError::InvalidUtf8)?;
-    if let Some(ty) = type_probe::probe_first_type_field(text) {
-        if !known_types.contains(&ty.as_str()) {
-            return Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty)));
-        }
-    }
     match serde_json::from_slice::<T>(bytes) {
         Ok(msg) => Ok(msg),
         Err(full_err) => {
-            // Two-pass: probe the type field structurally.
-            if let Ok(TypeProbe { ty }) = serde_json::from_str::<TypeProbe>(text) {
+            if std::str::from_utf8(bytes).is_err() {
+                return Err(IpcError::Frame(FrameError::InvalidUtf8));
+            }
+            if let Ok(TypeProbe { ty }) = serde_json::from_slice::<TypeProbe>(bytes) {
                 if !known_types.contains(&ty.as_str()) {
                     return Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty)));
                 }
@@ -231,9 +228,70 @@ pub(crate) fn decode_typed_message<T: DeserializeOwned>(
 /// Serialize a protocol message to an owned [`Bytes`] buffer suitable
 /// for feeding into a [`FrameCodec`] encoder.
 pub(crate) fn encode_message<T: Serialize>(msg: &T) -> Result<Bytes, IpcError> {
-    serde_json::to_vec(msg)
-        .map(Bytes::from)
-        .map_err(|e| IpcError::serialize(&e))
+    let mut writer = CappedBytesWriter::new(MAX_FRAME_BYTES);
+    match serde_json::to_writer(&mut writer, msg) {
+        Ok(()) => Ok(writer.into_bytes()),
+        Err(e) => {
+            if let Some(size) = writer.overflow_size() {
+                return Err(IpcError::Frame(FrameError::Oversize {
+                    size,
+                    max: MAX_FRAME_BYTES,
+                }));
+            }
+            Err(IpcError::serialize(&e))
+        }
+    }
+}
+
+/// Typed alias — serialize a [`ContainerToHost`] message.
+pub(crate) fn encode_container_to_host(msg: &ContainerToHost) -> Result<Bytes, IpcError> {
+    encode_message(msg)
+}
+
+/// Typed alias — serialize a [`HostToContainer`] message.
+pub(crate) fn encode_host_to_container(msg: &HostToContainer) -> Result<Bytes, IpcError> {
+    encode_message(msg)
+}
+
+/// Streaming JSON writer that aborts once `max_bytes` is exceeded.
+struct CappedBytesWriter {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    overflow_size: Option<usize>,
+}
+
+impl CappedBytesWriter {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            max_bytes,
+            overflow_size: None,
+        }
+    }
+
+    fn overflow_size(&self) -> Option<usize> {
+        self.overflow_size
+    }
+
+    fn into_bytes(self) -> Bytes {
+        Bytes::from(self.bytes)
+    }
+}
+
+impl Write for CappedBytesWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let next = self.bytes.len().saturating_add(buf.len());
+        if next > self.max_bytes {
+            self.overflow_size = Some(next);
+            return Err(std::io::Error::other("serialized frame exceeds max size"));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Typed alias — turn a frame into a [`ContainerToHost`].
@@ -247,254 +305,5 @@ pub fn decode_host_to_container(bytes: &[u8]) -> Result<HostToContainer, IpcErro
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        FrameCodec, LENGTH_PREFIX_BYTES, MAX_FRAME_BYTES, decode_container_to_host,
-        decode_typed_message, encode_message,
-    };
-    use crate::error::{FrameError, IpcError, ProtocolError};
-    use crate::message::{ContainerToHost, ReadyPayload};
-    use bytes::{Bytes, BytesMut};
-    use tokio_util::codec::{Decoder, Encoder};
-
-    #[test]
-    fn encode_writes_big_endian_prefix() {
-        let mut codec = FrameCodec::new();
-        let mut buf = BytesMut::new();
-        codec
-            .encode(Bytes::from_static(b"hello"), &mut buf)
-            .expect("encode");
-        assert_eq!(&buf[..LENGTH_PREFIX_BYTES], &[0, 0, 0, 5]);
-        assert_eq!(&buf[LENGTH_PREFIX_BYTES..], b"hello");
-    }
-
-    #[test]
-    fn encode_rejects_empty_frame() {
-        let mut codec = FrameCodec::new();
-        let mut buf = BytesMut::new();
-        let err = codec
-            .encode(Bytes::new(), &mut buf)
-            .expect_err("empty frame should error");
-        assert!(matches!(err, IpcError::Frame(FrameError::EmptyFrame)));
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn encode_rejects_oversize_payload() {
-        let mut codec = FrameCodec::new();
-        let mut buf = BytesMut::new();
-        let big = Bytes::from(vec![0u8; MAX_FRAME_BYTES + 1]);
-        let err = codec
-            .encode(big, &mut buf)
-            .expect_err("oversize payload should error");
-        assert!(matches!(err, IpcError::Frame(FrameError::Oversize { .. })));
-    }
-
-    #[test]
-    fn encode_accepts_max_frame_exactly() {
-        let mut codec = FrameCodec::new();
-        let mut buf = BytesMut::new();
-        codec
-            .encode(Bytes::from(vec![0u8; MAX_FRAME_BYTES]), &mut buf)
-            .expect("encode at max");
-        assert_eq!(buf.len(), LENGTH_PREFIX_BYTES + MAX_FRAME_BYTES);
-    }
-
-    #[test]
-    fn decode_returns_none_on_empty_buffer() {
-        let mut codec = FrameCodec::new();
-        let mut buf = BytesMut::new();
-        assert!(codec.decode(&mut buf).expect("decode").is_none());
-    }
-
-    #[test]
-    fn decode_waits_for_full_header() {
-        let mut codec = FrameCodec::new();
-        let mut buf = BytesMut::from(&[0u8, 0, 0][..]);
-        assert!(codec.decode(&mut buf).expect("decode").is_none());
-        assert_eq!(buf.len(), 3); // buffer untouched
-    }
-
-    #[test]
-    fn decode_waits_for_full_payload() {
-        let mut codec = FrameCodec::new();
-        let mut buf = BytesMut::from(&[0u8, 0, 0, 5, b'h', b'i'][..]);
-        assert!(codec.decode(&mut buf).expect("decode").is_none());
-        // Length prefix untouched because we had fewer than 5 payload bytes.
-        assert_eq!(buf.len(), 6);
-    }
-
-    #[test]
-    fn decode_yields_payload_on_full_frame() {
-        let mut codec = FrameCodec::new();
-        let mut buf = BytesMut::from(&[0u8, 0, 0, 5, b'h', b'e', b'l', b'l', b'o'][..]);
-        let frame = codec.decode(&mut buf).expect("decode").expect("some");
-        assert_eq!(&frame[..], b"hello");
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn decode_handles_multiple_frames_in_buffer() {
-        let mut codec = FrameCodec::new();
-        let mut buf = BytesMut::new();
-        codec
-            .encode(Bytes::from_static(b"ab"), &mut buf)
-            .expect("encode");
-        codec
-            .encode(Bytes::from_static(b"cde"), &mut buf)
-            .expect("encode");
-        let first = codec.decode(&mut buf).expect("decode").expect("some");
-        let second = codec.decode(&mut buf).expect("decode").expect("some");
-        assert_eq!(&first[..], b"ab");
-        assert_eq!(&second[..], b"cde");
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn decode_rejects_zero_length_frame() {
-        let mut codec = FrameCodec::new();
-        let mut buf = BytesMut::from(&[0u8, 0, 0, 0][..]);
-        let err = codec
-            .decode(&mut buf)
-            .expect_err("zero-length frame should error");
-        assert!(matches!(err, IpcError::Frame(FrameError::EmptyFrame)));
-        // Header was consumed so subsequent decodes don't re-trigger.
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn decode_rejects_oversize_declared_length() {
-        let mut codec = FrameCodec::new();
-        // 0x00_C0_00_00 = 12 MiB > 10 MiB cap.
-        let mut buf = BytesMut::from(&[0x00, 0xC0, 0x00, 0x00][..]);
-        let err = codec
-            .decode(&mut buf)
-            .expect_err("oversize declared length should error");
-        assert!(matches!(err, IpcError::Frame(FrameError::Oversize { .. })));
-        // Header consumed but oversized payload was never buffered.
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn decode_eof_on_truncated_header_errors() {
-        let mut codec = FrameCodec::new();
-        let mut buf = BytesMut::from(&[0u8, 0][..]);
-        let err = codec
-            .decode_eof(&mut buf)
-            .expect_err("truncated header should error");
-        assert!(matches!(
-            err,
-            IpcError::Frame(FrameError::Truncated {
-                expected: 4,
-                got: 2
-            })
-        ));
-    }
-
-    #[test]
-    fn decode_eof_on_truncated_payload_errors() {
-        let mut codec = FrameCodec::new();
-        let mut buf = BytesMut::from(&[0u8, 0, 0, 10, b'x', b'y', b'z'][..]);
-        let err = codec
-            .decode_eof(&mut buf)
-            .expect_err("truncated payload should error");
-        assert!(matches!(
-            err,
-            IpcError::Frame(FrameError::Truncated {
-                expected: 10,
-                got: 3
-            })
-        ));
-    }
-
-    #[test]
-    fn decode_eof_on_empty_buffer_is_none() {
-        let mut codec = FrameCodec::new();
-        let mut buf = BytesMut::new();
-        assert!(codec.decode_eof(&mut buf).expect("decode_eof").is_none());
-    }
-
-    #[test]
-    fn encode_then_decode_roundtrip_variable_sizes() {
-        let mut codec = FrameCodec::new();
-        for size in [1usize, 2, 4, 128, 4096, 65536] {
-            let payload = vec![0xABu8; size];
-            let mut buf = BytesMut::new();
-            codec
-                .encode(Bytes::from(payload.clone()), &mut buf)
-                .expect("encode");
-            let decoded = codec.decode(&mut buf).expect("decode").expect("some");
-            assert_eq!(&decoded[..], &payload[..]);
-            assert!(buf.is_empty());
-        }
-    }
-
-    #[test]
-    fn decode_rejects_non_utf8() {
-        let bytes = &[0xFFu8, 0xFE, 0xFD][..];
-        let err = decode_container_to_host(bytes).expect_err("non-UTF8 should error");
-        assert!(matches!(err, IpcError::Frame(FrameError::InvalidUtf8)));
-    }
-
-    #[test]
-    fn decode_rejects_malformed_json() {
-        let bytes = b"{not json";
-        let err = decode_container_to_host(bytes).expect_err("malformed JSON should error");
-        assert!(matches!(err, IpcError::Frame(FrameError::MalformedJson(_))));
-    }
-
-    #[test]
-    fn decode_unknown_type_is_protocol_error() {
-        let bytes = br#"{"type":"definitely_not_a_real_message"}"#;
-        let err = decode_container_to_host(bytes).expect_err("unknown type should error");
-        assert!(
-            matches!(
-                &err,
-                IpcError::Protocol(ProtocolError::UnknownMessageType(n))
-                    if n == "definitely_not_a_real_message"
-            ),
-            "expected UnknownMessageType, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn decode_known_type_missing_field_is_malformed() {
-        // "ready" is known, but the payload is missing required fields.
-        let bytes = br#"{"type":"ready"}"#;
-        let err = decode_container_to_host(bytes).expect_err("missing field should error");
-        assert!(matches!(err, IpcError::Frame(FrameError::MalformedJson(_))));
-    }
-
-    #[test]
-    fn decode_no_type_field_is_malformed() {
-        let bytes = br#"{"adapter":"x"}"#;
-        let err = decode_container_to_host(bytes).expect_err("missing type should error");
-        assert!(matches!(err, IpcError::Frame(FrameError::MalformedJson(_))));
-    }
-
-    #[test]
-    fn encode_message_roundtrips_through_decode() {
-        let msg = ContainerToHost::Ready(ReadyPayload {
-            adapter: "claude-code".to_owned(),
-            adapter_version: "1.0.0".to_owned(),
-            protocol_version: "1.0".to_owned(),
-        });
-        let bytes = encode_message(&msg).expect("encode");
-        let back = decode_container_to_host(&bytes).expect("decode");
-        assert_eq!(back, msg);
-    }
-
-    #[test]
-    fn two_pass_uses_known_types_not_serde_wording() {
-        // Verify structural detection: type "ready" is known, so a
-        // missing field classifies as MalformedJson not UnknownMessageType,
-        // regardless of serde's error message wording.
-        let bytes = br#"{"type":"ready"}"#;
-        let err = decode_typed_message::<ContainerToHost>(bytes, ContainerToHost::KNOWN_TYPES)
-            .expect_err("should error");
-        assert!(
-            matches!(err, IpcError::Frame(FrameError::MalformedJson(_))),
-            "known type with bad payload should be MalformedJson, got {err:?}"
-        );
-    }
-}
+#[path = "codec_tests.rs"]
+mod tests;

@@ -47,9 +47,11 @@
 pub mod client;
 pub mod codec;
 pub mod error;
+pub(crate) mod lifecycle;
 pub mod message;
 pub mod peer_cred;
 pub(crate) mod policy;
+pub mod recv_policy;
 pub mod server;
 pub(crate) mod util;
 pub mod version;
@@ -61,17 +63,23 @@ pub use codec::{
 };
 pub use error::{FrameError, IpcError, ProtocolError};
 pub use message::{
-    AuthorizedCommand, BranchPolicy, CancelTaskPayload, CommandBody, CommandPayload,
-    ContainerToHost, DispatchSelfImprovementPayload, DispatchTanrenPayload, ErrorCode,
-    ErrorPayload, GroupCapabilities, GroupCommand, GroupExtensions, GroupInfo, HeartbeatPayload,
-    HistoricalMessage, HostToContainer, InitConfig, InitContext, InitPayload, MainGroupCommand,
-    MessagesPayload, OutputCompletePayload, OutputDeltaPayload, OwnershipPending, PauseTaskPayload,
-    Percent, PercentError, PrivilegedAuthorizedCommand, ProgressPayload, ReadyPayload,
-    RegisterGroupPayload, ScheduleTaskPayload, ScheduleType, ScopedAuthorizedCommand,
-    SendMessagePayload, ShutdownPayload, ShutdownReason, StopReason, TanrenPhase, TokenUsage,
+    AuthorizedCommand, BoundedCollectionError, BranchPolicy, CancelTaskPayload, CommandBody,
+    CommandPayload, ContainerToHost, DispatchSelfImprovementPayload, DispatchTanrenPayload,
+    ErrorCode, ErrorPayload, GroupCapabilities, GroupCommand, GroupExtensions,
+    GroupExtensionsError, GroupExtensionsVersion, GroupExtensionsVersionError, GroupInfo,
+    HeartbeatPayload, HistoricalMessage, HistoricalMessages, HostToContainer, IanaTimezone,
+    InitConfig, InitContext, InitPayload, IpcTimestamp, MainGroupCommand, MessagesPayload,
+    OutputCompletePayload, OutputDeltaPayload, OwnershipPending, PauseTaskPayload, Percent,
+    PercentError, PrivilegedAuthorizedCommand, ProgressPayload, ReadyPayload, RegisterGroupPayload,
+    ScheduleTaskPayload, ScheduleType, ScopedAuthorizedCommand, SelfImprovementListItems,
+    SendMessagePayload, ShutdownPayload, ShutdownReason, StopReason, TanrenPhase, TimestampError,
+    TimezoneError, TokenUsage,
 };
 pub use peer_cred::{PeerCredentials, SessionIdentity};
+pub use recv_policy::UnknownTypePolicy;
 pub use server::{
-    IpcConnection, IpcConnectionReader, IpcConnectionWriter, IpcServer, PendingConnection,
+    IpcConnection, IpcConnectionReader, IpcConnectionWriter, IpcInboundEvent, IpcServer,
+    IpcServerOptions, PendingConnection, UnauthorizedCommandLimitConfig,
+    UnauthorizedCommandRejection,
 };
-pub use version::{PROTOCOL_VERSION, is_compatible};
+pub use version::{NegotiatedProtocolVersion, PROTOCOL_VERSION, is_compatible, negotiate};

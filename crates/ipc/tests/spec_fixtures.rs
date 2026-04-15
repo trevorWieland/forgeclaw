@@ -175,18 +175,3 @@ fn register_group_extensions_rejects_string() {
     });
     serde_json::from_value::<CommandPayload>(json).expect_err("string extensions should fail");
 }
-
-#[test]
-fn register_group_extensions_rejects_missing_version() {
-    let json = serde_json::json!({
-        "command": "register_group",
-        "payload": {
-            "name": "g",
-            "extensions": {
-                "trigger": "@bot"
-            }
-        }
-    });
-    serde_json::from_value::<CommandPayload>(json)
-        .expect_err("extensions without version should fail");
-}

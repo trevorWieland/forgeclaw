@@ -124,12 +124,13 @@ expression: json
       ]
     },
     "CancelTaskPayload": {
-      "description": "Cancel a previously scheduled task.\n\nAuthorization: main agent may cancel any task; non-main agents may\ncancel only their own tasks.",
+      "description": "Cancel a previously scheduled task.",
       "type": "object",
       "properties": {
         "task_id": {
           "description": "Task to cancel.",
           "type": "string",
+          "maxLength": 128,
           "minLength": 1,
           "pattern": "\\S"
         }
@@ -139,7 +140,7 @@ expression: json
       ]
     },
     "CommandPayload": {
-      "description": "`command` — IPC command from the agent to the host.\n\nWraps [`CommandBody`] with `#[serde(flatten)]` so the serialized\nJSON contains `command` and `payload` fields at the top level\nalongside the `type` discriminator added by\n[`crate::message::ContainerToHost`].",
+      "description": "`command` — IPC command from the agent to the host.",
       "type": "object",
       "oneOf": [
         {
@@ -264,15 +265,18 @@ expression: json
       ]
     },
     "DispatchSelfImprovementPayload": {
-      "description": "Dispatch a self-improvement job.\n\nAuthorization: main agent only.",
+      "description": "Dispatch a self-improvement job.",
       "type": "object",
       "properties": {
         "acceptance_tests": {
           "description": "Acceptance tests that must pass for the improvement to land.",
           "type": "array",
           "items": {
-            "type": "string"
-          }
+            "description": "Self-improvement list item text with maxLength 1024.",
+            "type": "string",
+            "maxLength": 1024
+          },
+          "maxItems": 64
         },
         "branch_policy": {
           "description": "Branch strategy for this improvement.",
@@ -280,14 +284,18 @@ expression: json
         },
         "objective": {
           "description": "Human-readable objective for the improvement.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 32768
         },
         "scopes": {
           "description": "Scope constraints (e.g. which crates or subsystems).",
           "type": "array",
           "items": {
-            "type": "string"
-          }
+            "description": "Self-improvement list item text with maxLength 1024.",
+            "type": "string",
+            "maxLength": 1024
+          },
+          "maxItems": 64
         }
       },
       "required": [
@@ -298,19 +306,21 @@ expression: json
       ]
     },
     "DispatchTanrenPayload": {
-      "description": "Dispatch a Tanren job.\n\nAuthorization: groups with Tanren permission only.",
+      "description": "Dispatch a Tanren job.",
       "type": "object",
       "properties": {
         "branch": {
           "description": "Git branch to work on.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 128
         },
         "environment_profile": {
           "description": "Optional environment profile override.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "maxLength": 128
         },
         "phase": {
           "description": "Tanren execution phase.",
@@ -318,11 +328,13 @@ expression: json
         },
         "project": {
           "description": "Target project name.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 128
         },
         "prompt": {
           "description": "Prompt / instructions for the dispatch.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 32768
         }
       },
       "required": [
@@ -380,12 +392,14 @@ expression: json
             "string",
             "null"
           ],
+          "maxLength": 128,
           "minLength": 1,
           "pattern": "\\S"
         },
         "message": {
           "description": "Human-readable description of the failure.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 1024
         }
       },
       "required": [
@@ -394,27 +408,15 @@ expression: json
         "fatal"
       ]
     },
-    "GroupExtensions": {
-      "description": "Typed extension envelope for group registration.\n\nEnforces that extensions are a JSON object (not an arbitrary\nscalar or array) and carries a schema version for forward\ncompatibility. Shape details are owned by the `router` crate;\nthis crate transports the envelope.",
-      "type": "object",
-      "properties": {
-        "version": {
-          "description": "Schema version for extension compatibility (e.g. `\"1\"`).",
-          "type": "string"
-        }
-      },
-      "additionalProperties": true,
-      "required": [
-        "version"
-      ]
-    },
     "HeartbeatPayload": {
       "description": "`heartbeat` — periodic liveness signal during processing.",
       "type": "object",
       "properties": {
         "timestamp": {
-          "description": "ISO 8601 timestamp when the heartbeat was emitted. Carried as a\nstring so the crate stays neutral to timestamp precision.",
-          "type": "string"
+          "description": "RFC3339 timestamp when the heartbeat was emitted.",
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:\\d{2})$"
         }
       },
       "required": [
@@ -428,14 +430,21 @@ expression: json
         "job_id": {
           "description": "Job identifier this completion belongs to.",
           "type": "string",
+          "maxLength": 128,
           "minLength": 1,
           "pattern": "\\S"
         },
         "result": {
           "description": "Final text output. `None` for tools-only turns.\n\nRequired on the wire even when `null` — adapters must not omit\nthis key. See `docs/IPC_PROTOCOL.md` §`output_complete`.",
-          "type": [
-            "string",
-            "null"
+          "oneOf": [
+            {
+              "description": "Output completion result text with maxLength 262144.",
+              "type": "string",
+              "maxLength": 262144
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "session_id": {
@@ -443,7 +452,8 @@ expression: json
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "maxLength": 128
         },
         "stop_reason": {
           "description": "Why the model stopped generating.",
@@ -474,12 +484,14 @@ expression: json
         "job_id": {
           "description": "Job identifier this chunk belongs to.",
           "type": "string",
+          "maxLength": 128,
           "minLength": 1,
           "pattern": "\\S"
         },
         "text": {
           "description": "Incremental text chunk.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 65536
         }
       },
       "required": [
@@ -488,12 +500,13 @@ expression: json
       ]
     },
     "PauseTaskPayload": {
-      "description": "Pause a previously scheduled task.\n\nAuthorization: main agent may pause any task; non-main agents may\npause only their own tasks.",
+      "description": "Pause a previously scheduled task.",
       "type": "object",
       "properties": {
         "task_id": {
           "description": "Task to pause.",
           "type": "string",
+          "maxLength": 128,
           "minLength": 1,
           "pattern": "\\S"
         }
@@ -511,11 +524,13 @@ expression: json
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "maxLength": 1024
         },
         "job_id": {
           "description": "Job this progress signal belongs to.",
           "type": "string",
+          "maxLength": 128,
           "minLength": 1,
           "pattern": "\\S"
         },
@@ -531,7 +546,8 @@ expression: json
         },
         "stage": {
           "description": "Logical stage name (e.g. `tool_execution`).",
-          "type": "string"
+          "type": "string",
+          "maxLength": 128
         }
       },
       "required": [
@@ -545,15 +561,18 @@ expression: json
       "properties": {
         "adapter": {
           "description": "Name of the agent adapter (e.g. `claude-code`).",
-          "type": "string"
+          "type": "string",
+          "maxLength": 128
         },
         "adapter_version": {
           "description": "Adapter implementation version.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 128
         },
         "protocol_version": {
           "description": "IPC protocol version the adapter supports (e.g. `\"1.0\"`).",
-          "type": "string"
+          "type": "string",
+          "maxLength": 128
         }
       },
       "required": [
@@ -563,23 +582,29 @@ expression: json
       ]
     },
     "RegisterGroupPayload": {
-      "description": "Register a new group.\n\nAuthorization: main agent only.\n\nThe required `name` field is typed here. Additional group\nconfiguration owned by the `router` crate travels in the\noptional [`GroupExtensions`] envelope.",
+      "description": "Register a new group.",
       "type": "object",
       "properties": {
         "extensions": {
           "description": "Additional group configuration, versioned and typed as a\nJSON object. See [`GroupExtensions`].",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GroupExtensions"
-            },
-            {
-              "type": "null"
+          "type": "object",
+          "properties": {
+            "version": {
+              "description": "Schema version for extension compatibility (non-empty, e.g. `\"1\"`).",
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\S"
             }
+          },
+          "additionalProperties": true,
+          "required": [
+            "version"
           ]
         },
         "name": {
           "description": "Human-readable group name.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 128
         }
       },
       "required": [
@@ -587,7 +612,7 @@ expression: json
       ]
     },
     "ScheduleTaskPayload": {
-      "description": "Schedule a recurring or one-off task.\n\nAuthorization: main agent may target any group; non-main agents\nmay target only their own group.",
+      "description": "Schedule a recurring or one-off task.",
       "type": "object",
       "properties": {
         "context_mode": {
@@ -595,17 +620,20 @@ expression: json
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "maxLength": 128
         },
         "group": {
           "description": "Group to schedule the task for.",
           "type": "string",
+          "maxLength": 128,
           "minLength": 1,
           "pattern": "\\S"
         },
         "prompt": {
           "description": "The prompt to execute on each run.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 32768
         },
         "schedule_type": {
           "description": "Schedule type.",
@@ -613,7 +641,8 @@ expression: json
         },
         "schedule_value": {
           "description": "Schedule value (cron expression, duration, or timestamp).",
-          "type": "string"
+          "type": "string",
+          "maxLength": 512
         }
       },
       "required": [
@@ -644,18 +673,20 @@ expression: json
       ]
     },
     "SendMessagePayload": {
-      "description": "Send a chat message to a group.\n\nAuthorization: main agent may target any group; non-main agents\nmay target only their own group.",
+      "description": "Send a chat message to a group.",
       "type": "object",
       "properties": {
         "target_group": {
           "description": "Group to send the message to.",
           "type": "string",
+          "maxLength": 128,
           "minLength": 1,
           "pattern": "\\S"
         },
         "text": {
           "description": "Message text.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 32768
         }
       },
       "required": [

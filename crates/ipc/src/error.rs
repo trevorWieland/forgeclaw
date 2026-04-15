@@ -100,6 +100,18 @@ pub enum ProtocolError {
         got: &'static str,
     },
 
+    /// A command-specific receive API observed a valid non-command
+    /// message.
+    ///
+    /// This is non-fatal and expected when callers consume a shared
+    /// inbound stream that may legally interleave `command` with other
+    /// message types (for example `output_delta` and `heartbeat`).
+    #[error("not a command message: got {got}")]
+    NotCommand {
+        /// The message type name actually received.
+        got: &'static str,
+    },
+
     /// The frame decoded as JSON with a `type` field whose value does
     /// not match any known message variant.
     ///
@@ -149,6 +161,22 @@ pub enum ProtocolError {
         reason: &'static str,
     },
 
+    /// Repeated unauthorized commands exceeded per-connection abuse
+    /// limits and triggered forced disconnect.
+    #[error(
+        "unauthorized command abuse: command {command} exceeded limit ({strikes}/{disconnect_after_strikes}) — {reason}"
+    )]
+    UnauthorizedCommandAbuse {
+        /// The wire name of the command being abused.
+        command: &'static str,
+        /// Why each attempt is unauthorized.
+        reason: &'static str,
+        /// Consecutive exhausted-budget strikes observed.
+        strikes: u32,
+        /// Configured strike threshold that triggers disconnect.
+        disconnect_after_strikes: u32,
+    },
+
     /// The group identity in the `init` payload diverges from the
     /// host-authoritative group identity passed to `handshake`.
     ///
@@ -182,6 +210,22 @@ pub enum ProtocolError {
         reason: &'static str,
     },
 
+    /// A message with a job-scoped payload referenced the wrong job.
+    #[error(
+        "job_id mismatch: {direction} message `{message_type}` expected job_id {expected}, got {got}"
+    )]
+    JobIdMismatch {
+        /// Message direction (`host_to_container` or
+        /// `container_to_host`).
+        direction: &'static str,
+        /// Wire `type` discriminator.
+        message_type: &'static str,
+        /// Active job bound to the connection.
+        expected: forgeclaw_core::JobId,
+        /// Job ID provided in the incoming message.
+        got: forgeclaw_core::JobId,
+    },
+
     /// No heartbeat was observed before the processing deadline.
     ///
     /// This is non-fatal at the IPC layer so the caller can execute
@@ -194,6 +238,31 @@ pub enum ProtocolError {
         /// Configured heartbeat timeout in seconds.
         timeout_secs: u64,
     },
+
+    /// The container failed to complete draining before the host's
+    /// shutdown deadline.
+    ///
+    /// This is non-fatal at the IPC layer so the caller can execute
+    /// the spec-required escalation path (force-kill the container).
+    #[error(
+        "shutdown deadline exceeded: no completion within {deadline_ms}ms while in phase {phase}"
+    )]
+    ShutdownDeadlineExceeded {
+        /// Current server-side lifecycle phase (`draining`).
+        phase: &'static str,
+        /// Shutdown deadline configured by the host message.
+        deadline_ms: u64,
+    },
+
+    /// A command payload is syntactically valid JSON but violates
+    /// version-sensitive protocol rules.
+    #[error("invalid command payload: {command} — {reason}")]
+    InvalidCommandPayload {
+        /// Wire command name.
+        command: &'static str,
+        /// Validation failure reason.
+        reason: &'static str,
+    },
 }
 
 /// Top-level IPC crate error.
@@ -202,6 +271,10 @@ pub enum IpcError {
     /// Underlying I/O failure (socket, filesystem, accept).
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Socket bind attestation detected a path race.
+    #[error("socket bind race detected: {0}")]
+    BindRace(String),
 
     /// Framing-layer error.
     #[error("frame error: {0}")]
@@ -252,12 +325,14 @@ impl IpcError {
     #[must_use]
     pub fn is_fatal(&self) -> bool {
         match self {
-            Self::Io(_) | Self::Frame(_) | Self::Timeout(_) => true,
+            Self::Io(_) | Self::BindRace(_) | Self::Frame(_) | Self::Timeout(_) => true,
             Self::Protocol(p) => !matches!(
                 p,
                 ProtocolError::UnknownMessageType(_)
+                    | ProtocolError::NotCommand { .. }
                     | ProtocolError::Unauthorized { .. }
                     | ProtocolError::HeartbeatTimeout { .. }
+                    | ProtocolError::ShutdownDeadlineExceeded { .. }
             ),
             Self::Serialize(_) | Self::Closed => false,
         }
@@ -265,209 +340,5 @@ impl IpcError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{FrameError, IpcError, ProtocolError};
-
-    #[test]
-    fn oversize_display_carries_counts_not_bytes() {
-        let err = FrameError::Oversize {
-            size: 20_000_000,
-            max: 10_485_760,
-        };
-        let display = err.to_string();
-        assert!(display.contains("20000000"));
-        assert!(display.contains("10485760"));
-    }
-
-    #[test]
-    fn empty_frame_display() {
-        assert_eq!(
-            FrameError::EmptyFrame.to_string(),
-            "empty frame (zero-length payload)"
-        );
-    }
-
-    #[test]
-    fn truncated_display() {
-        let err = FrameError::Truncated {
-            expected: 100,
-            got: 37,
-        };
-        assert_eq!(
-            err.to_string(),
-            "truncated frame: expected 100 bytes, got 37"
-        );
-    }
-
-    #[test]
-    fn invalid_utf8_display() {
-        assert_eq!(
-            FrameError::InvalidUtf8.to_string(),
-            "invalid UTF-8 in frame payload"
-        );
-    }
-
-    #[test]
-    fn unsupported_version_display() {
-        let err = ProtocolError::UnsupportedVersion {
-            peer: "2.0".to_owned(),
-            local: "1.0",
-        };
-        assert_eq!(
-            err.to_string(),
-            "unsupported protocol version: peer=2.0, local=1.0"
-        );
-    }
-
-    #[test]
-    fn unexpected_message_display() {
-        let err = ProtocolError::UnexpectedMessage {
-            expected: "ready",
-            got: "output_delta",
-        };
-        assert_eq!(
-            err.to_string(),
-            "unexpected message: expected ready, got output_delta"
-        );
-    }
-
-    #[test]
-    fn unknown_message_type_display_includes_name() {
-        let err = ProtocolError::UnknownMessageType("bogus".to_owned());
-        assert!(err.to_string().contains("bogus"));
-    }
-
-    #[test]
-    fn frame_error_wraps_into_ipc_error() {
-        let ipc: IpcError = FrameError::EmptyFrame.into();
-        assert!(matches!(ipc, IpcError::Frame(FrameError::EmptyFrame)));
-    }
-
-    #[test]
-    fn io_error_wraps_into_ipc_error() {
-        let io = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
-        let ipc: IpcError = io.into();
-        assert!(matches!(ipc, IpcError::Io(_)));
-    }
-
-    #[test]
-    fn protocol_error_wraps_into_ipc_error() {
-        let p = ProtocolError::UnknownMessageType("x".to_owned());
-        let ipc: IpcError = p.into();
-        assert!(matches!(ipc, IpcError::Protocol(_)));
-    }
-
-    #[test]
-    fn too_many_unknown_messages_display() {
-        let err = ProtocolError::TooManyUnknownMessages {
-            count: 33,
-            limit: 32,
-        };
-        assert_eq!(
-            err.to_string(),
-            "too many unknown messages: 33 consecutive (limit 32)"
-        );
-    }
-
-    #[test]
-    fn too_many_unknown_messages_is_fatal() {
-        let err = IpcError::Protocol(ProtocolError::TooManyUnknownMessages {
-            count: 33,
-            limit: 32,
-        });
-        assert!(err.is_fatal());
-    }
-
-    #[test]
-    fn too_many_unknown_bytes_display() {
-        let err = ProtocolError::TooManyUnknownBytes {
-            bytes: 1_500_000,
-            limit: 1_048_576,
-        };
-        assert_eq!(
-            err.to_string(),
-            "too many unknown message bytes: 1500000 bytes (limit 1048576)"
-        );
-    }
-
-    #[test]
-    fn too_many_unknown_bytes_is_fatal() {
-        let err = IpcError::Protocol(ProtocolError::TooManyUnknownBytes {
-            bytes: 1_500_000,
-            limit: 1_048_576,
-        });
-        assert!(err.is_fatal());
-    }
-
-    #[test]
-    fn unauthorized_display() {
-        let err = ProtocolError::Unauthorized {
-            command: "register_group",
-            reason: "requires main-group privilege",
-        };
-        let s = err.to_string();
-        assert!(s.contains("register_group"));
-        assert!(s.contains("requires main-group privilege"));
-    }
-
-    #[test]
-    fn unauthorized_is_not_fatal() {
-        let err = IpcError::Protocol(ProtocolError::Unauthorized {
-            command: "register_group",
-            reason: "requires main-group privilege",
-        });
-        assert!(!err.is_fatal());
-    }
-
-    #[test]
-    fn group_mismatch_display() {
-        let err = ProtocolError::GroupMismatch {
-            init_group_id: "group-a".into(),
-            session_group_id: "group-b".into(),
-        };
-        let s = err.to_string();
-        assert!(s.contains("group-a"));
-        assert!(s.contains("group-b"));
-    }
-
-    #[test]
-    fn group_mismatch_is_fatal() {
-        let err = IpcError::Protocol(ProtocolError::GroupMismatch {
-            init_group_id: "group-a".into(),
-            session_group_id: "group-b".into(),
-        });
-        assert!(err.is_fatal());
-    }
-
-    #[test]
-    fn lifecycle_violation_is_fatal() {
-        let err = IpcError::Protocol(ProtocolError::LifecycleViolation {
-            phase: "idle",
-            direction: "container_to_host",
-            message_type: "output_delta",
-            reason: "requires active processing",
-        });
-        assert!(err.is_fatal());
-    }
-
-    #[test]
-    fn heartbeat_timeout_display() {
-        let err = ProtocolError::HeartbeatTimeout {
-            phase: "processing",
-            timeout_secs: 60,
-        };
-        assert_eq!(
-            err.to_string(),
-            "heartbeat timeout: no heartbeat for 60s while in phase processing"
-        );
-    }
-
-    #[test]
-    fn heartbeat_timeout_is_not_fatal() {
-        let err = IpcError::Protocol(ProtocolError::HeartbeatTimeout {
-            phase: "processing",
-            timeout_secs: 60,
-        });
-        assert!(!err.is_fatal());
-    }
-}
+#[path = "error_tests.rs"]
+mod tests;

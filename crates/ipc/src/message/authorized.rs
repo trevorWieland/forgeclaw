@@ -171,14 +171,14 @@ mod tests {
         let scoped =
             AuthorizedCommand::from(ScopedAuthorizedCommand::SendMessage(SendMessagePayload {
                 target_group: GroupId::from("group-a"),
-                text: "hello".to_owned(),
+                text: "hello".parse().expect("valid text"),
             }));
         assert!(scoped.as_scoped().is_some());
         assert!(scoped.as_privileged().is_none());
 
         let privileged = AuthorizedCommand::from(PrivilegedAuthorizedCommand::RegisterGroup(
             RegisterGroupPayload {
-                name: "new".to_owned(),
+                name: "new".parse().expect("valid name"),
                 extensions: None,
             },
         ));
@@ -191,26 +191,26 @@ mod tests {
         let scoped =
             AuthorizedCommand::from(ScopedAuthorizedCommand::SendMessage(SendMessagePayload {
                 target_group: GroupId::from("group-a"),
-                text: "hello".to_owned(),
+                text: "hello".parse().expect("valid text"),
             }));
         assert!(scoped.into_scoped().is_some());
         let scoped =
             AuthorizedCommand::from(ScopedAuthorizedCommand::SendMessage(SendMessagePayload {
                 target_group: GroupId::from("group-a"),
-                text: "hello".to_owned(),
+                text: "hello".parse().expect("valid text"),
             }));
         assert!(scoped.into_privileged().is_none());
 
         let privileged = AuthorizedCommand::from(PrivilegedAuthorizedCommand::RegisterGroup(
             RegisterGroupPayload {
-                name: "new".to_owned(),
+                name: "new".parse().expect("valid name"),
                 extensions: None,
             },
         ));
         assert!(privileged.into_privileged().is_some());
         let privileged = AuthorizedCommand::from(PrivilegedAuthorizedCommand::RegisterGroup(
             RegisterGroupPayload {
-                name: "new".to_owned(),
+                name: "new".parse().expect("valid name"),
                 extensions: None,
             },
         ));

@@ -1,6 +1,6 @@
 # IPC Protocol Specification
 
-Version: 1.0-draft
+Version: 1.0
 
 ## Overview
 
@@ -13,6 +13,17 @@ The IPC protocol defines bidirectional communication between the Forgeclaw host 
 **Socket Path**: `/workspace/ipc.sock` (mounted as a volume by the host)
 
 **Connection Model**: One socket per container. The host listens; the container connects. The connection lifetime equals the container session lifetime.
+
+**Host Bind Policy** (Unix hardening):
+- The immediate socket parent directory must be mode `0700`.
+- The socket file is bound with mode `0600`.
+- Ancestor symlinks are rejected except vetted system aliases:
+  - macOS: `/var -> /private/var`, `/tmp -> /private/tmp`
+  - Linux: `/var/run -> /run`, `/var/lock -> /run/lock`
+- Post-bind attestation is required: parent fingerprint must remain
+  stable and listener/path inode fingerprints must match. Any mismatch
+  is a fail-closed bind-race error.
+- Guaranteed-supported deployment pattern: use a dedicated private host-owned directory and place the socket there.
 
 ## Framing
 
@@ -28,6 +39,32 @@ All messages are length-prefixed JSON frames:
 - **Length**: 4-byte big-endian unsigned integer. Value is the byte length of the JSON payload (not including the length prefix itself).
 - **Payload**: UTF-8 encoded JSON object.
 - **Maximum frame size**: 10 MiB (10,485,760 bytes). Frames exceeding this limit are rejected with a protocol error.
+
+## Wire Constraints
+
+These constraints are normative for protocol `1.x`. Implementations must enforce them consistently in runtime validation and schema validation.
+
+| Field / Structure | Constraint |
+|---|---|
+| `init.context.messages` | max 256 entries |
+| `messages.messages` | max 256 entries |
+| `dispatch_self_improvement.payload.scopes` | max 64 entries |
+| `dispatch_self_improvement.payload.acceptance_tests` | max 64 entries |
+| Core ID fields (`group`, `target_group`, `task_id`, `job_id`, etc.) | non-empty, maxLength 128 |
+| `IdentifierText` fields (`adapter`, `adapter_version`, `protocol_version`, `stage`, `name`, `project`, `branch`, etc.) | maxLength 128 |
+| `model` | maxLength 256 |
+| token-like fields (`provider_proxy_token`) | maxLength 2048 |
+| short freeform fields (`error.message`, `progress.detail`) | maxLength 1024 |
+| `schedule_value` | maxLength 512 |
+| message text (`historical.text`, `send_message.text`) | maxLength 32768 |
+| prompt/objective text (`schedule_task.prompt`, `dispatch_* .prompt`, `dispatch_self_improvement.objective`) | maxLength 32768 |
+| `output_delta.text` | maxLength 65536 |
+| `output_complete.result` | maxLength 262144 |
+| `session_id` | maxLength 128 |
+| self-improvement list item text (`scopes[]`, `acceptance_tests[]`) | maxLength 1024 |
+| `provider_proxy_url` | absolute `http(s)` URL, maxLength 2048 |
+
+For additive `1.x` changes, new fields may be introduced, but documented constraints on existing fields are never loosened silently.
 
 ## Message Types
 
@@ -71,7 +108,7 @@ Streamed text output from the agent. Sent incrementally as the model generates t
 |-------|------|----------|-------------|
 | `type` | `"output_delta"` | yes | Message discriminator |
 | `text` | string | yes | Incremental text chunk |
-| `job_id` | string | yes | Correlates to the job from `init` or `messages` |
+| `job_id` | string | yes | Must match the active job from `init` or latest idle-time `messages` rebind |
 
 #### `output_complete`
 
@@ -94,7 +131,7 @@ Signals the agent has finished processing the current job. Contains the final re
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `type` | `"output_complete"` | yes | Message discriminator |
-| `job_id` | string | yes | Correlates to the originating job |
+| `job_id` | string | yes | Must match the active originating job |
 | `result` | string \| null | yes | Final text output (null if tools-only turn) |
 | `session_id` | string \| null | no | Session ID for resume (adapter-specific) |
 | `token_usage` | object \| null | no | Token counts for this turn |
@@ -156,6 +193,30 @@ IPC commands from the agent to the host system.
 
 The `capabilities` object is host-authoritative and determines which command families the IPC layer will accept. If omitted, capabilities default to all-false.
 
+##### `register_group` payload
+
+`register_group.payload` is defined as:
+
+```json
+{
+  "name": "New Group",
+  "extensions": {
+    "version": "1",
+    "trigger": "@bot"
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | yes | Human-readable group name |
+| `extensions` | object \| null | no | Optional typed envelope for router-owned extension data |
+| `extensions.version` | string | yes when `extensions` is present | Schema version for extension compatibility |
+
+`extensions` must be a JSON object when provided. Arrays/scalars are invalid.
+`extensions.version` is a required wire-contract field whenever `extensions` is present.
+All supported runtime versions enforce this requirement.
+
 #### `error`
 
 Reports an error from the agent adapter.
@@ -187,6 +248,7 @@ Reports an error from the agent adapter.
 #### `heartbeat`
 
 Periodic liveness signal. The host expects heartbeats at least every 30 seconds during processing.
+`timestamp` must be an RFC3339 string.
 
 ```json
 {
@@ -233,12 +295,13 @@ Sent after receiving `ready`. Provides the initial context and configuration for
 |-------|------|----------|-------------|
 | `type` | `"init"` | yes | Message discriminator |
 | `job_id` | string | yes | Unique job identifier for correlation |
-| `context` | object | yes | Message history, group info, timezone |
+| `context` | object | yes | Message history, group info, timezone (IANA name validated at IPC boundary) |
 | `config` | object | yes | Provider proxy URL/token, model, limits |
 
 #### `messages`
 
 Follow-up messages that arrived while the container was processing. Allows the agent to incorporate new context without restarting.
+While `Processing`, `messages.job_id` must match the active job. While `Idle`, it may rebind the active job.
 
 ```json
 {
@@ -303,8 +366,10 @@ Host                              Container
 The host enforces post-handshake phases at the IPC boundary:
 
 - **Processing**: default immediately after `init`; container may emit streaming/progress/commands/heartbeat/error and must eventually emit `output_complete`.
-- **Idle**: entered after `output_complete`; container must not continue streaming until the host sends new `messages`.
+- **Idle**: entered after `output_complete`; container must not continue streaming or sending commands until the host sends new `messages`.
 - **Draining**: entered after host `shutdown`; host rejects new `messages`, and container may only finish/heartbeat/error before close.
+- On the first `output_complete` observed while draining, IPC transitions
+  to terminal closed state and closes the transport immediately.
 
 Out-of-phase traffic is treated as a protocol error and the connection is closed.
 
@@ -312,10 +377,14 @@ Out-of-phase traffic is treated as a protocol error and the connection is closed
 
 The `protocol_version` field in `ready` allows the host to detect adapter capability:
 
-- **1.0**: Base protocol (this document)
+- **1.0**: Baseline protocol. `register_group.extensions.version` is
+  required whenever `extensions` is present.
 - Future versions add new message types or fields. Existing fields are never removed or retyped (additive-only changes within a major version).
 
 The host rejects connections from adapters with an unsupported major version.
+After handshake, the host persists a negotiated runtime version
+(`major` unchanged, `minor = min(local, peer)`) per connection so
+minor-aware behavior gates can remain explicit and centralized.
 
 ## Error Handling
 
@@ -325,9 +394,11 @@ The host rejects connections from adapters with an unsupported major version.
   - 1 MiB cumulative bytes across the current consecutive-unknown streak.
   On either limit breach, the host closes the connection. Any recognized message resets both unknown counters.
 - **Missing required field**: Treated as malformed. Socket closed.
+- **Job ID mismatch** (job-scoped message whose `job_id` does not match the active job): Treated as protocol violation. Socket closed.
 - **Socket disconnect without `output_complete`**: Host treats the in-progress job as failed. Container transitioned to `Exited` with error status.
 - **Heartbeat timeout** (no heartbeat for 60 seconds during `Processing`): Host sends `shutdown` with a short deadline, then kills the container if it doesn't respond.
 - **Lifecycle violation** (valid message at wrong phase): Host logs the violation and closes the connection.
+- **Unauthorized command abuse**: Single unauthorized commands are rejected and logged. Repeated unauthorized commands are connection-bounded with per-connection token-bucket controls (default: burst 8, refill 2/sec, 200ms backoff, disconnect after 5 exhausted-budget strikes).
 
 ## Implementing an Adapter
 

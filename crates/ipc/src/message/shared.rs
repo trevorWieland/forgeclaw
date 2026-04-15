@@ -6,18 +6,19 @@
 use forgeclaw_core::GroupId;
 use serde::{Deserialize, Serialize};
 
+use super::semantic::{IdentifierText, IpcTimestamp, MessageText};
+
 /// A historical chat message included in the `init.context.messages`
 /// array or the `messages` follow-up envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct HistoricalMessage {
     /// Display name of the message sender.
-    pub sender: String,
+    pub sender: IdentifierText,
     /// Raw message text.
-    pub text: String,
-    /// ISO 8601 timestamp, carried as a string so the crate stays
-    /// neutral with respect to timestamp precision and timezone format.
-    pub timestamp: String,
+    pub text: MessageText,
+    /// RFC3339 timestamp for when this historical message was emitted.
+    pub timestamp: IpcTimestamp,
 }
 
 /// Capabilities granted to a group, determining which command
@@ -37,7 +38,7 @@ pub struct GroupInfo {
     /// Stable group identifier (e.g. `group-main`).
     pub id: GroupId,
     /// Human-readable group name.
-    pub name: String,
+    pub name: IdentifierText,
     /// Whether this group is the `main` group with elevated privileges.
     pub is_main: bool,
     /// Capabilities granted to this group. Determines which command
@@ -172,9 +173,9 @@ mod tests {
     #[test]
     fn historical_message_roundtrip() {
         let msg = HistoricalMessage {
-            sender: "Alice".to_owned(),
-            text: "Hey @bot".to_owned(),
-            timestamp: "2026-04-03T10:00:00Z".to_owned(),
+            sender: "Alice".parse().expect("valid sender"),
+            text: "Hey @bot".parse().expect("valid text"),
+            timestamp: "2026-04-03T10:00:00Z".parse().expect("valid timestamp"),
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: HistoricalMessage = serde_json::from_str(&json).expect("deserialize");
@@ -185,7 +186,7 @@ mod tests {
     fn group_info_roundtrip() {
         let g = GroupInfo {
             id: GroupId::from("group-main"),
-            name: "Main Group".to_owned(),
+            name: "Main Group".parse().expect("valid group name"),
             is_main: true,
             capabilities: GroupCapabilities::default(),
         };
@@ -205,7 +206,7 @@ mod tests {
     fn group_capabilities_tanren_roundtrip() {
         let g = GroupInfo {
             id: GroupId::from("group-tanren"),
-            name: "Tanren Group".to_owned(),
+            name: "Tanren Group".parse().expect("valid name"),
             is_main: false,
             capabilities: GroupCapabilities { tanren: true },
         };

@@ -2,7 +2,7 @@
 //!
 //! These mirror the server-side adversarial coverage in
 //! `handshake_lifecycle.rs` and `malformed_frames.rs`, exercising
-//! the client's `recv`, `recv_strict`, and split-mode teardown
+//! the client's `recv`, `recv_with_policy(Strict)`, and split-mode teardown
 //! against raw malformed frames sent by a fake host.
 
 use std::path::PathBuf;
@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use forgeclaw_core::{GroupId, JobId};
 use forgeclaw_ipc::{
-    ContainerToHost, FrameError, GroupCapabilities, GroupInfo, HostToContainer, InitConfig,
-    InitContext, InitPayload, IpcClient, IpcError, MAX_FRAME_BYTES, ProtocolError, ReadyPayload,
-    ShutdownPayload, ShutdownReason,
+    ContainerToHost, FrameError, GroupCapabilities, GroupInfo, HistoricalMessages, HostToContainer,
+    InitConfig, InitContext, InitPayload, IpcClient, IpcError, MAX_FRAME_BYTES, ProtocolError,
+    ReadyPayload, ShutdownPayload, ShutdownReason, UnknownTypePolicy,
 };
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,14 +20,30 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const HS_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn socket_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
-    dir.path().join(name)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let socket_dir = dir.path().join("s");
+        std::fs::create_dir_all(&socket_dir).expect("mkdir s");
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod s");
+        {
+            let short_name = if name.len() > 32 { &name[..32] } else { name };
+            socket_dir.join(short_name)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        dir.path().join(name)
+    }
 }
 
 fn sample_ready() -> ReadyPayload {
     ReadyPayload {
-        adapter: "test-adapter".to_owned(),
-        adapter_version: "0.1.0".to_owned(),
-        protocol_version: "1.0".to_owned(),
+        adapter: "test-adapter".parse().expect("valid adapter"),
+        adapter_version: "0.1.0".parse().expect("valid adapter version"),
+        protocol_version: "1.0".parse().expect("valid protocol version"),
     }
 }
 
@@ -35,19 +51,19 @@ fn sample_init() -> InitPayload {
     InitPayload {
         job_id: JobId::from("job-adv-1"),
         context: InitContext {
-            messages: vec![],
+            messages: HistoricalMessages::default(),
             group: GroupInfo {
                 id: GroupId::from("group-main"),
-                name: "Main".to_owned(),
+                name: "Main".parse().expect("valid name"),
                 is_main: true,
                 capabilities: GroupCapabilities::default(),
             },
-            timezone: "UTC".to_owned(),
+            timezone: "UTC".parse().expect("valid timezone"),
         },
         config: InitConfig {
-            provider_proxy_url: "http://proxy.local".to_owned(),
-            provider_proxy_token: "token".to_owned(),
-            model: "claude-sonnet-4-6".to_owned(),
+            provider_proxy_url: "http://proxy.local".parse().expect("valid proxy url"),
+            provider_proxy_token: "token".parse().expect("valid proxy token"),
+            model: "claude-sonnet-4-6".parse().expect("valid model"),
             max_tokens: 1000,
             session_id: None,
             tools_enabled: true,
@@ -111,7 +127,10 @@ async fn client_recv_invalid_utf8() {
         .handshake(sample_ready(), HS_TIMEOUT)
         .await
         .expect("handshake");
-    let err = client.recv_strict().await.expect_err("should error");
+    let err = client
+        .recv_with_policy(UnknownTypePolicy::Strict)
+        .await
+        .expect_err("should error");
     assert!(
         matches!(err, IpcError::Frame(FrameError::InvalidUtf8)),
         "expected InvalidUtf8, got {err:?}"
@@ -137,7 +156,10 @@ async fn client_recv_malformed_json() {
         .handshake(sample_ready(), HS_TIMEOUT)
         .await
         .expect("handshake");
-    let err = client.recv_strict().await.expect_err("should error");
+    let err = client
+        .recv_with_policy(UnknownTypePolicy::Strict)
+        .await
+        .expect_err("should error");
     assert!(
         matches!(err, IpcError::Frame(FrameError::MalformedJson(_))),
         "expected MalformedJson, got {err:?}"
@@ -179,7 +201,10 @@ async fn client_recv_unknown_type_skip_limit() {
         "expected TooManyUnknownMessages, got {err:?}"
     );
     // Connection should be poisoned — subsequent recv returns Closed.
-    let err2 = client.recv_strict().await.expect_err("should be closed");
+    let err2 = client
+        .recv_with_policy(UnknownTypePolicy::Strict)
+        .await
+        .expect_err("should be closed");
     assert!(
         matches!(err2, IpcError::Closed),
         "expected Closed, got {err2:?}"
@@ -196,13 +221,15 @@ async fn client_recv_unknown_type_byte_budget_limit() {
 
     let host_task = tokio::spawn(async move {
         let mut stream = fake_host_handshake(&listener).await;
-        let mut payload = vec![b' '; 1_049_000];
-        let prefix = br#"{"type":"unknown_adv_large","data":"#;
-        payload[..prefix.len()].copy_from_slice(prefix);
-        let suffix = br#""}"#;
-        let suffix_start = payload.len() - suffix.len();
-        payload[suffix_start..].copy_from_slice(suffix);
-        raw_write_frame(&mut stream, &payload).await;
+        // Exceed the unknown-byte budget across many parseable unknown
+        // frames so classification remains UnknownMessageType.
+        for i in 0..20 {
+            let payload = format!(
+                r#"{{"type":"unknown_adv_large_{i}","data":"{}"}}"#,
+                "x".repeat(60_000)
+            );
+            raw_write_frame(&mut stream, payload.as_bytes()).await;
+        }
         tokio::time::sleep(Duration::from_secs(1)).await;
     });
 
@@ -219,7 +246,10 @@ async fn client_recv_unknown_type_byte_budget_limit() {
         ),
         "expected TooManyUnknownBytes, got {err:?}"
     );
-    let err2 = client.recv_strict().await.expect_err("should be closed");
+    let err2 = client
+        .recv_with_policy(UnknownTypePolicy::Strict)
+        .await
+        .expect_err("should be closed");
     assert!(matches!(err2, IpcError::Closed));
 
     host_task.abort();
@@ -286,7 +316,10 @@ async fn client_split_reader_error_shuts_down_writer() {
     let (mut writer, mut reader) = client.into_split();
 
     // Reader gets fatal error.
-    let err = reader.recv_strict().await.expect_err("should error");
+    let err = reader
+        .recv_with_policy(UnknownTypePolicy::Strict)
+        .await
+        .expect_err("should error");
     assert!(
         matches!(err, IpcError::Frame(FrameError::InvalidUtf8)),
         "expected InvalidUtf8, got {err:?}"
@@ -296,7 +329,7 @@ async fn client_split_reader_error_shuts_down_writer() {
     let send_result = writer
         .send(&ContainerToHost::Heartbeat(
             forgeclaw_ipc::HeartbeatPayload {
-                timestamp: "2026-04-13T00:00:00Z".to_owned(),
+                timestamp: "2026-04-13T00:00:00Z".parse().expect("valid timestamp"),
             },
         ))
         .await;
@@ -331,7 +364,10 @@ async fn client_recv_oversize_frame() {
         .handshake(sample_ready(), HS_TIMEOUT)
         .await
         .expect("handshake");
-    let err = client.recv_strict().await.expect_err("should error");
+    let err = client
+        .recv_with_policy(UnknownTypePolicy::Strict)
+        .await
+        .expect_err("should error");
     assert!(
         matches!(err, IpcError::Frame(FrameError::Oversize { .. })),
         "expected Oversize, got {err:?}"
@@ -363,7 +399,10 @@ async fn client_recv_truncated_frame() {
         .handshake(sample_ready(), HS_TIMEOUT)
         .await
         .expect("handshake");
-    let err = client.recv_strict().await.expect_err("should error");
+    let err = client
+        .recv_with_policy(UnknownTypePolicy::Strict)
+        .await
+        .expect_err("should error");
     assert!(
         matches!(
             err,

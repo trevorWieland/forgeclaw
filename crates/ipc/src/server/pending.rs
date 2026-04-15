@@ -15,15 +15,16 @@ use tokio::net::UnixStream;
 use tokio::time::Instant;
 use tokio_util::codec::Framed;
 
-use crate::codec::{FrameCodec, decode_container_to_host, encode_message};
+use crate::codec::{FrameCodec, decode_container_to_host, encode_host_to_container};
 use crate::error::{IpcError, ProtocolError};
 use crate::message::{ContainerToHost, GroupInfo, HostToContainer, InitPayload, ReadyPayload};
 use crate::peer_cred::SessionIdentity;
 use crate::policy::UnknownFrameBudget;
 use crate::util::truncate_for_log;
-use crate::version::{PROTOCOL_VERSION, is_compatible};
+use crate::version::{NegotiatedProtocolVersion, PROTOCOL_VERSION, negotiate};
 
 use super::IpcConnection;
+use super::listener::UnauthorizedCommandLimitConfig;
 use super::protocol::{log_fatal_protocol_error, log_unknown_message};
 
 /// A server-side connection that has not yet completed the handshake.
@@ -42,12 +43,14 @@ pub struct PendingConnection {
     unknown_budget: UnknownFrameBudget,
     last_frame_len: usize,
     identity: Arc<std::sync::Mutex<SessionIdentity>>,
+    unauthorized_limit: UnauthorizedCommandLimitConfig,
 }
 
 impl PendingConnection {
     pub(crate) fn from_stream(
         stream: UnixStream,
         identity: Arc<std::sync::Mutex<SessionIdentity>>,
+        unauthorized_limit: UnauthorizedCommandLimitConfig,
     ) -> Self {
         Self {
             framed: Framed::new(stream, FrameCodec::new()),
@@ -55,6 +58,7 @@ impl PendingConnection {
             unknown_budget: UnknownFrameBudget::default(),
             last_frame_len: 0,
             identity,
+            unauthorized_limit,
         }
     }
 
@@ -80,6 +84,7 @@ impl PendingConnection {
         init: InitPayload,
         timeout: Duration,
     ) -> Result<(IpcConnection, ReadyPayload), IpcError> {
+        let active_job_id = init.job_id.clone();
         let init = match self.bind_authoritative_group(init) {
             Ok(init) => init,
             Err(e) => {
@@ -93,15 +98,21 @@ impl PendingConnection {
 
         let deadline = Instant::now() + timeout;
         match self.handshake_inner(init, deadline, timeout).await {
-            Ok(ready) => {
+            Ok((ready, negotiated_version)) => {
                 tracing::debug!(
                     target: "forgeclaw_ipc::server",
-                    adapter = %truncate_for_log(&ready.adapter),
-                    adapter_version = %truncate_for_log(&ready.adapter_version),
-                    protocol_version = %truncate_for_log(&ready.protocol_version),
+                    adapter = %truncate_for_log(ready.adapter.as_ref()),
+                    adapter_version = %truncate_for_log(ready.adapter_version.as_ref()),
+                    protocol_version = %truncate_for_log(ready.protocol_version.as_ref()),
                     "IPC handshake complete"
                 );
-                let conn = IpcConnection::from_parts(self.framed, self.identity);
+                let conn = IpcConnection::from_parts(
+                    self.framed,
+                    self.identity,
+                    active_job_id,
+                    negotiated_version,
+                    self.unauthorized_limit,
+                );
                 Ok((conn, ready))
             }
             Err(e) => {
@@ -140,7 +151,7 @@ impl PendingConnection {
         init: InitPayload,
         deadline: Instant,
         timeout: Duration,
-    ) -> Result<ReadyPayload, IpcError> {
+    ) -> Result<(ReadyPayload, NegotiatedProtocolVersion), IpcError> {
         let first = match tokio::time::timeout_at(deadline, self.recv_container()).await {
             Ok(result) => result?,
             Err(_elapsed) => return Err(IpcError::Timeout(timeout)),
@@ -154,18 +165,18 @@ impl PendingConnection {
                 }));
             }
         };
-        if !is_compatible(&ready.protocol_version) {
-            return Err(IpcError::Protocol(ProtocolError::UnsupportedVersion {
-                peer: ready.protocol_version.clone(),
+        let negotiated = negotiate(ready.protocol_version.as_ref()).ok_or_else(|| {
+            IpcError::Protocol(ProtocolError::UnsupportedVersion {
+                peer: ready.protocol_version.to_string(),
                 local: PROTOCOL_VERSION,
-            }));
-        }
+            })
+        })?;
         match tokio::time::timeout_at(deadline, self.send_host(&HostToContainer::Init(init))).await
         {
             Ok(result) => result?,
             Err(_elapsed) => return Err(IpcError::Timeout(timeout)),
         }
-        Ok(ready)
+        Ok((ready, negotiated))
     }
 
     /// Cleanly close the connection without completing the handshake.
@@ -188,7 +199,15 @@ impl PendingConnection {
 
     async fn send_host(&mut self, msg: &HostToContainer) -> Result<(), IpcError> {
         self.check_poisoned()?;
-        let bytes: Bytes = encode_message(msg)?;
+        let bytes: Bytes = match encode_host_to_container(msg) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                if e.is_fatal() {
+                    self.poison().await;
+                }
+                return Err(e);
+            }
+        };
         let result = self.framed.send(bytes).await;
         if let Err(ref e) = result {
             if e.is_fatal() {

@@ -7,18 +7,20 @@
 use forgeclaw_core::JobId;
 use serde::{Deserialize, Serialize};
 
-use super::shared::{GroupInfo, HistoricalMessage, ShutdownReason};
+use super::collections::HistoricalMessages;
+use super::semantic::{AbsoluteHttpUrl, IanaTimezone, ModelText, SessionIdText, TokenText};
+use super::shared::{GroupInfo, ShutdownReason};
 
 /// Context bundle carried inside an `init` message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct InitContext {
     /// Historical messages making up the current context window.
-    pub messages: Vec<HistoricalMessage>,
+    pub messages: HistoricalMessages,
     /// Summary of the group the agent is serving.
     pub group: GroupInfo,
     /// IANA timezone name for resolving relative time references.
-    pub timezone: String,
+    pub timezone: IanaTimezone,
 }
 
 /// Provider-proxy and adapter configuration carried inside an `init`
@@ -27,16 +29,16 @@ pub struct InitContext {
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct InitConfig {
     /// Base URL the adapter should target for provider calls.
-    pub provider_proxy_url: String,
+    pub provider_proxy_url: AbsoluteHttpUrl,
     /// Bearer token the adapter should present to the provider proxy.
-    pub provider_proxy_token: String,
+    pub provider_proxy_token: TokenText,
     /// Model identifier to request from the provider.
-    pub model: String,
+    pub model: ModelText,
     /// Maximum output tokens for this job.
     pub max_tokens: u32,
     /// Adapter session identifier to resume (if any).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
+    pub session_id: Option<SessionIdText>,
     /// Whether tool use is permitted for this job.
     pub tools_enabled: bool,
     /// Hard timeout (in seconds) for the whole job.
@@ -63,7 +65,7 @@ pub struct MessagesPayload {
     /// Job identifier this follow-up belongs to.
     pub job_id: JobId,
     /// New historical messages to append to the context window.
-    pub messages: Vec<HistoricalMessage>,
+    pub messages: HistoricalMessages,
 }
 
 /// `shutdown` — request graceful shutdown.
@@ -80,6 +82,8 @@ pub struct ShutdownPayload {
 #[cfg(test)]
 mod tests {
     use super::{InitConfig, InitContext, InitPayload, MessagesPayload, ShutdownPayload};
+    use crate::message::HistoricalMessages;
+    use crate::message::semantic::{AbsoluteHttpUrl, ModelText, SessionIdText, TokenText};
     use crate::message::shared::{GroupCapabilities, GroupInfo, HistoricalMessage, ShutdownReason};
     use forgeclaw_core::{GroupId, JobId};
 
@@ -89,30 +93,33 @@ mod tests {
             context: InitContext {
                 messages: vec![
                     HistoricalMessage {
-                        sender: "Alice".to_owned(),
-                        text: "Hey @bot, what's the weather?".to_owned(),
-                        timestamp: "2026-04-03T10:00:00Z".to_owned(),
+                        sender: "Alice".parse().expect("valid sender"),
+                        text: "Hey @bot, what's the weather?".parse().expect("valid text"),
+                        timestamp: "2026-04-03T10:00:00Z".parse().expect("valid timestamp"),
                     },
                     HistoricalMessage {
-                        sender: "Bob".to_owned(),
-                        text: "Also curious!".to_owned(),
-                        timestamp: "2026-04-03T10:01:00Z".to_owned(),
+                        sender: "Bob".parse().expect("valid sender"),
+                        text: "Also curious!".parse().expect("valid text"),
+                        timestamp: "2026-04-03T10:01:00Z".parse().expect("valid timestamp"),
                     },
-                ],
+                ]
+                .try_into()
+                .expect("messages within bound"),
                 group: GroupInfo {
                     id: GroupId::from("group-main"),
-                    name: "Main Group".to_owned(),
+                    name: "Main Group".parse().expect("valid group name"),
                     is_main: true,
                     capabilities: GroupCapabilities::default(),
                 },
-                timezone: "America/New_York".to_owned(),
+                timezone: "America/New_York".parse().expect("valid timezone"),
             },
             config: InitConfig {
-                provider_proxy_url: "http://host.docker.internal:9090/v1".to_owned(),
-                provider_proxy_token: "abc123def456".to_owned(),
-                model: "claude-sonnet-4-20250514".to_owned(),
+                provider_proxy_url: AbsoluteHttpUrl::new("http://host.docker.internal:9090/v1")
+                    .expect("valid url"),
+                provider_proxy_token: TokenText::new("abc123def456").expect("valid token"),
+                model: ModelText::new("claude-sonnet-4-20250514").expect("valid model"),
                 max_tokens: 32000,
-                session_id: Some("sess-xyz789".to_owned()),
+                session_id: Some(SessionIdText::new("sess-xyz789").expect("valid session")),
                 tools_enabled: true,
                 timeout_seconds: 1800,
             },
@@ -144,14 +151,48 @@ mod tests {
         let m = MessagesPayload {
             job_id: JobId::from("job-abc123"),
             messages: vec![HistoricalMessage {
-                sender: "Alice".to_owned(),
-                text: "Also check the logs please".to_owned(),
-                timestamp: "2026-04-03T10:05:00Z".to_owned(),
-            }],
+                sender: "Alice".parse().expect("valid sender"),
+                text: "Also check the logs please"
+                    .parse()
+                    .expect("valid message text"),
+                timestamp: "2026-04-03T10:05:00Z".parse().expect("valid timestamp"),
+            }]
+            .try_into()
+            .expect("messages within bound"),
         };
         let json = serde_json::to_value(&m).expect("serialize");
         let back: MessagesPayload = serde_json::from_value(json).expect("deserialize");
         assert_eq!(back, m);
+    }
+
+    #[test]
+    fn messages_rejects_more_than_256() {
+        let msg = HistoricalMessage {
+            sender: "A".parse().expect("valid sender"),
+            text: "x".parse().expect("valid text"),
+            timestamp: "2026-04-03T10:00:00Z".parse().expect("valid timestamp"),
+        };
+        let payload = serde_json::json!({
+            "job_id": "job-1",
+            "messages": std::iter::repeat_n(serde_json::to_value(&msg).expect("serialize"), 257)
+                .collect::<Vec<_>>()
+        });
+        let err = serde_json::from_value::<MessagesPayload>(payload)
+            .expect_err("messages >256 should fail");
+        assert!(err.to_string().contains("256"));
+    }
+
+    #[test]
+    fn historical_messages_constructor_rejects_over_256() {
+        let msg = HistoricalMessage {
+            sender: "A".parse().expect("valid sender"),
+            text: "x".parse().expect("valid text"),
+            timestamp: "2026-04-03T10:00:00Z".parse().expect("valid timestamp"),
+        };
+        let err = HistoricalMessages::new(std::iter::repeat_n(msg, 257).collect())
+            .expect_err("messages >256 should fail");
+        assert_eq!(err.max, 256);
+        assert_eq!(err.actual, 257);
     }
 
     #[test]

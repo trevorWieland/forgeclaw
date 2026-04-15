@@ -6,21 +6,37 @@ use std::time::Duration;
 use forgeclaw_core::{GroupId, JobId};
 use forgeclaw_ipc::{
     ContainerToHost, GroupCapabilities, GroupInfo, HeartbeatPayload, HistoricalMessage,
-    HostToContainer, InitConfig, InitContext, InitPayload, IpcClient, IpcError, IpcServer,
-    MessagesPayload, OutputCompletePayload, ProtocolError, ReadyPayload, ShutdownPayload,
-    ShutdownReason, StopReason,
+    HistoricalMessages, HostToContainer, InitConfig, InitContext, InitPayload, IpcClient, IpcError,
+    IpcInboundEvent, IpcServer, MessagesPayload, OutputCompletePayload, ProtocolError,
+    ReadyPayload, ShutdownPayload, ShutdownReason, StopReason,
 };
 use tempfile::tempdir;
 
 fn socket_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
-    dir.path().join(name)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let socket_dir = dir.path().join("s");
+        std::fs::create_dir_all(&socket_dir).expect("mkdir s");
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod s");
+        {
+            let short_name = if name.len() > 32 { &name[..32] } else { name };
+            socket_dir.join(short_name)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        dir.path().join(name)
+    }
 }
 
 fn sample_ready(version: &str) -> ReadyPayload {
     ReadyPayload {
-        adapter: "test-adapter".to_owned(),
-        adapter_version: "0.1.0".to_owned(),
-        protocol_version: version.to_owned(),
+        adapter: "test-adapter".parse().expect("valid adapter"),
+        adapter_version: "0.1.0".parse().expect("valid adapter version"),
+        protocol_version: version.parse().expect("valid protocol version"),
     }
 }
 
@@ -29,7 +45,7 @@ const HS_TIMEOUT: Duration = Duration::from_secs(5);
 fn sample_group() -> GroupInfo {
     GroupInfo {
         id: GroupId::from("group-main"),
-        name: "Main".to_owned(),
+        name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
     }
@@ -39,24 +55,42 @@ fn sample_init() -> InitPayload {
     InitPayload {
         job_id: JobId::from("job-integration-1"),
         context: InitContext {
-            messages: vec![],
+            messages: HistoricalMessages::default(),
             group: GroupInfo {
                 id: GroupId::from("group-main"),
-                name: "Main".to_owned(),
+                name: "Main".parse().expect("valid name"),
                 is_main: true,
                 capabilities: GroupCapabilities::default(),
             },
-            timezone: "UTC".to_owned(),
+            timezone: "UTC".parse().expect("valid timezone"),
         },
         config: InitConfig {
-            provider_proxy_url: "http://proxy.local".to_owned(),
-            provider_proxy_token: "token".to_owned(),
-            model: "claude-sonnet-4-6".to_owned(),
+            provider_proxy_url: "http://proxy.local".parse().expect("valid proxy url"),
+            provider_proxy_token: "token".parse().expect("valid proxy token"),
+            model: "claude-sonnet-4-6".parse().expect("valid model"),
             max_tokens: 1000,
             session_id: None,
             tools_enabled: true,
             timeout_seconds: 600,
         },
+    }
+}
+
+async fn recv_message(
+    conn: &mut forgeclaw_ipc::IpcConnection,
+) -> Result<ContainerToHost, IpcError> {
+    match conn.recv_event().await? {
+        IpcInboundEvent::Message(msg) => Ok(msg),
+        IpcInboundEvent::Command(_) => Err(IpcError::Protocol(ProtocolError::UnexpectedMessage {
+            expected: "message",
+            got: "command",
+        })),
+        IpcInboundEvent::Unauthorized(rej) => {
+            Err(IpcError::Protocol(ProtocolError::UnexpectedMessage {
+                expected: "message",
+                got: rej.command,
+            }))
+        }
     }
 }
 
@@ -92,6 +126,31 @@ async fn handshake_happy_path() {
 }
 
 #[tokio::test]
+async fn handshake_accepts_previous_minor_version() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ipc-prev-minor.sock");
+    let server = IpcServer::bind(&path).expect("bind");
+
+    let accept_task = tokio::spawn(async move {
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (_conn, ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
+            .await
+            .expect("server handshake");
+        ready
+    });
+
+    let pending = IpcClient::connect(&path).await.expect("connect");
+    let (_client, _init) = pending
+        .handshake(sample_ready("1.0"), HS_TIMEOUT)
+        .await
+        .expect("client handshake");
+
+    let ready = accept_task.await.expect("join");
+    assert_eq!(ready, sample_ready("1.0"));
+}
+
+#[tokio::test]
 async fn handshake_rejects_mismatched_major_version() {
     let dir = tempdir().expect("tempdir");
     let path = socket_path(&dir, "ipc.sock");
@@ -103,8 +162,6 @@ async fn handshake_rejects_mismatched_major_version() {
     });
 
     let client_pending = IpcClient::connect(&path).await.expect("connect");
-    // Client sends Ready with unsupported version "2.0"; the server's
-    // handshake will fail with UnsupportedVersion.
     let _ = client_pending
         .handshake(sample_ready("2.0"), HS_TIMEOUT)
         .await;
@@ -133,14 +190,13 @@ async fn full_duplex_exchange_after_handshake() {
             .handshake(sample_init(), HS_TIMEOUT)
             .await
             .expect("server handshake");
-        // Host sends a shutdown, then receives an output_complete.
         conn.send_host(&HostToContainer::Shutdown(ShutdownPayload {
             reason: ShutdownReason::HostShutdown,
             deadline_ms: 5_000,
         }))
         .await
         .expect("send shutdown");
-        conn.recv_container().await.expect("recv last msg")
+        recv_message(&mut conn).await.expect("recv last msg")
     });
 
     let pending = IpcClient::connect(&path).await.expect("connect");
@@ -157,11 +213,10 @@ async fn full_duplex_exchange_after_handshake() {
         })
     ));
 
-    // Client reports completion and disconnects.
     client
         .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
             job_id: JobId::from("job-integration-1"),
-            result: Some("done".to_owned()),
+            result: Some("done".parse().expect("valid result")),
             session_id: None,
             token_usage: None,
             stop_reason: StopReason::EndTurn,
@@ -189,7 +244,7 @@ async fn heartbeat_exchange_after_handshake() {
             .handshake(sample_init(), HS_TIMEOUT)
             .await
             .expect("handshake");
-        conn.recv_container().await.expect("recv heartbeat")
+        recv_message(&mut conn).await.expect("recv heartbeat")
     });
 
     let pending = IpcClient::connect(&path).await.expect("connect");
@@ -199,7 +254,7 @@ async fn heartbeat_exchange_after_handshake() {
         .expect("client handshake");
     client
         .send(&ContainerToHost::Heartbeat(HeartbeatPayload {
-            timestamp: "2026-04-11T00:00:00Z".to_owned(),
+            timestamp: "2026-04-11T00:00:00Z".parse().expect("valid timestamp"),
         }))
         .await
         .expect("send heartbeat");
@@ -217,7 +272,6 @@ async fn peer_disconnect_before_handshake_reports_closed() {
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let accept_task = tokio::spawn(async move {
         let pending = server.accept(sample_group()).await.expect("accept");
-        // Signal that accept (and peer_cred) has completed.
         let _ = tx.send(());
         pending
             .handshake(sample_init(), HS_TIMEOUT)
@@ -225,7 +279,6 @@ async fn peer_disconnect_before_handshake_reports_closed() {
             .map(|(_conn, ready)| ready)
     });
 
-    // Connect, wait for accept to capture credentials, then drop.
     let client = IpcClient::connect(&path).await.expect("connect");
     let _ = rx.await;
     drop(client);
@@ -255,14 +308,11 @@ async fn drop_unlinks_socket_file() {
 async fn rebind_over_stale_socket_file_succeeds() {
     let dir = tempdir().expect("tempdir");
     let path = socket_path(&dir, "ipc.sock");
-    // Create a real Unix socket to simulate a previous process crash.
     {
         let _old = std::os::unix::net::UnixListener::bind(&path).expect("bind old");
-        // Drop the listener but leave the socket file behind.
     }
     assert!(path.exists(), "stale socket file should exist");
 
-    // Bind should unlink the stale socket and proceed.
     let server = IpcServer::bind(&path).expect("bind over stale socket");
     assert_eq!(server.path(), path.as_path());
 }
@@ -293,18 +343,19 @@ async fn messages_exchange_after_init() {
             .handshake(sample_init(), HS_TIMEOUT)
             .await
             .expect("server handshake");
-        // Host sends a follow-up Messages payload.
         conn.send_host(&HostToContainer::Messages(MessagesPayload {
             job_id: JobId::from("job-integration-1"),
             messages: vec![HistoricalMessage {
-                sender: "Alice".to_owned(),
-                text: "Also check the logs".to_owned(),
-                timestamp: "2026-04-03T10:05:00Z".to_owned(),
-            }],
+                sender: "Alice".parse().expect("valid sender"),
+                text: "Also check the logs".parse().expect("valid text"),
+                timestamp: "2026-04-03T10:05:00Z".parse().expect("valid timestamp"),
+            }]
+            .try_into()
+            .expect("messages within bound"),
         }))
         .await
         .expect("send messages");
-        conn.recv_container().await.expect("recv complete")
+        recv_message(&mut conn).await.expect("recv complete")
     });
 
     let pending = IpcClient::connect(&path).await.expect("connect");
@@ -318,7 +369,7 @@ async fn messages_exchange_after_init() {
     client
         .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
             job_id: JobId::from("job-integration-1"),
-            result: Some("done".to_owned()),
+            result: Some("done".parse().expect("valid result")),
             session_id: None,
             token_usage: None,
             stop_reason: StopReason::EndTurn,
@@ -342,14 +393,12 @@ async fn session_identity_survives_split_with_group_binding() {
             .handshake(sample_init(), HS_TIMEOUT)
             .await
             .expect("handshake");
-        // Group should be bound after handshake.
         {
             let id = conn.identity().lock().expect("lock");
             let group = id.group();
             assert!(group.is_main, "should be main group");
             assert!(id.is_main());
         }
-        // Split and verify identity survives on both halves.
         let (writer, reader) = conn.into_split();
         {
             let id = writer.identity().lock().expect("lock");
@@ -376,15 +425,14 @@ async fn handshake_rejects_group_mismatch() {
     let path = socket_path(&dir, "ipc.sock");
     let server = IpcServer::bind(&path).expect("bind");
 
-    // init.context.group has a different ID than the group parameter.
     let mut init = sample_init();
     init.context.group = GroupInfo {
         id: GroupId::from("group-other"),
-        name: "Other".to_owned(),
+        name: "Other".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities::default(),
     };
-    let session_group = sample_group(); // group-main
+    let session_group = sample_group();
 
     let accept_task = tokio::spawn(async move {
         let pending = server.accept(session_group).await.expect("accept");
@@ -392,8 +440,6 @@ async fn handshake_rejects_group_mismatch() {
     });
 
     let client_pending = IpcClient::connect(&path).await.expect("connect");
-    // Client handshake will fail because the server rejects after
-    // detecting the mismatch, poisoning the connection.
     let _ = client_pending
         .handshake(sample_ready("1.0"), HS_TIMEOUT)
         .await;
@@ -414,19 +460,17 @@ async fn handshake_overwrites_same_id_different_metadata_from_session_identity()
     let path = socket_path(&dir, "ipc-meta-drift.sock");
     let server = IpcServer::bind(&path).expect("bind");
 
-    // Session group has one name and capabilities...
     let session_group = GroupInfo {
         id: GroupId::from("group-main"),
-        name: "Main".to_owned(),
+        name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
     };
 
-    // ...but init carries the same ID with different metadata.
     let mut init = sample_init();
     init.context.group = GroupInfo {
         id: GroupId::from("group-main"),
-        name: "Main (Updated)".to_owned(),
+        name: "Main (Updated)".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities { tanren: true },
     };

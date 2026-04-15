@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::UnixListener;
 
@@ -10,6 +11,37 @@ use crate::message::shared::GroupInfo;
 use crate::peer_cred::{self, SessionIdentity};
 
 use super::PendingConnection;
+
+/// Per-connection unauthorized-command abuse controls.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UnauthorizedCommandLimitConfig {
+    /// Maximum immediate unauthorized attempts before refill/backoff.
+    pub burst_capacity: u32,
+    /// Refill rate in tokens per second.
+    pub refill_per_second: u32,
+    /// Delay applied after each exhausted-budget strike.
+    pub backoff: Duration,
+    /// Disconnect after this many exhausted-budget strikes.
+    pub disconnect_after_strikes: u32,
+}
+
+impl Default for UnauthorizedCommandLimitConfig {
+    fn default() -> Self {
+        Self {
+            burst_capacity: 8,
+            refill_per_second: 2,
+            backoff: Duration::from_millis(200),
+            disconnect_after_strikes: 5,
+        }
+    }
+}
+
+/// Host-side server options.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct IpcServerOptions {
+    /// Unauthorized-command limiter config for accepted connections.
+    pub unauthorized_limit: UnauthorizedCommandLimitConfig,
+}
 
 /// Unix-socket server for the host side of the IPC protocol.
 ///
@@ -21,6 +53,9 @@ use super::PendingConnection;
 pub struct IpcServer {
     listener: UnixListener,
     socket_path: PathBuf,
+    #[cfg(unix)]
+    socket_fingerprint: (u64, u64),
+    options: IpcServerOptions,
 }
 
 impl IpcServer {
@@ -37,23 +72,51 @@ impl IpcServer {
     ///
     /// On Unix, the parent directory is validated before binding:
     /// - Must be a real directory (not a symlink).
-    /// - Must not have group/other write bits set.
+    /// - Must have mode 0o700.
+    /// - Ancestors must not be symlinks except vetted system aliases
+    ///   (platform-dependent).
     /// - If it does not exist, it is created with mode 0o700.
     ///
     /// The socket file itself is set to mode 0o600 after binding.
+    ///
+    /// Post-bind listener/path attestation is fail-closed: mismatch or
+    /// inconclusive identity evidence is treated as a bind-race error.
     pub fn bind(path: impl AsRef<Path>) -> Result<Self, IpcError> {
+        Self::bind_with_options(path, IpcServerOptions::default())
+    }
+
+    /// Bind a Unix socket at `path` with explicit server options.
+    ///
+    /// See [`Self::bind`] for bind and hardening semantics.
+    pub fn bind_with_options(
+        path: impl AsRef<Path>,
+        options: IpcServerOptions,
+    ) -> Result<Self, IpcError> {
         let socket_path = path.as_ref().to_path_buf();
         // `bind` is a startup-time operation so the short blocking
         // metadata check + unlink here is fine.
         #[cfg(unix)]
         peer_cred::validate_socket_dir(&socket_path)?;
+        #[cfg(unix)]
+        let bind_attestation = peer_cred::capture_bind_attestation(&socket_path)?;
         clean_stale_socket(&socket_path)?;
         let listener = UnixListener::bind(&socket_path)?;
         #[cfg(unix)]
-        {
+        let socket_fingerprint = {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
-        }
+            if let Err(e) = peer_cred::attest_post_bind(&socket_path, &listener, &bind_attestation)
+            {
+                cleanup_listener_owned_socket(
+                    &socket_path,
+                    &listener,
+                    "bind_attestation_failure",
+                    None,
+                );
+                return Err(e);
+            }
+            peer_cred::socket_path_fingerprint(&socket_path)?
+        };
         tracing::debug!(
             target: "forgeclaw_ipc::server",
             path = %socket_path.display(),
@@ -62,6 +125,9 @@ impl IpcServer {
         Ok(Self {
             listener,
             socket_path,
+            #[cfg(unix)]
+            socket_fingerprint,
+            options,
         })
     }
 
@@ -90,7 +156,11 @@ impl IpcServer {
             IpcError::Io(e)
         })?;
         let identity = Arc::new(std::sync::Mutex::new(SessionIdentity::new(creds, group)));
-        Ok(PendingConnection::from_stream(stream, identity))
+        Ok(PendingConnection::from_stream(
+            stream,
+            identity,
+            self.options.unauthorized_limit,
+        ))
     }
 
     /// Returns the filesystem path this server is bound to.
@@ -100,43 +170,90 @@ impl IpcServer {
     }
 }
 
-impl Drop for IpcServer {
-    fn drop(&mut self) {
-        // Only unlink if the path is still a Unix socket (defensive
-        // against the file being replaced between bind and drop).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::FileTypeExt;
-            match std::fs::symlink_metadata(&self.socket_path) {
-                Ok(meta) if meta.file_type().is_socket() => {
-                    if let Err(e) = std::fs::remove_file(&self.socket_path) {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            tracing::warn!(
-                                target: "forgeclaw_ipc::server",
-                                path = %self.socket_path.display(),
-                                error = %e,
-                                "failed to remove IPC socket file on drop"
-                            );
-                        }
-                    }
-                }
-                Ok(_) => {
+#[cfg(unix)]
+fn cleanup_listener_owned_socket(
+    path: &Path,
+    listener: &UnixListener,
+    operation: &'static str,
+    expected_fingerprint: Option<(u64, u64)>,
+) {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::MetadataExt;
+
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if !meta.file_type().is_socket() => {
+            tracing::warn!(
+                target: "forgeclaw_ipc::server",
+                path = %path.display(),
+                operation,
+                "socket path replaced with non-socket; skipping cleanup"
+            );
+            return;
+        }
+        Ok(meta) => {
+            if let Some((expected_dev, expected_ino)) = expected_fingerprint {
+                let current = (meta.dev(), meta.ino());
+                if current != (expected_dev, expected_ino) {
                     tracing::warn!(
                         target: "forgeclaw_ipc::server",
-                        path = %self.socket_path.display(),
-                        "socket path replaced with non-socket; skipping cleanup"
+                        path = %path.display(),
+                        operation,
+                        expected_dev,
+                        expected_ino,
+                        current_dev = current.0,
+                        current_ino = current.1,
+                        "socket path inode does not match bind-time listener socket; skipping cleanup"
                     );
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    tracing::warn!(
-                        target: "forgeclaw_ipc::server",
-                        path = %self.socket_path.display(),
-                        error = %e,
-                        "failed to stat IPC socket file on drop"
-                    );
+                    return;
                 }
             }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!(
+                target: "forgeclaw_ipc::server",
+                path = %path.display(),
+                operation,
+                error = %e,
+                "failed to stat IPC socket file before cleanup"
+            );
+            return;
+        }
+    }
+
+    if !peer_cred::listener_matches_socket_definitive(listener, path) {
+        tracing::warn!(
+            target: "forgeclaw_ipc::server",
+            path = %path.display(),
+            operation,
+            "socket path inode does not match active listener; skipping cleanup"
+        );
+        return;
+    }
+
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                target: "forgeclaw_ipc::server",
+                path = %path.display(),
+                operation,
+                error = %e,
+                "failed to remove IPC socket file"
+            );
+        }
+    }
+}
+
+impl Drop for IpcServer {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            cleanup_listener_owned_socket(
+                &self.socket_path,
+                &self.listener,
+                "server_drop",
+                Some(self.socket_fingerprint),
+            );
         }
     }
 }

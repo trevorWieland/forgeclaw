@@ -14,7 +14,7 @@ use tokio::net::UnixStream;
 use tokio_util::codec::Framed;
 
 use crate::codec::{
-    DEFAULT_MAX_UNKNOWN_SKIPS, FrameCodec, decode_host_to_container, encode_message,
+    DEFAULT_MAX_UNKNOWN_SKIPS, FrameCodec, decode_host_to_container, encode_container_to_host,
 };
 use crate::error::{IpcError, ProtocolError};
 use crate::message::{ContainerToHost, HostToContainer, InitPayload, ReadyPayload};
@@ -60,7 +60,7 @@ impl PendingClient {
     ) -> Result<(IpcClient, InitPayload), IpcError> {
         match tokio::time::timeout(timeout, self.handshake_inner(ready)).await {
             Ok(Ok(init)) => {
-                let client = IpcClient::from_parts(self.framed);
+                let client = IpcClient::from_parts(self.framed, init.job_id.clone());
                 Ok((client, init))
             }
             Ok(Err(e)) => {
@@ -112,7 +112,15 @@ impl PendingClient {
 
     async fn send(&mut self, msg: &ContainerToHost) -> Result<(), IpcError> {
         self.check_poisoned()?;
-        let bytes: Bytes = encode_message(msg)?;
+        let bytes: Bytes = match encode_container_to_host(msg) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                if e.is_fatal() {
+                    self.poison().await;
+                }
+                return Err(e);
+            }
+        };
         let result = self.framed.send(bytes).await;
         if let Err(ref e) = result {
             if e.is_fatal() {

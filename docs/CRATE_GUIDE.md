@@ -229,7 +229,19 @@ impl Decoder for FrameCodec { ... }
 pub struct IpcServer { ... }
 impl IpcServer {
     pub fn bind(path: &Path) -> Result<Self>;
+    pub fn bind_with_options(path: &Path, options: IpcServerOptions) -> Result<Self>;
     pub async fn accept(&self, group: GroupInfo) -> Result<PendingConnection>;
+}
+
+pub struct IpcServerOptions {
+    pub unauthorized_limit: UnauthorizedCommandLimitConfig,
+}
+
+pub struct UnauthorizedCommandLimitConfig {
+    pub burst_capacity: u32,
+    pub refill_per_second: u32,
+    pub backoff: Duration,
+    pub disconnect_after_strikes: u32,
 }
 
 pub struct PendingConnection { ... }
@@ -241,7 +253,25 @@ impl PendingConnection {
     ) -> Result<(IpcConnection, ReadyPayload)>;
 }
 
+pub enum UnknownTypePolicy { SkipBounded, Strict }
+
+pub enum IpcInboundEvent {
+    Command(AuthorizedCommand),
+    Unauthorized(UnauthorizedCommandRejection), // non-fatal: event loops stay alive
+    Message(ContainerToHost),
+}
+
 pub struct IpcConnection { ... } // typed send/recv, recv_command auth matrix, into_split
+impl IpcConnection {
+    pub fn negotiated_protocol_version(&self) -> NegotiatedProtocolVersion;
+    pub async fn recv_event(&mut self) -> Result<IpcInboundEvent>; // command + non-command demux
+    pub async fn recv_event_with_policy(
+        &mut self,
+        policy: UnknownTypePolicy,
+    ) -> Result<IpcInboundEvent>;
+    pub async fn recv_command(&mut self) -> Result<AuthorizedCommand>; // returns NotCommand for legal interleaving
+    pub async fn recv_command_strict(&mut self) -> Result<AuthorizedCommand>; // strict non-command rejection
+}
 pub struct IpcConnectionWriter { ... }
 pub struct IpcConnectionReader { ... }
 
@@ -249,6 +279,11 @@ pub struct IpcConnectionReader { ... }
 pub struct IpcClient { ... }
 impl IpcClient {
     pub async fn connect(path: &Path) -> Result<PendingClient>;
+    pub async fn recv(&mut self) -> Result<HostToContainer>; // default SkipBounded
+    pub async fn recv_with_policy(
+        &mut self,
+        policy: UnknownTypePolicy,
+    ) -> Result<HostToContainer>;
 }
 
 pub struct PendingClient { ... }
@@ -261,7 +296,15 @@ impl PendingClient {
 }
 ```
 
-**Test surface**: Frame codec roundtrip (all message types), max frame size enforcement, connection lifecycle (connect, handshake, exchange, close), malformed frame handling.
+Safe receive API source of truth:
+- [`IpcConnection::recv_event`](../crates/ipc/src/server/mod.rs)
+- [`IpcConnection::recv_event_with_policy`](../crates/ipc/src/server/mod.rs)
+- [`IpcConnection::recv_command`](../crates/ipc/src/server/mod.rs)
+- [`IpcConnection::recv_command_strict`](../crates/ipc/src/server/mod.rs)
+
+`recv_container_unchecked*` are crate-private internals and are not part of the public API contract.
+
+**Test surface**: Frame codec roundtrip (all message types), max frame size enforcement, command/non-command interleaving behavior, connection lifecycle (connect, handshake, exchange, close), malformed frame handling, schema/runtime parity checks.
 
 ---
 

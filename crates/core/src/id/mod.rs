@@ -6,8 +6,9 @@
 //! ## Construction
 //!
 //! - **Validated** — [`GroupId::new()`] (and the same for every ID type)
-//!   rejects empty or whitespace-only values with an [`IdError`].  Use
-//!   this at ingress boundaries (config loading, API endpoints, IPC).
+//!   rejects empty/whitespace-only values and values longer than 128
+//!   characters with an [`IdError`]. Use this at ingress boundaries
+//!   (config loading, API endpoints, IPC).
 //!
 //! - **Unchecked** — [`From<String>`] / [`From<&str>`] accept any value
 //!   without validation.  Use only in internal code that has already
@@ -18,6 +19,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+
+const MAX_ID_CHARS: usize = 128;
 
 /// Error returned when an ID string fails validation.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -32,7 +35,7 @@ pub struct IdError {
 /// Each generated type implements `Debug`, `Clone`, `PartialEq`, `Eq`, `Hash`,
 /// `Display`, `Serialize`, `From<String>`, `From<&str>`, and `AsRef<str>`,
 /// plus a validated `new()` constructor and a custom `Deserialize` that
-/// rejects empty/whitespace values.
+/// rejects empty/whitespace values and values over 128 characters.
 macro_rules! define_id {
     ($(#[doc = $doc:expr] $name:ident),+ $(,)?) => {
         $(
@@ -56,10 +59,11 @@ macro_rules! define_id {
                     schemars::json_schema!({
                         "type": "string",
                         "minLength": 1,
+                        "maxLength": MAX_ID_CHARS,
                         "pattern": "\\S",
                         "description": concat!(
                             stringify!($name),
-                            " — must be non-empty and contain at least one non-whitespace character."
+                            " — must be non-empty, contain at least one non-whitespace character, and be at most 128 chars."
                         )
                     })
                 }
@@ -67,20 +71,29 @@ macro_rules! define_id {
 
             impl $name {
                 /// Create a validated ID, rejecting empty or whitespace-only
-                /// values.
+                /// values and values longer than 128 characters.
                 ///
                 /// Prefer this over `From` at ingress boundaries.
                 ///
                 /// # Errors
                 ///
-                /// Returns [`IdError`] if the value is empty or contains
-                /// only whitespace.
+                /// Returns [`IdError`] if the value is empty, contains
+                /// only whitespace, or exceeds 128 characters.
                 pub fn new(s: impl Into<String>) -> Result<Self, IdError> {
                     let value = s.into();
                     if value.trim().is_empty() {
                         return Err(IdError {
                             reason: format!(
                                 "{} cannot be empty or whitespace-only",
+                                stringify!($name)
+                            ),
+                        });
+                    }
+                    let len = value.chars().count();
+                    if len > MAX_ID_CHARS {
+                        return Err(IdError {
+                            reason: format!(
+                                "{} cannot exceed {MAX_ID_CHARS} characters (got {len})",
                                 stringify!($name)
                             ),
                         });

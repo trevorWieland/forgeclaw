@@ -83,6 +83,46 @@ fn container_to_host_schema_rejects_output_complete_missing_result() {
 }
 
 #[test]
+fn container_to_host_schema_rejects_register_group_extensions_missing_version() {
+    let schema_value = load_schema("container_to_host.schema.json");
+    let validator = jsonschema::validator_for(&schema_value).expect("compile schema");
+    let missing_version = serde_json::json!({
+        "type": "command",
+        "command": "register_group",
+        "payload": {
+            "name": "new-group",
+            "extensions": {
+                "trigger": "@bot"
+            }
+        }
+    });
+    let err = validator
+        .validate(&missing_version)
+        .expect_err("extensions without version should fail schema");
+    assert!(
+        !err.to_string().is_empty(),
+        "schema validation should report a concrete error"
+    );
+}
+
+#[test]
+fn container_to_host_schema_rejects_invalid_heartbeat_timestamp() {
+    let schema_value = load_schema("container_to_host.schema.json");
+    let validator = jsonschema::validator_for(&schema_value).expect("compile schema");
+    let invalid_timestamp = serde_json::json!({
+        "type": "heartbeat",
+        "timestamp": "2026-04-03 10:30:00"
+    });
+    let err = validator
+        .validate(&invalid_timestamp)
+        .expect_err("invalid heartbeat timestamp should fail schema");
+    assert!(
+        !err.to_string().is_empty(),
+        "schema validation should report a concrete error"
+    );
+}
+
+#[test]
 fn host_to_container_fixtures_conform_to_schema() {
     let schema_value = load_schema("host_to_container.schema.json");
 
@@ -94,4 +134,68 @@ fn host_to_container_fixtures_conform_to_schema() {
         assert!(path.exists(), "fixture missing: {name}");
         validate_fixture(&schema_value, &path);
     }
+}
+
+#[test]
+fn host_to_container_schema_rejects_invalid_timezone_with_valid_timestamp() {
+    let schema_value = load_schema("host_to_container.schema.json");
+    let validator = jsonschema::validator_for(&schema_value).expect("compile schema");
+    let invalid_timezone = serde_json::json!({
+        "type": "init",
+        "job_id": "job-1",
+        "context": {
+            "messages": [
+                { "sender": "A", "text": "x", "timestamp": "2026-04-03T10:00:00Z" }
+            ],
+            "group": { "id": "group-main", "name": "Main", "is_main": true },
+            "timezone": "Mars/Olympus"
+        },
+        "config": {
+            "provider_proxy_url": "http://proxy.local",
+            "provider_proxy_token": "token",
+            "model": "model",
+            "max_tokens": 1000,
+            "tools_enabled": true,
+            "timeout_seconds": 600
+        }
+    });
+    let err = validator
+        .validate(&invalid_timezone)
+        .expect_err("invalid timezone should fail schema");
+    assert!(
+        !err.to_string().is_empty(),
+        "schema validation should report a concrete error"
+    );
+}
+
+#[test]
+fn host_to_container_schema_rejects_invalid_timestamp_with_valid_timezone() {
+    let schema_value = load_schema("host_to_container.schema.json");
+    let validator = jsonschema::validator_for(&schema_value).expect("compile schema");
+    let invalid_timestamp = serde_json::json!({
+        "type": "init",
+        "job_id": "job-1",
+        "context": {
+            "messages": [
+                { "sender": "A", "text": "x", "timestamp": "not-a-timestamp" }
+            ],
+            "group": { "id": "group-main", "name": "Main", "is_main": true },
+            "timezone": "UTC"
+        },
+        "config": {
+            "provider_proxy_url": "http://proxy.local",
+            "provider_proxy_token": "token",
+            "model": "model",
+            "max_tokens": 1000,
+            "tools_enabled": true,
+            "timeout_seconds": 600
+        }
+    });
+    let err = validator
+        .validate(&invalid_timestamp)
+        .expect_err("invalid timestamp should fail schema");
+    assert!(
+        !err.to_string().is_empty(),
+        "schema validation should report a concrete error"
+    );
 }
