@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn group_info_roundtrip() {
         let g = GroupInfo {
-            id: GroupId::from("group-main"),
+            id: GroupId::new("group-main").expect("valid group id"),
             name: "Main Group".parse().expect("valid group name"),
             is_main: true,
             capabilities: GroupCapabilities::default(),
@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn group_capabilities_tanren_roundtrip() {
         let g = GroupInfo {
-            id: GroupId::from("group-tanren"),
+            id: GroupId::new("group-tanren").expect("valid group id"),
             name: "Tanren Group".parse().expect("valid name"),
             is_main: false,
             capabilities: GroupCapabilities { tanren: true },

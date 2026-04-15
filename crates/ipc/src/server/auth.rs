@@ -25,14 +25,12 @@ use crate::peer_cred::SessionIdentity;
 /// Returns [`ProtocolError::Unauthorized`] for rejected commands.
 pub(crate) fn authorize_command(
     classified: ClassifiedCommand,
-    identity: &std::sync::Mutex<SessionIdentity>,
+    identity: &SessionIdentity,
 ) -> Result<AuthorizedCommand, IpcError> {
-    let guard = identity.lock().map_err(|_| IpcError::Closed)?;
-    let group = guard.group();
+    let group = identity.group();
     let is_main = group.is_main;
     let group_id = group.id.clone();
     let has_tanren = group.capabilities.tanren;
-    drop(guard);
 
     authorize_classified(classified, &group_id, is_main, has_tanren)
 }

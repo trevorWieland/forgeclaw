@@ -235,6 +235,15 @@ impl IpcServer {
 
 pub struct IpcServerOptions {
     pub unauthorized_limit: UnauthorizedCommandLimitConfig,
+    pub unknown_traffic_limit: UnknownTrafficLimitConfig,
+    pub peer_credential_policy: PeerCredentialPolicy,
+    pub write_timeout: Duration,
+}
+
+pub enum PeerCredentialPolicy {
+    CaptureOnly,
+    RequireExact { uid: Option<u32>, gid: Option<u32> },
+    Custom(...),
 }
 
 pub struct UnauthorizedCommandLimitConfig {
@@ -242,6 +251,13 @@ pub struct UnauthorizedCommandLimitConfig {
     pub refill_per_second: u32,
     pub backoff: Duration,
     pub disconnect_after_strikes: u32,
+}
+
+pub struct UnknownTrafficLimitConfig {
+    pub lifetime_message_limit: usize,      // 0 disables this control
+    pub lifetime_byte_limit: usize,         // 0 disables this control
+    pub rate_limit_burst_capacity: u32,     // 0 disables rate limiting
+    pub rate_limit_refill_per_second: u32,  // 0 disables rate limiting
 }
 
 pub struct PendingConnection { ... }
@@ -276,9 +292,14 @@ pub struct IpcConnectionWriter { ... }
 pub struct IpcConnectionReader { ... }
 
 // Client (container side)
+pub struct IpcClientOptions {
+    pub write_timeout: Duration,
+}
+
 pub struct IpcClient { ... }
 impl IpcClient {
     pub async fn connect(path: &Path) -> Result<PendingClient>;
+    pub async fn connect_with_options(path: &Path, options: IpcClientOptions) -> Result<PendingClient>;
     pub async fn recv(&mut self) -> Result<HostToContainer>; // default SkipBounded
     pub async fn recv_with_policy(
         &mut self,
@@ -304,7 +325,7 @@ Safe receive API source of truth:
 
 `recv_container_unchecked*` are crate-private internals and are not part of the public API contract.
 
-**Test surface**: Frame codec roundtrip (all message types), max frame size enforcement, command/non-command interleaving behavior, connection lifecycle (connect, handshake, exchange, close), malformed frame handling, schema/runtime parity checks.
+**Test surface**: Frame codec roundtrip (all message types), max frame size enforcement, command/non-command interleaving behavior, connection lifecycle (connect, handshake, exchange, close), malformed frame handling, outbound pre-serialization constraint validation, schema/runtime parity checks.
 
 ---
 

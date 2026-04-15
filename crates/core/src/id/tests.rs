@@ -2,40 +2,46 @@ use super::*;
 
 // Compile-time safety: different ID types are not interchangeable.
 // The following would fail to compile if uncommented:
-//   let g: GroupId = ContainerId::from("x");
+//   let g: GroupId = ContainerId::new("x").expect("valid container id");
 //   fn takes_group(_: GroupId) {}
-//   takes_group(ContainerId::from("x"));
+//   takes_group(ContainerId::new("x").expect("valid container id"));
 
-// ---------------------------------------------------------------------------
-// Unchecked construction (From)
-// ---------------------------------------------------------------------------
+fn is_valid_id(s: &str) -> bool {
+    !s.trim().is_empty() && s.chars().count() <= 128
+}
 
 #[test]
 fn display_shows_inner_string() {
-    let id = GroupId::from("my-group");
+    let id = GroupId::new("my-group").expect("valid group id");
     assert_eq!(id.to_string(), "my-group");
 }
 
 #[test]
-fn from_string_and_as_ref_roundtrip() {
+fn try_from_string_and_as_ref_roundtrip() {
     let original = "test-id-123".to_owned();
-    let id = ContainerId::from(original.clone());
+    let id = ContainerId::try_from(original.clone()).expect("valid container id");
     assert_eq!(id.as_ref(), original);
 }
 
 #[test]
-fn from_str_ref() {
-    let id = ProviderId::from("anthropic");
+fn try_from_str_ref() {
+    let id = ProviderId::try_from("anthropic").expect("valid provider id");
     assert_eq!(id.as_ref(), "anthropic");
+}
+
+#[test]
+fn parse_from_str() {
+    let id: ChannelId = "discord".parse().expect("valid channel id");
+    assert_eq!(id.as_ref(), "discord");
 }
 
 #[test]
 fn equality_and_hash() {
     use std::collections::HashSet;
 
-    let a = ChannelId::from("discord");
-    let b = ChannelId::from("discord");
-    let c = ChannelId::from("telegram");
+    let a = ChannelId::new("discord").expect("valid channel id");
+    let b = ChannelId::new("discord").expect("valid channel id");
+    let c = ChannelId::new("telegram").expect("valid channel id");
     assert_eq!(a, b);
     assert_ne!(a, c);
 
@@ -47,7 +53,7 @@ fn equality_and_hash() {
 
 #[test]
 fn serde_roundtrip() {
-    let id = JobId::from("job-42");
+    let id = JobId::new("job-42").expect("valid job id");
     let json = serde_json::to_string(&id).expect("serialize");
     let back: JobId = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(id, back);
@@ -86,10 +92,6 @@ fn deserialize_rejects_over_max_len() {
         "error should mention 128-char bound: {msg}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Validated construction (new)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn new_accepts_valid_string() {
@@ -169,67 +171,31 @@ fn id_error_display() {
     insta::assert_snapshot!(err.to_string(), @"invalid identifier: GroupId cannot be empty or whitespace-only");
 }
 
-// ---------------------------------------------------------------------------
-// Property tests
-// ---------------------------------------------------------------------------
-
 mod proptest_ids {
     use super::*;
     use proptest::prelude::*;
 
     proptest! {
         #[test]
-        fn group_id_roundtrips(s in ".*") {
-            let id = GroupId::from(s.clone());
-            prop_assert_eq!(id.as_ref(), s.as_str());
-            prop_assert_eq!(id.to_string(), s);
+        fn parse_validates_for_arbitrary_strings(s in ".*") {
+            let parsed: Result<GroupId, _> = s.parse();
+            prop_assert_eq!(parsed.is_ok(), is_valid_id(&s));
+            if let Ok(id) = parsed {
+                prop_assert_eq!(id.as_ref(), s.as_str());
+            }
         }
 
         #[test]
-        fn container_id_roundtrips(s in ".*") {
-            let id = ContainerId::from(s.clone());
-            prop_assert_eq!(id.as_ref(), s.as_str());
-        }
-
-        #[test]
-        fn provider_id_roundtrips(s in ".*") {
-            let id = ProviderId::from(s.clone());
-            prop_assert_eq!(id.as_ref(), s.as_str());
-        }
-
-        #[test]
-        fn channel_id_roundtrips(s in ".*") {
-            let id = ChannelId::from(s.clone());
-            prop_assert_eq!(id.as_ref(), s.as_str());
-        }
-
-        #[test]
-        fn job_id_roundtrips(s in ".*") {
-            let id = JobId::from(s.clone());
-            prop_assert_eq!(id.as_ref(), s.as_str());
-        }
-
-        #[test]
-        fn task_id_roundtrips(s in ".*") {
-            let id = TaskId::from(s.clone());
-            prop_assert_eq!(id.as_ref(), s.as_str());
-        }
-
-        #[test]
-        fn dispatch_id_roundtrips(s in ".*") {
-            let id = DispatchId::from(s.clone());
-            prop_assert_eq!(id.as_ref(), s.as_str());
-        }
-
-        #[test]
-        fn pool_id_roundtrips(s in ".*") {
-            let id = PoolId::from(s.clone());
-            prop_assert_eq!(id.as_ref(), s.as_str());
+        fn try_from_string_matches_validation_rules(s in ".*") {
+            let parsed = GroupId::try_from(s.clone());
+            prop_assert_eq!(parsed.is_ok(), is_valid_id(&s));
+            if let Ok(id) = parsed {
+                prop_assert_eq!(id.as_ref(), s.as_str());
+            }
         }
 
         #[test]
         fn validated_rejects_empty_and_whitespace(s in r"\s*") {
-            // All whitespace-only strings should be rejected.
             prop_assert!(GroupId::new(s).is_err());
         }
 
@@ -238,7 +204,6 @@ mod proptest_ids {
             s in proptest::string::string_regex(r"(?s).{1,128}").expect("valid regex"),
         ) {
             prop_assume!(s.chars().any(|c| !c.is_whitespace()));
-            // Strings with at least one non-whitespace char and <=128 chars should be accepted.
             prop_assert!(GroupId::new(s).is_ok());
         }
     }

@@ -45,7 +45,7 @@ const HS_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn sample_group() -> GroupInfo {
     GroupInfo {
-        id: GroupId::from("group-main"),
+        id: GroupId::new("group-main").expect("valid group id"),
         name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
@@ -54,11 +54,11 @@ fn sample_group() -> GroupInfo {
 
 fn sample_init() -> InitPayload {
     InitPayload {
-        job_id: JobId::from("job-integration-1"),
+        job_id: JobId::new("job-integration-1").expect("valid job id"),
         context: InitContext {
             messages: HistoricalMessages::default(),
             group: GroupInfo {
-                id: GroupId::from("group-main"),
+                id: GroupId::new("group-main").expect("valid group id"),
                 name: "Main".parse().expect("valid name"),
                 is_main: true,
                 capabilities: GroupCapabilities::default(),
@@ -134,7 +134,7 @@ async fn concurrent_send_recv_through_split() {
     client
         .send(&ContainerToHost::OutputDelta(OutputDeltaPayload {
             text: "partial output".parse().expect("valid text"),
-            job_id: JobId::from("job-integration-1"),
+            job_id: JobId::new("job-integration-1").expect("valid job id"),
         }))
         .await
         .expect("send delta");
@@ -172,7 +172,7 @@ async fn split_preserves_pipelined_buffered_bytes() {
         serde_json::to_vec(&ContainerToHost::Ready(sample_ready("1.0"))).expect("serialize ready");
     let delta = serde_json::to_vec(&ContainerToHost::OutputDelta(OutputDeltaPayload {
         text: "pipelined".parse().expect("valid text"),
-        job_id: JobId::from("job-integration-1"),
+        job_id: JobId::new("job-integration-1").expect("valid job id"),
     }))
     .expect("serialize delta");
 
@@ -279,7 +279,7 @@ async fn split_reader_rejects_output_delta_after_idle() {
         .expect("client handshake");
     client
         .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
-            job_id: JobId::from("job-integration-1"),
+            job_id: JobId::new("job-integration-1").expect("valid job id"),
             result: None,
             session_id: None,
             token_usage: None,
@@ -290,7 +290,7 @@ async fn split_reader_rejects_output_delta_after_idle() {
     client
         .send(&ContainerToHost::OutputDelta(OutputDeltaPayload {
             text: "late".parse().expect("valid text"),
-            job_id: JobId::from("job-integration-1"),
+            job_id: JobId::new("job-integration-1").expect("valid job id"),
         }))
         .await
         .expect_err("send late delta should fail client-side");
@@ -325,7 +325,7 @@ async fn split_reader_rejects_command_after_output_complete_until_messages() {
         .expect("client handshake");
     client
         .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
-            job_id: JobId::from("job-integration-1"),
+            job_id: JobId::new("job-integration-1").expect("valid job id"),
             result: None,
             session_id: None,
             token_usage: None,
@@ -336,7 +336,7 @@ async fn split_reader_rejects_command_after_output_complete_until_messages() {
     client
         .send(&ContainerToHost::Command(CommandPayload {
             body: CommandBody::SendMessage(SendMessagePayload {
-                target_group: GroupId::from("group-main"),
+                target_group: GroupId::new("group-main").expect("valid group id"),
                 text: "late command".parse().expect("valid text"),
             }),
         }))
@@ -368,7 +368,7 @@ async fn split_writer_rejects_messages_after_shutdown() {
             .expect("shutdown allowed");
         writer
             .send_host(&HostToContainer::Messages(MessagesPayload {
-                job_id: JobId::from("job-integration-1"),
+                job_id: JobId::new("job-integration-1").expect("valid job id"),
                 messages: HistoricalMessages::default(),
             }))
             .await
@@ -429,7 +429,7 @@ async fn split_reader_rejects_repeated_output_complete_while_draining() {
     assert!(matches!(received, HostToContainer::Shutdown(_)));
     client
         .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
-            job_id: JobId::from("job-integration-1"),
+            job_id: JobId::new("job-integration-1").expect("valid job id"),
             result: None,
             session_id: None,
             token_usage: None,
@@ -439,7 +439,7 @@ async fn split_reader_rejects_repeated_output_complete_while_draining() {
         .expect("first completion");
     client
         .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
-            job_id: JobId::from("job-integration-1"),
+            job_id: JobId::new("job-integration-1").expect("valid job id"),
             result: None,
             session_id: None,
             token_usage: None,

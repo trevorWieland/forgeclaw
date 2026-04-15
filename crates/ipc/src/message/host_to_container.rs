@@ -89,7 +89,7 @@ mod tests {
 
     fn sample_init() -> InitPayload {
         InitPayload {
-            job_id: JobId::from("job-abc123"),
+            job_id: JobId::new("job-abc123").expect("valid job id"),
             context: InitContext {
                 messages: vec![
                     HistoricalMessage {
@@ -106,7 +106,7 @@ mod tests {
                 .try_into()
                 .expect("messages within bound"),
                 group: GroupInfo {
-                    id: GroupId::from("group-main"),
+                    id: GroupId::new("group-main").expect("valid group id"),
                     name: "Main Group".parse().expect("valid group name"),
                     is_main: true,
                     capabilities: GroupCapabilities::default(),
@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn messages_roundtrip() {
         let m = MessagesPayload {
-            job_id: JobId::from("job-abc123"),
+            job_id: JobId::new("job-abc123").expect("valid job id"),
             messages: vec![HistoricalMessage {
                 sender: "Alice".parse().expect("valid sender"),
                 text: "Also check the logs please"

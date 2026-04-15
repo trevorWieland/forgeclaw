@@ -57,11 +57,12 @@ fn timezone_strategy() -> impl Strategy<Value = IanaTimezone> {
 }
 
 fn job_id_strategy() -> impl Strategy<Value = JobId> {
-    short_string().prop_map(JobId::from)
+    short_string().prop_map(|value| JobId::new(value).expect("strategy generates valid job ids"))
 }
 
 fn group_id_strategy() -> impl Strategy<Value = GroupId> {
-    short_string().prop_map(GroupId::from)
+    short_string()
+        .prop_map(|value| GroupId::new(value).expect("strategy generates valid group ids"))
 }
 
 fn stop_reason_strategy() -> impl Strategy<Value = StopReason> {
@@ -150,7 +151,7 @@ fn progress_strategy() -> impl Strategy<Value = ProgressPayload> {
 }
 
 fn task_id_strategy() -> impl Strategy<Value = TaskId> {
-    short_string().prop_map(TaskId::from)
+    short_string().prop_map(|value| TaskId::new(value).expect("strategy generates valid task ids"))
 }
 
 fn command_strategy() -> impl Strategy<Value = CommandPayload> {

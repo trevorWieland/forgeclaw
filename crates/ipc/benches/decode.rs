@@ -18,13 +18,13 @@ fn known_frames() -> Vec<Vec<u8>> {
     for size in [32usize, 1024, 8192, 65_536] {
         let delta = ContainerToHost::OutputDelta(OutputDeltaPayload {
             text: "x".repeat(size).parse().expect("valid text"),
-            job_id: JobId::from("job-bench"),
+            job_id: JobId::new("job-bench").expect("valid job id"),
         });
         frames.push(serde_json::to_vec(&delta).expect("serialize delta"));
     }
 
     let complete = ContainerToHost::OutputComplete(OutputCompletePayload {
-        job_id: JobId::from("job-bench"),
+        job_id: JobId::new("job-bench").expect("valid job id"),
         result: Some("done".parse().expect("valid result")),
         session_id: Some("sess-1".parse().expect("valid session id")),
         token_usage: None,

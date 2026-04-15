@@ -238,7 +238,7 @@ mod tests {
     fn output_delta_roundtrip() {
         let d = OutputDeltaPayload {
             text: OutputDeltaText::new("Here's what I found...").expect("valid delta"),
-            job_id: JobId::from("job-abc123"),
+            job_id: JobId::new("job-abc123").expect("valid job id"),
         };
         let json = serde_json::to_value(&d).expect("serialize");
         let back: OutputDeltaPayload = serde_json::from_value(json).expect("deserialize");
@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn output_complete_roundtrip_full() {
         let c = OutputCompletePayload {
-            job_id: JobId::from("job-abc123"),
+            job_id: JobId::new("job-abc123").expect("valid job id"),
             result: Some(OutputResultText::new("Here's the full response...").expect("valid")),
             session_id: Some(SessionIdText::new("sess-xyz789").expect("valid")),
             token_usage: Some(TokenUsage {
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn output_complete_skips_none_optionals() {
         let c = OutputCompletePayload {
-            job_id: JobId::from("job-1"),
+            job_id: JobId::new("job-1").expect("valid job id"),
             result: None,
             session_id: None,
             token_usage: None,
@@ -282,7 +282,7 @@ mod tests {
     #[test]
     fn progress_optionals_omitted_when_none() {
         let p = ProgressPayload {
-            job_id: JobId::from("job-1"),
+            job_id: JobId::new("job-1").expect("valid job id"),
             stage: IdentifierText::new("tool_execution").expect("valid stage"),
             detail: None,
             percent: None,
@@ -299,7 +299,7 @@ mod tests {
             code: ErrorCode::ProviderError,
             message: ShortText::new("Model returned 429: rate limited").expect("valid message"),
             fatal: false,
-            job_id: Some(JobId::from("job-abc123")),
+            job_id: Some(JobId::new("job-abc123").expect("valid job id")),
         };
         let json = serde_json::to_value(&e).expect("serialize");
         let back: ErrorPayload = serde_json::from_value(json).expect("deserialize");

@@ -181,7 +181,7 @@ mod tests {
     fn container_to_host_output_delta_tag() {
         let msg = ContainerToHost::OutputDelta(OutputDeltaPayload {
             text: "x".parse().expect("valid text"),
-            job_id: JobId::from("job-1"),
+            job_id: JobId::new("job-1").expect("valid job id"),
         });
         let json = serde_json::to_value(&msg).expect("serialize");
         assert_eq!(json["type"], "output_delta");
@@ -219,7 +219,7 @@ mod tests {
     fn container_to_host_command_wire_shape() {
         let msg = ContainerToHost::Command(CommandPayload {
             body: CommandBody::SendMessage(SendMessagePayload {
-                target_group: GroupId::from("group-main"),
+                target_group: GroupId::new("group-main").expect("valid group id"),
                 text: "hello".parse().expect("valid text"),
             }),
         });
@@ -245,13 +245,13 @@ mod tests {
             (
                 ContainerToHost::OutputDelta(OutputDeltaPayload {
                     text: String::new().parse().expect("valid output delta"),
-                    job_id: JobId::from("j"),
+                    job_id: JobId::new("j").expect("valid job id"),
                 }),
                 "output_delta",
             ),
             (
                 ContainerToHost::OutputComplete(OutputCompletePayload {
-                    job_id: JobId::from("j"),
+                    job_id: JobId::new("j").expect("valid job id"),
                     result: None,
                     session_id: None,
                     token_usage: None,
@@ -261,7 +261,7 @@ mod tests {
             ),
             (
                 ContainerToHost::Progress(ProgressPayload {
-                    job_id: JobId::from("j"),
+                    job_id: JobId::new("j").expect("valid job id"),
                     stage: "x".parse().expect("valid stage"),
                     detail: None,
                     percent: None,
@@ -283,11 +283,11 @@ mod tests {
     #[test]
     fn host_to_container_init_tag() {
         let msg = HostToContainer::Init(InitPayload {
-            job_id: JobId::from("job-abc123"),
+            job_id: JobId::new("job-abc123").expect("valid job id"),
             context: InitContext {
                 messages: HistoricalMessages::default(),
                 group: GroupInfo {
-                    id: GroupId::from("group-main"),
+                    id: GroupId::new("group-main").expect("valid group id"),
                     name: "Main".parse().expect("valid name"),
                     is_main: true,
                     capabilities: GroupCapabilities::default(),
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn host_to_container_messages_tag() {
         let msg = HostToContainer::Messages(MessagesPayload {
-            job_id: JobId::from("j"),
+            job_id: JobId::new("j").expect("valid job id"),
             messages: HistoricalMessages::default(),
         });
         assert_eq!(
@@ -337,11 +337,11 @@ mod tests {
     #[test]
     fn host_to_container_type_name_matches_wire() {
         let init = HostToContainer::Init(InitPayload {
-            job_id: JobId::from("j"),
+            job_id: JobId::new("j").expect("valid job id"),
             context: InitContext {
                 messages: HistoricalMessages::default(),
                 group: GroupInfo {
-                    id: GroupId::from("g"),
+                    id: GroupId::new("g").expect("valid group id"),
                     name: "n".parse().expect("valid name"),
                     is_main: false,
                     capabilities: GroupCapabilities::default(),
@@ -361,7 +361,7 @@ mod tests {
         assert_eq!(init.type_name(), "init");
         assert_eq!(
             HostToContainer::Messages(MessagesPayload {
-                job_id: JobId::from("j"),
+                job_id: JobId::new("j").expect("valid job id"),
                 messages: HistoricalMessages::default(),
             })
             .type_name(),

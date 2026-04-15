@@ -19,13 +19,16 @@ use crate::codec::{FrameCodec, decode_container_to_host, encode_host_to_containe
 use crate::error::{IpcError, ProtocolError};
 use crate::message::{ContainerToHost, GroupInfo, HostToContainer, InitPayload, ReadyPayload};
 use crate::peer_cred::SessionIdentity;
-use crate::policy::UnknownFrameBudget;
+use crate::policy::UnknownTrafficBudget;
 use crate::util::truncate_for_log;
 use crate::version::{NegotiatedProtocolVersion, PROTOCOL_VERSION, negotiate};
 
 use super::IpcConnection;
+use super::UnknownTrafficLimitConfig;
 use super::listener::UnauthorizedCommandLimitConfig;
-use super::protocol::{log_fatal_protocol_error, log_unknown_message};
+use super::protocol::{
+    log_fatal_protocol_error, log_outbound_validation_rejection, log_unknown_message,
+};
 
 /// A server-side connection that has not yet completed the handshake.
 ///
@@ -40,31 +43,37 @@ use super::protocol::{log_fatal_protocol_error, log_unknown_message};
 pub struct PendingConnection {
     framed: Framed<UnixStream, FrameCodec>,
     poisoned: bool,
-    unknown_budget: UnknownFrameBudget,
+    unknown_budget: UnknownTrafficBudget,
     last_frame_len: usize,
-    identity: Arc<std::sync::Mutex<SessionIdentity>>,
+    identity: Arc<SessionIdentity>,
     unauthorized_limit: UnauthorizedCommandLimitConfig,
+    unknown_traffic_limit: UnknownTrafficLimitConfig,
+    write_timeout: Duration,
 }
 
 impl PendingConnection {
     pub(crate) fn from_stream(
         stream: UnixStream,
-        identity: Arc<std::sync::Mutex<SessionIdentity>>,
+        identity: Arc<SessionIdentity>,
         unauthorized_limit: UnauthorizedCommandLimitConfig,
+        unknown_traffic_limit: UnknownTrafficLimitConfig,
+        write_timeout: Duration,
     ) -> Self {
         Self {
             framed: Framed::new(stream, FrameCodec::new()),
             poisoned: false,
-            unknown_budget: UnknownFrameBudget::default(),
+            unknown_budget: UnknownTrafficBudget::new(Instant::now(), unknown_traffic_limit),
             last_frame_len: 0,
             identity,
             unauthorized_limit,
+            unknown_traffic_limit,
+            write_timeout,
         }
     }
 
     /// Returns the session identity.
     #[must_use]
-    pub fn identity(&self) -> &Arc<std::sync::Mutex<SessionIdentity>> {
+    pub fn identity(&self) -> &Arc<SessionIdentity> {
         &self.identity
     }
 
@@ -112,6 +121,8 @@ impl PendingConnection {
                     active_job_id,
                     negotiated_version,
                     self.unauthorized_limit,
+                    self.unknown_traffic_limit,
+                    self.write_timeout,
                 );
                 Ok((conn, ready))
             }
@@ -126,7 +137,7 @@ impl PendingConnection {
     }
 
     fn bind_authoritative_group(&self, mut init: InitPayload) -> Result<InitPayload, IpcError> {
-        let session_group = self.session_group()?;
+        let session_group = self.session_group();
         if init.context.group.id != session_group.id {
             return Err(IpcError::Protocol(ProtocolError::GroupMismatch {
                 init_group_id: init.context.group.id,
@@ -137,11 +148,8 @@ impl PendingConnection {
         Ok(init)
     }
 
-    fn session_group(&self) -> Result<GroupInfo, IpcError> {
-        self.identity
-            .lock()
-            .map_err(|_| IpcError::Closed)
-            .map(|guard| guard.group().clone())
+    fn session_group(&self) -> GroupInfo {
+        self.identity.group().clone()
     }
 
     /// Validate the handshake protocol under a shared deadline:
@@ -202,6 +210,7 @@ impl PendingConnection {
         let bytes: Bytes = match encode_host_to_container(msg) {
             Ok(bytes) => bytes,
             Err(e) => {
+                log_outbound_validation_rejection(&self.identity, "handshake", &e);
                 if e.is_fatal() {
                     self.poison().await;
                 }
@@ -246,11 +255,14 @@ impl PendingConnection {
         loop {
             match self.recv_container_strict().await {
                 Ok(msg) => {
-                    self.unknown_budget.reset();
+                    self.unknown_budget.reset_consecutive();
                     return Ok(msg);
                 }
                 Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
-                    if let Err(e) = self.unknown_budget.on_unknown(self.last_frame_len) {
+                    if let Err(e) = self
+                        .unknown_budget
+                        .on_unknown(self.last_frame_len, Instant::now())
+                    {
                         log_fatal_protocol_error(&self.identity, "handshake", &e);
                         self.poison().await;
                         return Err(e);

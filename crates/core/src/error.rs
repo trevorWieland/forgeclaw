@@ -100,7 +100,7 @@ mod tests {
     #[test]
     fn auth_display() {
         let err = ErrorClass::Auth {
-            provider: ProviderId::from("anthropic"),
+            provider: ProviderId::new("anthropic").expect("valid provider id"),
             reason: "invalid API key".to_owned(),
         };
         insta::assert_snapshot!(err.to_string(), @"auth error for provider anthropic: invalid API key");
@@ -121,7 +121,7 @@ mod tests {
     #[test]
     fn container_display_with_id() {
         let err = ErrorClass::Container {
-            id: Some(ContainerId::from("ctr-1")),
+            id: Some(ContainerId::new("ctr-1").expect("valid container id")),
             reason: "OOM killed".to_owned(),
         };
         insta::assert_snapshot!(err.to_string(), @"container error for ctr-1: OOM killed");
@@ -155,7 +155,7 @@ mod tests {
 
         assert!(
             !ErrorClass::Auth {
-                provider: ProviderId::from("x"),
+                provider: ProviderId::new("x").expect("valid provider id"),
                 reason: String::new(),
             }
             .is_retriable()

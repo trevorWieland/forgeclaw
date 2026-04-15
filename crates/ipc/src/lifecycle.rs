@@ -254,8 +254,11 @@ fn lifecycle_violation(
     })
 }
 
-fn invalid_command_payload(command: &'static str, reason: &'static str) -> IpcError {
-    IpcError::Protocol(ProtocolError::InvalidCommandPayload { command, reason })
+fn invalid_command_payload(command: &'static str, reason: impl Into<String>) -> IpcError {
+    IpcError::Protocol(ProtocolError::InvalidCommandPayload {
+        command,
+        reason: reason.into(),
+    })
 }
 
 fn job_id_mismatch(
@@ -275,17 +278,8 @@ fn job_id_mismatch(
 fn validate_command_payload(payload: &CommandPayload) -> Result<(), IpcError> {
     if let CommandBody::RegisterGroup(register) = &payload.body {
         if let Some(extensions) = &register.extensions {
-            if extensions.version().as_str().trim().is_empty() {
-                return Err(invalid_command_payload(
-                    "register_group",
-                    "extensions.version is required when extensions are present",
-                ));
-            }
-            if extensions.validate_wire_invariants().is_err() {
-                return Err(invalid_command_payload(
-                    "register_group",
-                    "extensions contain reserved envelope keys",
-                ));
+            if let Err(err) = extensions.validate_wire_invariants() {
+                return Err(invalid_command_payload("register_group", err.to_string()));
             }
         }
     }

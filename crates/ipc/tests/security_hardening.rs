@@ -44,7 +44,7 @@ async fn too_many_unknown_frames_poisons_connection() {
     let server = IpcServer::bind(&path).expect("bind");
 
     let group = GroupInfo {
-        id: GroupId::from("group-main"),
+        id: GroupId::new("group-main").expect("valid group id"),
         name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
@@ -102,7 +102,7 @@ fn sample_ready(version: &str) -> ReadyPayload {
 
 fn sample_init(group: &GroupInfo) -> InitPayload {
     InitPayload {
-        job_id: JobId::from("job-auth-1"),
+        job_id: JobId::new("job-auth-1").expect("valid job id"),
         context: InitContext {
             messages: HistoricalMessages::default(),
             group: group.clone(),
@@ -160,7 +160,7 @@ async fn privileged_command_rejected_for_non_main_session() {
     let path = socket_path(&dir, "auth-reject.sock");
 
     let group = GroupInfo {
-        id: GroupId::from("group-worker"),
+        id: GroupId::new("group-worker").expect("valid group id"),
         name: "Worker".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities::default(),
@@ -193,7 +193,7 @@ async fn privileged_command_accepted_for_main_session() {
     let path = socket_path(&dir, "auth-accept.sock");
 
     let group = GroupInfo {
-        id: GroupId::from("group-main"),
+        id: GroupId::new("group-main").expect("valid group id"),
         name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
@@ -225,14 +225,14 @@ async fn send_message_own_group_accepted_for_non_main() {
     let path = socket_path(&dir, "auth-msg-own.sock");
 
     let group = GroupInfo {
-        id: GroupId::from("group-worker"),
+        id: GroupId::new("group-worker").expect("valid group id"),
         name: "Worker".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities::default(),
     };
     let command = ContainerToHost::Command(CommandPayload {
         body: CommandBody::SendMessage(SendMessagePayload {
-            target_group: GroupId::from("group-worker"),
+            target_group: GroupId::new("group-worker").expect("valid group id"),
             text: "hello".parse().expect("valid text"),
         }),
     });
@@ -255,14 +255,14 @@ async fn send_message_cross_group_rejected_for_non_main() {
     let path = socket_path(&dir, "auth-msg-cross.sock");
 
     let group = GroupInfo {
-        id: GroupId::from("group-worker"),
+        id: GroupId::new("group-worker").expect("valid group id"),
         name: "Worker".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities::default(),
     };
     let command = ContainerToHost::Command(CommandPayload {
         body: CommandBody::SendMessage(SendMessagePayload {
-            target_group: GroupId::from("group-other"),
+            target_group: GroupId::new("group-other").expect("valid group id"),
             text: "hello".parse().expect("valid text"),
         }),
     });
@@ -288,14 +288,14 @@ async fn send_message_cross_group_accepted_for_main() {
     let path = socket_path(&dir, "auth-msg-main.sock");
 
     let group = GroupInfo {
-        id: GroupId::from("group-main"),
+        id: GroupId::new("group-main").expect("valid group id"),
         name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
     };
     let command = ContainerToHost::Command(CommandPayload {
         body: CommandBody::SendMessage(SendMessagePayload {
-            target_group: GroupId::from("group-other"),
+            target_group: GroupId::new("group-other").expect("valid group id"),
             text: "hello from main".parse().expect("valid text"),
         }),
     });
@@ -318,14 +318,14 @@ async fn schedule_task_cross_group_rejected_for_non_main() {
     let path = socket_path(&dir, "auth-sched-cross.sock");
 
     let group = GroupInfo {
-        id: GroupId::from("group-worker"),
+        id: GroupId::new("group-worker").expect("valid group id"),
         name: "Worker".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities::default(),
     };
     let command = ContainerToHost::Command(CommandPayload {
         body: CommandBody::ScheduleTask(ScheduleTaskPayload {
-            group: GroupId::from("group-other"),
+            group: GroupId::new("group-other").expect("valid group id"),
             schedule_type: ScheduleType::Once,
             schedule_value: "2026-04-12T00:00:00Z".parse().expect("valid schedule"),
             prompt: "p".parse().expect("valid prompt"),
@@ -356,7 +356,7 @@ async fn dispatch_tanren_rejected_without_capability() {
     let path = socket_path(&dir, "auth-tanren-no.sock");
 
     let group = GroupInfo {
-        id: GroupId::from("group-worker"),
+        id: GroupId::new("group-worker").expect("valid group id"),
         name: "Worker".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities { tanren: false },
@@ -392,7 +392,7 @@ async fn dispatch_tanren_accepted_with_capability() {
     let path = socket_path(&dir, "auth-tanren-yes.sock");
 
     let group = GroupInfo {
-        id: GroupId::from("group-tanren"),
+        id: GroupId::new("group-tanren").expect("valid group id"),
         name: "Tanren".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities { tanren: true },
@@ -425,7 +425,7 @@ async fn dispatch_tanren_rejected_for_main_without_capability() {
     let path = socket_path(&dir, "auth-tanren-main-no.sock");
 
     let group = GroupInfo {
-        id: GroupId::from("group-main"),
+        id: GroupId::new("group-main").expect("valid group id"),
         name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities { tanren: false },
@@ -461,7 +461,7 @@ async fn dispatch_tanren_accepted_for_main_with_capability() {
     let path = socket_path(&dir, "auth-tanren-main-yes.sock");
 
     let group = GroupInfo {
-        id: GroupId::from("group-main"),
+        id: GroupId::new("group-main").expect("valid group id"),
         name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities { tanren: true },

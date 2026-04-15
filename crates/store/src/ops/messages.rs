@@ -110,17 +110,25 @@ pub(crate) async fn get_messages_since(
         .all(db)
         .await?;
 
-    Ok(rows.into_iter().map(row_to_stored).collect())
+    rows.into_iter().map(row_to_stored).collect()
 }
 
-fn row_to_stored(row: messages::Model) -> StoredMessage {
-    StoredMessage {
+fn row_to_stored(row: messages::Model) -> Result<StoredMessage, StoreError> {
+    Ok(StoredMessage {
         seq: row.seq,
         id: row.id,
-        group_id: GroupId::from(row.group_id),
-        channel_id: ChannelId::from(row.channel_id),
+        group_id: GroupId::new(row.group_id).map_err(|e| StoreError::SchemaDrift {
+            table: Some("messages".to_owned()),
+            column: Some("group_id".to_owned()),
+            reason: e.to_string(),
+        })?,
+        channel_id: ChannelId::new(row.channel_id).map_err(|e| StoreError::SchemaDrift {
+            table: Some("messages".to_owned()),
+            column: Some("channel_id".to_owned()),
+            reason: e.to_string(),
+        })?,
         sender: row.sender,
         content: row.content,
         created_at: row.created_at,
-    }
+    })
 }

@@ -30,7 +30,7 @@ async fn insert(store: &Store, group: &GroupId, id: &str, at: DateTime<Utc>) {
         .store_message(&NewMessage {
             id: id.to_owned(),
             group_id: group.clone(),
-            channel_id: ChannelId::from("ch"),
+            channel_id: ChannelId::new("ch").expect("valid channel id"),
             sender: "u".into(),
             content: "c".into(),
             created_at: at,
@@ -46,7 +46,7 @@ fn cursor_from(msg: &StoredMessage) -> Cursor {
 #[tokio::test]
 async fn empty_table_returns_empty_vec() {
     let store = fresh_store().await;
-    let group = GroupId::from("g");
+    let group = GroupId::new("g").expect("valid group id");
     let got = store
         .get_messages_since(&group, &Cursor::beginning(), 100)
         .await
@@ -57,7 +57,7 @@ async fn empty_table_returns_empty_vec() {
 #[tokio::test]
 async fn single_message_with_beginning_cursor_returns_it() {
     let store = fresh_store().await;
-    let group = GroupId::from("g");
+    let group = GroupId::new("g").expect("valid group id");
     insert(&store, &group, "m-1", epoch_plus(1000)).await;
 
     let got = store
@@ -72,7 +72,7 @@ async fn single_message_with_beginning_cursor_returns_it() {
 #[tokio::test]
 async fn cursor_past_last_message_returns_empty() {
     let store = fresh_store().await;
-    let group = GroupId::from("g");
+    let group = GroupId::new("g").expect("valid group id");
     insert(&store, &group, "m-1", epoch_plus(1000)).await;
 
     let cursor = Cursor::after(i64::MAX - 1);
@@ -91,7 +91,7 @@ async fn ordering_is_by_insert_seq_not_created_at() {
     // of the B1 fix: caller-controlled `created_at` cannot affect
     // pagination order.
     let store = fresh_store().await;
-    let group = GroupId::from("g");
+    let group = GroupId::new("g").expect("valid group id");
 
     insert(&store, &group, "m-c", epoch_plus(3000)).await;
     insert(&store, &group, "m-a", epoch_plus(1000)).await; // backdated
@@ -123,7 +123,7 @@ async fn backdated_insert_is_not_skipped_when_cursor_is_advanced() {
     // seq-based cursor, m-2 gets a fresh seq after the checkpoint
     // and is visible to the reader.
     let store = fresh_store().await;
-    let group = GroupId::from("g");
+    let group = GroupId::new("g").expect("valid group id");
 
     insert(&store, &group, "m-1", epoch_plus(5_000_000_000)).await;
     let page1 = store
@@ -152,7 +152,7 @@ async fn backdated_insert_is_not_skipped_when_cursor_is_advanced() {
 #[tokio::test]
 async fn cursor_excludes_message_at_exact_seq() {
     let store = fresh_store().await;
-    let group = GroupId::from("g");
+    let group = GroupId::new("g").expect("valid group id");
     for i in 0..3 {
         insert(&store, &group, &format!("m-{i}"), epoch_plus(4000 + i)).await;
     }
@@ -175,7 +175,7 @@ async fn cursor_excludes_message_at_exact_seq() {
 #[tokio::test]
 async fn limit_boundary_paginates_correctly() {
     let store = fresh_store().await;
-    let group = GroupId::from("g");
+    let group = GroupId::new("g").expect("valid group id");
     for i in 0..5 {
         insert(&store, &group, &format!("m-{i}"), epoch_plus(5000 + i)).await;
     }
@@ -209,8 +209,8 @@ async fn limit_boundary_paginates_correctly() {
 #[tokio::test]
 async fn multi_group_isolation() {
     let store = fresh_store().await;
-    let a = GroupId::from("a");
-    let b = GroupId::from("b");
+    let a = GroupId::new("a").expect("valid group id");
+    let b = GroupId::new("b").expect("valid group id");
 
     insert(&store, &a, "a-1", epoch_plus(6000)).await;
     insert(&store, &a, "a-2", epoch_plus(6001)).await;
@@ -234,7 +234,7 @@ async fn multi_group_isolation() {
 #[tokio::test]
 async fn negative_limit_is_rejected() {
     let store = fresh_store().await;
-    let group = GroupId::from("g");
+    let group = GroupId::new("g").expect("valid group id");
     insert(&store, &group, "m-1", epoch_plus(7500)).await;
 
     let err = store
@@ -250,7 +250,7 @@ async fn negative_limit_is_rejected() {
 #[tokio::test]
 async fn huge_limit_is_clamped_to_max_page_size() {
     let store = fresh_store().await;
-    let group = GroupId::from("g");
+    let group = GroupId::new("g").expect("valid group id");
     for i in 0..5_i64 {
         insert(&store, &group, &format!("m-{i}"), epoch_plus(8000 + i)).await;
     }
@@ -266,7 +266,7 @@ async fn huge_limit_is_clamped_to_max_page_size() {
 #[tokio::test]
 async fn zero_limit_returns_empty() {
     let store = fresh_store().await;
-    let group = GroupId::from("g");
+    let group = GroupId::new("g").expect("valid group id");
     insert(&store, &group, "m-1", epoch_plus(7000)).await;
 
     let got = store
@@ -283,14 +283,14 @@ async fn duplicate_message_id_is_integrity_error() {
     // upstream. Classification goes to `Fatal` via
     // `DatabaseCategory::Integrity` / `Other`.
     let store = fresh_store().await;
-    let group = GroupId::from("g");
+    let group = GroupId::new("g").expect("valid group id");
     insert(&store, &group, "m-dup", epoch_plus(9000)).await;
 
     let err = store
         .store_message(&NewMessage {
             id: "m-dup".to_owned(),
             group_id: group,
-            channel_id: ChannelId::from("ch"),
+            channel_id: ChannelId::new("ch").expect("valid channel id"),
             sender: "u".into(),
             content: "c".into(),
             created_at: epoch_plus(9001),

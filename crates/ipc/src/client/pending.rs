@@ -21,7 +21,28 @@ use crate::message::{ContainerToHost, HostToContainer, InitPayload, ReadyPayload
 use crate::policy::{DEFAULT_MAX_UNKNOWN_BYTES, UnknownFrameBudget};
 use crate::util::truncate_for_log;
 
-use super::IpcClient;
+use super::{IpcClient, IpcClientOptions};
+
+fn log_outbound_validation_rejection(err: &IpcError) {
+    let IpcError::Protocol(ProtocolError::OutboundValidation {
+        direction,
+        message_type,
+        field_path,
+        reason,
+    }) = err
+    else {
+        return;
+    };
+    tracing::warn!(
+        target: "forgeclaw_ipc::client",
+        phase = "handshake",
+        direction,
+        message_type,
+        field_path = %truncate_for_log(field_path),
+        reason = %truncate_for_log(reason),
+        "rejected outbound IPC message before serialization"
+    );
+}
 
 /// A container-side client that has not yet completed the handshake.
 ///
@@ -34,15 +55,17 @@ pub struct PendingClient {
     poisoned: bool,
     unknown_budget: UnknownFrameBudget,
     last_frame_len: usize,
+    options: IpcClientOptions,
 }
 
 impl PendingClient {
-    pub(crate) fn from_stream(stream: UnixStream) -> Self {
+    pub(crate) fn from_stream(stream: UnixStream, options: IpcClientOptions) -> Self {
         Self {
             framed: Framed::new(stream, FrameCodec::new()),
             poisoned: false,
             unknown_budget: UnknownFrameBudget::default(),
             last_frame_len: 0,
+            options,
         }
     }
 
@@ -60,7 +83,11 @@ impl PendingClient {
     ) -> Result<(IpcClient, InitPayload), IpcError> {
         match tokio::time::timeout(timeout, self.handshake_inner(ready)).await {
             Ok(Ok(init)) => {
-                let client = IpcClient::from_parts(self.framed, init.job_id.clone());
+                let client = IpcClient::from_parts(
+                    self.framed,
+                    init.job_id.clone(),
+                    self.options.write_timeout,
+                );
                 Ok((client, init))
             }
             Ok(Err(e)) => {
@@ -115,6 +142,7 @@ impl PendingClient {
         let bytes: Bytes = match encode_container_to_host(msg) {
             Ok(bytes) => bytes,
             Err(e) => {
+                log_outbound_validation_rejection(&e);
                 if e.is_fatal() {
                     self.poison().await;
                 }

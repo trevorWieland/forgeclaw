@@ -34,8 +34,8 @@ pub(crate) fn epoch_plus(seconds: i64) -> DateTime<Utc> {
 // ---------------------------------------------------------------
 
 pub(crate) async fn scenario_messages_round_trip(store: &Store) {
-    let group = GroupId::from("group-a");
-    let channel = ChannelId::from("discord");
+    let group = GroupId::new("group-a").expect("valid group id");
+    let channel = ChannelId::new("discord").expect("valid channel id");
     let base = epoch_plus(1_000_000_000);
 
     for i in 0..3 {
@@ -66,7 +66,7 @@ pub(crate) async fn scenario_messages_round_trip(store: &Store) {
 }
 
 pub(crate) async fn scenario_groups_upsert_preserves_created_at(store: &Store) {
-    let id = GroupId::from("group-b");
+    let id = GroupId::new("group-b").expect("valid group id");
     let created = epoch_plus(1_600_000_000);
     store
         .upsert_group(&RegisteredGroup {
@@ -106,7 +106,7 @@ pub(crate) async fn scenario_groups_upsert_preserves_created_at(store: &Store) {
 }
 
 pub(crate) async fn scenario_get_group_missing_returns_none(store: &Store) {
-    let id = GroupId::from("nope-no-such-group");
+    let id = GroupId::new("nope-no-such-group").expect("valid group id");
     let got = store.get_group(&id).await.expect("get_group");
     assert!(got.is_none());
 }
@@ -126,8 +126,8 @@ pub(crate) async fn scenario_state_round_trip(store: &Store) {
 }
 
 pub(crate) async fn scenario_sessions_round_trip(store: &Store) {
-    let a = GroupId::from("sess-a");
-    let b = GroupId::from("sess-b");
+    let a = GroupId::new("sess-a").expect("valid group id");
+    let b = GroupId::new("sess-b").expect("valid group id");
     assert_eq!(store.get_session(&a).await.expect("get a miss"), None);
 
     store.set_session(&a, "sess-1").await.expect("set a");
@@ -148,12 +148,12 @@ pub(crate) async fn scenario_sessions_round_trip(store: &Store) {
 }
 
 pub(crate) async fn scenario_get_session_missing_returns_none(store: &Store) {
-    let id = GroupId::from("nope-no-session");
+    let id = GroupId::new("nope-no-session").expect("valid group id");
     assert_eq!(store.get_session(&id).await.expect("get_session"), None);
 }
 
 pub(crate) async fn scenario_tasks_due_and_update(store: &Store) {
-    let group = GroupId::from("group-t");
+    let group = GroupId::new("group-t").expect("valid group id");
     let due = epoch_plus(1_500_000_000);
     let not_yet = epoch_plus(2_000_000_000);
 
@@ -205,7 +205,7 @@ pub(crate) async fn scenario_tasks_due_and_update(store: &Store) {
 
 pub(crate) async fn scenario_update_missing_task_is_not_found(store: &Store) {
     use forgeclaw_core::id::TaskId;
-    let fake = TaskId::from("no-such-task-id");
+    let fake = TaskId::new("no-such-task-id").expect("valid task id");
     let result = TaskRunResult {
         ran_at: epoch_plus(1_900_000_000),
         outcome: RunOutcome::Success { detail: None },
@@ -223,7 +223,7 @@ pub(crate) async fn scenario_update_missing_task_is_not_found(store: &Store) {
 }
 
 pub(crate) async fn scenario_events_filters(store: &Store) {
-    let group = GroupId::from("group-e");
+    let group = GroupId::new("group-e").expect("valid group id");
     let base = epoch_plus(1_600_000_000);
 
     for i in 0..5 {

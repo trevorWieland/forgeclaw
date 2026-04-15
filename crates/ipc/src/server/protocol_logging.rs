@@ -1,19 +1,20 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::codec::DEFAULT_MAX_UNKNOWN_SKIPS;
 use crate::error::{FrameError, IpcError, ProtocolError};
 use crate::peer_cred::SessionIdentity;
-use crate::policy::{DEFAULT_MAX_UNKNOWN_BYTES, UnknownFrameBudget};
+use crate::policy::{DEFAULT_MAX_UNKNOWN_BYTES, UnknownTrafficBudget};
 use crate::util::truncate_for_log;
 
 use super::{UNAUTHORIZED_LOG_BURST, UNAUTHORIZED_LOG_EVERY, UnauthorizedLogDecision};
 
 pub(crate) fn log_unknown_message(
-    identity: &Arc<Mutex<SessionIdentity>>,
+    identity: &Arc<SessionIdentity>,
     message_type: &str,
-    budget: &UnknownFrameBudget,
+    budget: &UnknownTrafficBudget,
 ) {
     let group = identity_fields(identity);
+    let limits = budget.limits();
     tracing::warn!(
         target: "forgeclaw_ipc::server",
         message_type = %truncate_for_log(message_type),
@@ -21,6 +22,13 @@ pub(crate) fn log_unknown_message(
         skip_count_limit = DEFAULT_MAX_UNKNOWN_SKIPS,
         skip_bytes = budget.bytes(),
         skip_bytes_limit = DEFAULT_MAX_UNKNOWN_BYTES,
+        lifetime_skip_count = budget.total_count(),
+        lifetime_skip_count_limit = limits.lifetime_message_limit,
+        lifetime_skip_bytes = budget.total_bytes(),
+        lifetime_skip_bytes_limit = limits.lifetime_byte_limit,
+        rate_limit_enabled = limits.rate_limiter_enabled(),
+        rate_limit_burst_capacity = limits.rate_limit_burst_capacity,
+        rate_limit_refill_per_second = limits.rate_limit_refill_per_second,
         group_id = %group.group_id,
         group_name = %group.group_name,
         is_main = group.is_main,
@@ -32,16 +40,39 @@ pub(crate) fn log_unknown_message(
 }
 
 pub(crate) fn log_unauthorized_command(
-    identity: &Arc<Mutex<SessionIdentity>>,
+    identity: &Arc<SessionIdentity>,
     protocol_phase: &'static str,
     command: &'static str,
     reason: &'static str,
     decision: UnauthorizedLogDecision,
 ) {
+    let group = identity_fields(identity);
+    tracing::debug!(
+        target: "forgeclaw_ipc::server",
+        protocol_phase,
+        command,
+        reason,
+        attempt = decision.attempt,
+        enforcement_action = decision.action.as_str(),
+        strikes = decision.strikes,
+        disconnect_after_strikes = decision.disconnect_after_strikes,
+        backoff_ms = decision.backoff_ms,
+        tokens_remaining = decision.tokens_remaining,
+        sampled_warn = decision.should_log,
+        suppressed_since_last = decision.suppressed_since_last,
+        sample_burst = UNAUTHORIZED_LOG_BURST,
+        sample_every = UNAUTHORIZED_LOG_EVERY,
+        group_id = %group.group_id,
+        group_name = %group.group_name,
+        is_main = group.is_main,
+        peer_uid = group.peer_uid,
+        peer_gid = group.peer_gid,
+        peer_pid = group.peer_pid,
+        "audit unauthorized IPC command rejection"
+    );
     if !decision.should_log {
         return;
     }
-    let group = identity_fields(identity);
     tracing::warn!(
         target: "forgeclaw_ipc::server",
         protocol_phase,
@@ -67,7 +98,7 @@ pub(crate) fn log_unauthorized_command(
 }
 
 pub(crate) fn log_fatal_protocol_error(
-    identity: &Arc<Mutex<SessionIdentity>>,
+    identity: &Arc<SessionIdentity>,
     protocol_phase: &'static str,
     err: &IpcError,
 ) {
@@ -87,6 +118,39 @@ pub(crate) fn log_fatal_protocol_error(
         peer_gid = group.peer_gid,
         peer_pid = group.peer_pid,
         "fatal IPC protocol failure"
+    );
+}
+
+pub(crate) fn log_outbound_validation_rejection(
+    identity: &Arc<SessionIdentity>,
+    protocol_phase: &'static str,
+    err: &IpcError,
+) {
+    let IpcError::Protocol(ProtocolError::OutboundValidation {
+        direction,
+        message_type,
+        field_path,
+        reason,
+    }) = err
+    else {
+        return;
+    };
+
+    let group = identity_fields(identity);
+    tracing::warn!(
+        target: "forgeclaw_ipc::server",
+        protocol_phase,
+        direction,
+        message_type,
+        field_path = %truncate_for_log(field_path),
+        reason = %truncate_for_log(reason),
+        group_id = %group.group_id,
+        group_name = %group.group_name,
+        is_main = group.is_main,
+        peer_uid = group.peer_uid,
+        peer_gid = group.peer_gid,
+        peer_pid = group.peer_pid,
+        "rejected outbound IPC message before serialization"
     );
 }
 
@@ -115,6 +179,20 @@ fn format_error_for_log(err: &IpcError) -> String {
                 truncate_for_log(reason)
             )
         }
+        IpcError::Protocol(ProtocolError::OutboundValidation {
+            direction,
+            message_type,
+            field_path,
+            reason,
+        }) => {
+            format!(
+                "outbound validation failed: direction={}, type={}, field={}, reason={}",
+                truncate_for_log(direction),
+                truncate_for_log(message_type),
+                truncate_for_log(field_path),
+                truncate_for_log(reason)
+            )
+        }
         IpcError::Protocol(ProtocolError::UnauthorizedCommandAbuse {
             command,
             strikes,
@@ -126,6 +204,18 @@ fn format_error_for_log(err: &IpcError) -> String {
                 truncate_for_log(command),
                 strikes,
                 disconnect_after_strikes
+            )
+        }
+        IpcError::Protocol(ProtocolError::PeerCredentialRejected {
+            reason,
+            expected_uid,
+            expected_gid,
+            actual_uid,
+            actual_gid,
+        }) => {
+            format!(
+                "peer credential rejected: reason={}, expected_uid={expected_uid:?}, expected_gid={expected_gid:?}, actual_uid={actual_uid:?}, actual_gid={actual_gid:?}",
+                truncate_for_log(reason)
             )
         }
         IpcError::Frame(FrameError::MalformedJson(msg)) => {
@@ -146,28 +236,16 @@ struct IdentityFields {
     peer_pid: Option<i32>,
 }
 
-fn identity_fields(identity: &Arc<Mutex<SessionIdentity>>) -> IdentityFields {
-    match identity.lock() {
-        Ok(guard) => {
-            let group = guard.group();
-            let creds = guard.peer_credentials();
-            IdentityFields {
-                group_id: truncate_for_log(group.id.as_ref()),
-                group_name: truncate_for_log(group.name.as_ref()),
-                is_main: group.is_main,
-                peer_uid: creds.map(|c| c.uid),
-                peer_gid: creds.map(|c| c.gid),
-                peer_pid: creds.and_then(|c| c.pid),
-            }
-        }
-        Err(_) => IdentityFields {
-            group_id: "<identity-lock-poisoned>".to_owned(),
-            group_name: "<identity-lock-poisoned>".to_owned(),
-            is_main: false,
-            peer_uid: None,
-            peer_gid: None,
-            peer_pid: None,
-        },
+fn identity_fields(identity: &Arc<SessionIdentity>) -> IdentityFields {
+    let group = identity.group();
+    let creds = identity.peer_credentials();
+    IdentityFields {
+        group_id: truncate_for_log(group.id.as_ref()),
+        group_name: truncate_for_log(group.name.as_ref()),
+        is_main: group.is_main,
+        peer_uid: creds.map(|c| c.uid),
+        peer_gid: creds.map(|c| c.gid),
+        peer_pid: creds.and_then(|c| c.pid),
     }
 }
 
@@ -189,11 +267,23 @@ fn error_class(err: &IpcError) -> &'static str {
             "too_many_unknown_messages"
         }
         IpcError::Protocol(ProtocolError::TooManyUnknownBytes { .. }) => "too_many_unknown_bytes",
+        IpcError::Protocol(ProtocolError::TooManyUnknownMessagesTotal { .. }) => {
+            "too_many_unknown_messages_total"
+        }
+        IpcError::Protocol(ProtocolError::TooManyUnknownBytesTotal { .. }) => {
+            "too_many_unknown_bytes_total"
+        }
+        IpcError::Protocol(ProtocolError::UnknownMessageRateLimitExceeded { .. }) => {
+            "unknown_message_rate_limited"
+        }
         IpcError::Protocol(ProtocolError::Unauthorized { .. }) => "unauthorized",
         IpcError::Protocol(ProtocolError::UnauthorizedCommandAbuse { .. }) => {
             "unauthorized_command_abuse"
         }
         IpcError::Protocol(ProtocolError::GroupMismatch { .. }) => "group_mismatch",
+        IpcError::Protocol(ProtocolError::PeerCredentialRejected { .. }) => {
+            "peer_credential_rejected"
+        }
         IpcError::Protocol(ProtocolError::LifecycleViolation { .. }) => "lifecycle_violation",
         IpcError::Protocol(ProtocolError::JobIdMismatch { .. }) => "job_id_mismatch",
         IpcError::Protocol(ProtocolError::HeartbeatTimeout { .. }) => "heartbeat_timeout",
@@ -203,6 +293,7 @@ fn error_class(err: &IpcError) -> &'static str {
         IpcError::Protocol(ProtocolError::InvalidCommandPayload { .. }) => {
             "invalid_command_payload"
         }
+        IpcError::Protocol(ProtocolError::OutboundValidation { .. }) => "outbound_validation",
         IpcError::Closed => "closed",
         IpcError::Timeout(_) => "timeout",
     }

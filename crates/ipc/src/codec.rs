@@ -29,9 +29,11 @@
 
 use crate::error::{FrameError, IpcError, ProtocolError};
 use crate::message::{ContainerToHost, HostToContainer};
+use crate::outbound_validation::{
+    validate_outbound_container_to_host, validate_outbound_host_to_container,
+};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::Serialize;
-use serde::de::DeserializeOwned;
 use std::io::Write;
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -179,50 +181,27 @@ impl Decoder for FrameCodec {
     }
 }
 
-/// A minimal probe that extracts just the `type` field from a JSON
-/// object, used to structurally distinguish unknown message types from
-/// malformed known messages.
-#[derive(serde::Deserialize)]
-struct TypeProbe {
-    #[serde(rename = "type")]
-    ty: String,
-}
-
 /// Decode a frame payload into a typed protocol message.
 ///
-/// Uses a single structural fallback to classify decode failures:
-///
-/// 1. Attempt full deserialization into `T` (hot path).
-/// 2. On failure, classify:
-///    - Invalid UTF-8 => [`FrameError::InvalidUtf8`].
-///    - If the `type` value is not in `known_types`, return
-///      [`ProtocolError::UnknownMessageType`].
-///    - Otherwise (known type, bad payload), return
-///      [`FrameError::MalformedJson`].
-///
-/// This avoids depending on serde's error wording for forward
-/// compatibility.
-pub(crate) fn decode_typed_message<T: DeserializeOwned>(
+/// Performs one JSON parse into [`serde_json::Value`] and then:
+/// - classifies unknown `type` discriminators, and
+/// - deserializes the same value into `T`.
+pub(crate) fn decode_typed_message<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
     known_types: &[&str],
 ) -> Result<T, IpcError> {
-    match serde_json::from_slice::<T>(bytes) {
-        Ok(msg) => Ok(msg),
-        Err(full_err) => {
-            if std::str::from_utf8(bytes).is_err() {
-                return Err(IpcError::Frame(FrameError::InvalidUtf8));
-            }
-            if let Ok(TypeProbe { ty }) = serde_json::from_slice::<TypeProbe>(bytes) {
-                if !known_types.contains(&ty.as_str()) {
-                    return Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty)));
-                }
-            }
-            // Known type with bad payload, or no type field at all.
-            Err(IpcError::Frame(FrameError::MalformedJson(
-                full_err.to_string(),
-            )))
+    let utf8 = std::str::from_utf8(bytes).map_err(|_| IpcError::Frame(FrameError::InvalidUtf8))?;
+    let value: serde_json::Value = serde_json::from_str(utf8)
+        .map_err(|e| IpcError::Frame(FrameError::MalformedJson(e.to_string())))?;
+    if let Some(ty) = value.get("type").and_then(serde_json::Value::as_str) {
+        if !known_types.contains(&ty) {
+            return Err(IpcError::Protocol(ProtocolError::UnknownMessageType(
+                ty.to_owned(),
+            )));
         }
     }
+    serde_json::from_value::<T>(value)
+        .map_err(|e| IpcError::Frame(FrameError::MalformedJson(e.to_string())))
 }
 
 /// Serialize a protocol message to an owned [`Bytes`] buffer suitable
@@ -245,12 +224,34 @@ pub(crate) fn encode_message<T: Serialize>(msg: &T) -> Result<Bytes, IpcError> {
 
 /// Typed alias — serialize a [`ContainerToHost`] message.
 pub(crate) fn encode_container_to_host(msg: &ContainerToHost) -> Result<Bytes, IpcError> {
+    validate_outbound_container_to_host(msg)?;
     encode_message(msg)
+        .map_err(|e| map_outbound_oversize_to_validation("container_to_host", msg.type_name(), e))
 }
 
 /// Typed alias — serialize a [`HostToContainer`] message.
 pub(crate) fn encode_host_to_container(msg: &HostToContainer) -> Result<Bytes, IpcError> {
+    validate_outbound_host_to_container(msg)?;
     encode_message(msg)
+        .map_err(|e| map_outbound_oversize_to_validation("host_to_container", msg.type_name(), e))
+}
+
+fn map_outbound_oversize_to_validation(
+    direction: &'static str,
+    message_type: &'static str,
+    err: IpcError,
+) -> IpcError {
+    match err {
+        IpcError::Frame(FrameError::Oversize { size, max }) => {
+            IpcError::Protocol(ProtocolError::OutboundValidation {
+                direction,
+                message_type,
+                field_path: "$frame_bytes".to_owned(),
+                reason: format!("encoded frame size {size} exceeds maximum {max}"),
+            })
+        }
+        other => other,
+    }
 }
 
 /// Streaming JSON writer that aborts once `max_bytes` is exceeded.

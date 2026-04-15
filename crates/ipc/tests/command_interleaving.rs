@@ -43,7 +43,7 @@ fn sample_ready() -> ReadyPayload {
 
 fn sample_group() -> GroupInfo {
     GroupInfo {
-        id: GroupId::from("group-main"),
+        id: GroupId::new("group-main").expect("valid group id"),
         name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
@@ -52,7 +52,7 @@ fn sample_group() -> GroupInfo {
 
 fn sample_init() -> InitPayload {
     InitPayload {
-        job_id: JobId::from("job-interleave-1"),
+        job_id: JobId::new("job-interleave-1").expect("valid job id"),
         context: InitContext {
             messages: HistoricalMessages::default(),
             group: sample_group(),
@@ -73,7 +73,7 @@ fn sample_init() -> InitPayload {
 fn sample_command() -> ContainerToHost {
     ContainerToHost::Command(CommandPayload {
         body: CommandBody::SendMessage(SendMessagePayload {
-            target_group: GroupId::from("group-main"),
+            target_group: GroupId::new("group-main").expect("valid group id"),
             text: "hello".parse().expect("valid text"),
         }),
     })
@@ -82,7 +82,7 @@ fn sample_command() -> ContainerToHost {
 fn sample_delta() -> ContainerToHost {
     ContainerToHost::OutputDelta(OutputDeltaPayload {
         text: "chunk".parse().expect("valid text"),
-        job_id: JobId::from("job-interleave-1"),
+        job_id: JobId::new("job-interleave-1").expect("valid job id"),
     })
 }
 

@@ -4,9 +4,18 @@ use std::time::Duration;
 
 use crate::codec::DEFAULT_MAX_UNKNOWN_SKIPS;
 use crate::error::{IpcError, ProtocolError};
+use tokio::time::Instant;
 
 /// Cumulative byte budget for consecutive unknown-type frames.
 pub(crate) const DEFAULT_MAX_UNKNOWN_BYTES: usize = 1024 * 1024;
+/// Maximum unknown frames over an entire connection lifetime.
+pub(crate) const DEFAULT_MAX_UNKNOWN_TOTAL_MESSAGES: usize = 256;
+/// Maximum unknown-message bytes over an entire connection lifetime.
+pub(crate) const DEFAULT_MAX_UNKNOWN_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+/// Unknown-message token-bucket burst capacity.
+pub(crate) const DEFAULT_UNKNOWN_RATE_BURST_CAPACITY: u32 = 64;
+/// Unknown-message token-bucket refill rate per second.
+pub(crate) const DEFAULT_UNKNOWN_RATE_REFILL_PER_SECOND: u32 = 16;
 
 /// Processing-phase heartbeat timeout per protocol spec.
 pub(crate) const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -52,5 +61,244 @@ impl UnknownFrameBudget {
     /// Cumulative bytes across the current unknown streak.
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
+    }
+}
+
+/// Independent unknown-traffic controls applied per connection.
+///
+/// Set any field to `0` to disable that control explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnknownTrafficLimitConfig {
+    /// Max unknown frames over connection lifetime (`0` disables).
+    pub lifetime_message_limit: usize,
+    /// Max unknown bytes over connection lifetime (`0` disables).
+    pub lifetime_byte_limit: usize,
+    /// Token-bucket burst capacity for unknown frame rate (`0` disables).
+    pub rate_limit_burst_capacity: u32,
+    /// Token refill rate (per second) for unknown frame rate (`0` disables).
+    pub rate_limit_refill_per_second: u32,
+}
+
+impl Default for UnknownTrafficLimitConfig {
+    fn default() -> Self {
+        Self {
+            lifetime_message_limit: DEFAULT_MAX_UNKNOWN_TOTAL_MESSAGES,
+            lifetime_byte_limit: DEFAULT_MAX_UNKNOWN_TOTAL_BYTES,
+            rate_limit_burst_capacity: DEFAULT_UNKNOWN_RATE_BURST_CAPACITY,
+            rate_limit_refill_per_second: DEFAULT_UNKNOWN_RATE_REFILL_PER_SECOND,
+        }
+    }
+}
+
+impl UnknownTrafficLimitConfig {
+    #[must_use]
+    pub(crate) fn normalized(self) -> Self {
+        let mut normalized = self;
+        if normalized.rate_limit_burst_capacity == 0 || normalized.rate_limit_refill_per_second == 0
+        {
+            normalized.rate_limit_burst_capacity = 0;
+            normalized.rate_limit_refill_per_second = 0;
+        }
+        normalized
+    }
+
+    #[must_use]
+    pub(crate) fn rate_limiter_enabled(self) -> bool {
+        self.rate_limit_burst_capacity > 0 && self.rate_limit_refill_per_second > 0
+    }
+}
+
+/// Server-side unknown-frame tracker with both consecutive and
+/// independent lifetime/rate protections.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UnknownTrafficBudget {
+    consecutive: UnknownFrameBudget,
+    total_count: usize,
+    total_bytes: usize,
+    limits: UnknownTrafficLimitConfig,
+    rate_tokens: f64,
+    rate_last_refill: Instant,
+}
+
+impl UnknownTrafficBudget {
+    #[must_use]
+    pub(crate) fn new(now: Instant, limits: UnknownTrafficLimitConfig) -> Self {
+        let limits = limits.normalized();
+        Self {
+            consecutive: UnknownFrameBudget::default(),
+            total_count: 0,
+            total_bytes: 0,
+            rate_tokens: f64::from(limits.rate_limit_burst_capacity),
+            rate_last_refill: now,
+            limits,
+        }
+    }
+
+    pub(crate) fn reset_consecutive(&mut self) {
+        self.consecutive.reset();
+    }
+
+    pub(crate) fn on_unknown(&mut self, frame_len: usize, now: Instant) -> Result<(), IpcError> {
+        self.consecutive.on_unknown(frame_len)?;
+        self.total_count = self.total_count.saturating_add(1);
+        self.total_bytes = self.total_bytes.saturating_add(frame_len);
+
+        if self.limits.lifetime_message_limit > 0
+            && self.total_count > self.limits.lifetime_message_limit
+        {
+            return Err(IpcError::Protocol(
+                ProtocolError::TooManyUnknownMessagesTotal {
+                    count: self.total_count,
+                    limit: self.limits.lifetime_message_limit,
+                },
+            ));
+        }
+        if self.limits.lifetime_byte_limit > 0 && self.total_bytes > self.limits.lifetime_byte_limit
+        {
+            return Err(IpcError::Protocol(
+                ProtocolError::TooManyUnknownBytesTotal {
+                    bytes: self.total_bytes,
+                    limit: self.limits.lifetime_byte_limit,
+                },
+            ));
+        }
+
+        self.consume_rate_token(now)
+    }
+
+    fn consume_rate_token(&mut self, now: Instant) -> Result<(), IpcError> {
+        if !self.limits.rate_limiter_enabled() {
+            return Ok(());
+        }
+        let elapsed = now
+            .checked_duration_since(self.rate_last_refill)
+            .unwrap_or_default();
+        if !elapsed.is_zero() {
+            let refill =
+                elapsed.as_secs_f64() * f64::from(self.limits.rate_limit_refill_per_second);
+            let capacity = f64::from(self.limits.rate_limit_burst_capacity);
+            self.rate_tokens = (self.rate_tokens + refill).min(capacity);
+            self.rate_last_refill = now;
+        }
+
+        if self.rate_tokens >= 1.0 {
+            self.rate_tokens -= 1.0;
+            return Ok(());
+        }
+        Err(IpcError::Protocol(
+            ProtocolError::UnknownMessageRateLimitExceeded {
+                burst_capacity: self.limits.rate_limit_burst_capacity,
+                refill_per_second: self.limits.rate_limit_refill_per_second,
+            },
+        ))
+    }
+
+    #[must_use]
+    pub(crate) fn count(&self) -> usize {
+        self.consecutive.count()
+    }
+
+    #[must_use]
+    pub(crate) fn bytes(&self) -> usize {
+        self.consecutive.bytes()
+    }
+
+    #[must_use]
+    pub(crate) fn total_count(&self) -> usize {
+        self.total_count
+    }
+
+    #[must_use]
+    pub(crate) fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    #[must_use]
+    pub(crate) fn limits(&self) -> UnknownTrafficLimitConfig {
+        self.limits
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UnknownTrafficBudget, UnknownTrafficLimitConfig};
+
+    #[test]
+    fn unknown_budget_lifetime_count_enforced_across_resets() {
+        let now = tokio::time::Instant::now();
+        let mut budget = UnknownTrafficBudget::new(
+            now,
+            UnknownTrafficLimitConfig {
+                lifetime_message_limit: 3,
+                lifetime_byte_limit: 0,
+                rate_limit_burst_capacity: 0,
+                rate_limit_refill_per_second: 0,
+            },
+        );
+        budget.on_unknown(10, now).expect("first unknown");
+        budget.reset_consecutive();
+        budget.on_unknown(10, now).expect("second unknown");
+        budget.reset_consecutive();
+        budget.on_unknown(10, now).expect("third unknown");
+        budget.reset_consecutive();
+        let err = budget
+            .on_unknown(10, now)
+            .expect_err("lifetime cap should be enforced");
+        assert!(matches!(
+            err,
+            crate::error::IpcError::Protocol(
+                crate::error::ProtocolError::TooManyUnknownMessagesTotal { .. }
+            )
+        ));
+    }
+
+    #[test]
+    fn unknown_budget_lifetime_bytes_enforced_across_resets() {
+        let now = tokio::time::Instant::now();
+        let mut budget = UnknownTrafficBudget::new(
+            now,
+            UnknownTrafficLimitConfig {
+                lifetime_message_limit: 0,
+                lifetime_byte_limit: 100,
+                rate_limit_burst_capacity: 0,
+                rate_limit_refill_per_second: 0,
+            },
+        );
+        budget.on_unknown(60, now).expect("first unknown");
+        budget.reset_consecutive();
+        let err = budget
+            .on_unknown(60, now)
+            .expect_err("lifetime byte cap should be enforced");
+        assert!(matches!(
+            err,
+            crate::error::IpcError::Protocol(
+                crate::error::ProtocolError::TooManyUnknownBytesTotal { .. }
+            )
+        ));
+    }
+
+    #[test]
+    fn unknown_budget_rate_limiter_enforced() {
+        let now = tokio::time::Instant::now();
+        let mut budget = UnknownTrafficBudget::new(
+            now,
+            UnknownTrafficLimitConfig {
+                lifetime_message_limit: 0,
+                lifetime_byte_limit: 0,
+                rate_limit_burst_capacity: 2,
+                rate_limit_refill_per_second: 1,
+            },
+        );
+        budget.on_unknown(1, now).expect("token 1");
+        budget.on_unknown(1, now).expect("token 2");
+        let err = budget
+            .on_unknown(1, now)
+            .expect_err("third unknown should hit rate limit");
+        assert!(matches!(
+            err,
+            crate::error::IpcError::Protocol(
+                crate::error::ProtocolError::UnknownMessageRateLimitExceeded { .. }
+            )
+        ));
     }
 }

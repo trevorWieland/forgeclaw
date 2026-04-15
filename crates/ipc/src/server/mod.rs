@@ -15,12 +15,18 @@ mod connection_split;
 mod listener;
 mod pending;
 mod protocol;
+mod transport_core;
 
+pub use crate::policy::UnknownTrafficLimitConfig;
 pub use connection_split::{IpcConnectionReader, IpcConnectionWriter};
-pub use listener::{IpcServer, IpcServerOptions, UnauthorizedCommandLimitConfig};
+pub use listener::{
+    IpcServer, IpcServerOptions, PeerCredentialPolicy, PeerCredentialPolicyError,
+    UnauthorizedCommandLimitConfig,
+};
 pub use pending::PendingConnection;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use forgeclaw_core::JobId;
@@ -30,21 +36,22 @@ use tokio::net::UnixStream;
 use tokio::time::Instant;
 use tokio_util::codec::Framed;
 
-use crate::codec::{FrameCodec, decode_container_to_host, encode_host_to_container};
+use crate::codec::FrameCodec;
 use crate::error::{IpcError, ProtocolError};
 use crate::message::authorized::AuthorizedCommand;
 use crate::message::command::ClassifiedCommand;
 use crate::message::{ContainerToHost, HostToContainer};
 use crate::peer_cred::SessionIdentity;
-use crate::policy::UnknownFrameBudget;
+use crate::policy::UnknownTrafficBudget;
 use crate::recv_policy::UnknownTypePolicy;
 use crate::version::NegotiatedProtocolVersion;
 
 use self::protocol::{
-    ConnectionState, UnauthorizedEnforcementAction, enforce_inbound_state, enforce_outbound_state,
-    log_fatal_protocol_error, log_unauthorized_command, log_unknown_message,
+    ConnectionState, UnauthorizedEnforcementAction, log_fatal_protocol_error,
+    log_outbound_validation_rejection, log_unauthorized_command, log_unknown_message,
     record_unauthorized_rejection, recv_deadline, recv_timeout_error,
 };
+use self::transport_core::{decode_and_enforce_inbound, preflight_and_enforce_outbound};
 
 #[derive(Debug, Clone, Copy)]
 enum CommandReceiveBehavior {
@@ -77,10 +84,10 @@ fn classify_command_message(
 
 async fn authorize_classified_command(
     classified: ClassifiedCommand,
-    identity: &Arc<std::sync::Mutex<SessionIdentity>>,
+    identity: &Arc<SessionIdentity>,
     state: &mut ConnectionState,
 ) -> Result<AuthorizedCommand, IpcError> {
-    let result = auth::authorize_command(classified, identity);
+    let result = auth::authorize_command(classified, identity.as_ref());
     if let Err(IpcError::Protocol(ProtocolError::Unauthorized { command, reason })) = &result {
         let phase = state.phase_name();
         let outcome = record_unauthorized_rejection(state);
@@ -109,7 +116,7 @@ async fn authorize_classified_command(
 
 async fn classify_inbound_event(
     msg: ContainerToHost,
-    identity: &Arc<std::sync::Mutex<SessionIdentity>>,
+    identity: &Arc<SessionIdentity>,
     state: &mut ConnectionState,
 ) -> Result<IpcInboundEvent, IpcError> {
     match msg {
@@ -173,25 +180,28 @@ pub enum IpcInboundEvent {
 pub struct IpcConnection {
     framed: Framed<UnixStream, FrameCodec>,
     poisoned: bool,
-    unknown_budget: UnknownFrameBudget,
+    unknown_budget: UnknownTrafficBudget,
     last_frame_len: usize,
     state: ConnectionState,
-    identity: Arc<std::sync::Mutex<SessionIdentity>>,
+    identity: Arc<SessionIdentity>,
+    write_timeout: Duration,
 }
 
 impl IpcConnection {
     /// Construct from an already-handshaked transport.
     pub(crate) fn from_parts(
         framed: Framed<UnixStream, FrameCodec>,
-        identity: Arc<std::sync::Mutex<SessionIdentity>>,
+        identity: Arc<SessionIdentity>,
         active_job_id: JobId,
         negotiated_version: NegotiatedProtocolVersion,
         unauthorized_limit: UnauthorizedCommandLimitConfig,
+        unknown_traffic_limit: UnknownTrafficLimitConfig,
+        write_timeout: Duration,
     ) -> Self {
         Self {
             framed,
             poisoned: false,
-            unknown_budget: UnknownFrameBudget::default(),
+            unknown_budget: UnknownTrafficBudget::new(Instant::now(), unknown_traffic_limit),
             last_frame_len: 0,
             state: ConnectionState::new(
                 Instant::now(),
@@ -200,12 +210,13 @@ impl IpcConnection {
                 unauthorized_limit,
             ),
             identity,
+            write_timeout,
         }
     }
 
     /// Returns the session identity (shared with split halves).
     #[must_use]
-    pub fn identity(&self) -> &Arc<std::sync::Mutex<SessionIdentity>> {
+    pub fn identity(&self) -> &Arc<SessionIdentity> {
         &self.identity
     }
 
@@ -243,26 +254,27 @@ impl IpcConnection {
     /// Send a [`HostToContainer`] message to the peer.
     pub async fn send_host(&mut self, msg: &HostToContainer) -> Result<(), IpcError> {
         self.check_poisoned()?;
-        let phase_name = self.state.phase_name();
-        let _action = match enforce_outbound_state(&mut self.state, msg, Instant::now()) {
-            Ok(action) => action,
-            Err(e) => {
-                log_fatal_protocol_error(&self.identity, phase_name, &e);
-                self.poison().await;
-                return Err(e);
-            }
-        };
-        let bytes: Bytes = match encode_host_to_container(msg) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                if e.is_fatal() {
-                    log_fatal_protocol_error(&self.identity, self.state.phase_name(), &e);
-                    self.poison().await;
+        let phase_name_before = self.state.phase_name();
+        let bytes: Bytes =
+            match preflight_and_enforce_outbound(&mut self.state, msg, Instant::now()) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    if matches!(
+                        e,
+                        IpcError::Protocol(ProtocolError::OutboundValidation { .. })
+                    ) {
+                        log_outbound_validation_rejection(&self.identity, phase_name_before, &e);
+                    } else {
+                        log_fatal_protocol_error(&self.identity, phase_name_before, &e);
+                        self.poison().await;
+                    }
+                    return Err(e);
                 }
-                return Err(e);
-            }
+            };
+        let result = match tokio::time::timeout(self.write_timeout, self.framed.send(bytes)).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(IpcError::Timeout(self.write_timeout)),
         };
-        let result = self.framed.send(bytes).await;
         if let Err(ref e) = result {
             if e.is_fatal() {
                 log_fatal_protocol_error(&self.identity, self.state.phase_name(), e);
@@ -295,27 +307,17 @@ impl IpcConnection {
             }
         };
         self.last_frame_len = frame.len();
-        let result = decode_container_to_host(&frame);
-        let msg = match result {
-            Ok(msg) => msg,
-            Err(e) => {
-                if e.is_fatal() {
-                    log_fatal_protocol_error(&self.identity, self.state.phase_name(), &e);
-                    self.poison().await;
+        let (msg, lifecycle_action) =
+            match decode_and_enforce_inbound(&mut self.state, &frame, Instant::now()) {
+                Ok(result) => result,
+                Err(e) => {
+                    if e.is_fatal() {
+                        log_fatal_protocol_error(&self.identity, self.state.phase_name(), &e);
+                        self.poison().await;
+                    }
+                    return Err(e);
                 }
-                return Err(e);
-            }
-        };
-        let lifecycle_action = match enforce_inbound_state(&mut self.state, &msg, Instant::now()) {
-            Ok(action) => action,
-            Err(e) => {
-                if e.is_fatal() {
-                    log_fatal_protocol_error(&self.identity, self.state.phase_name(), &e);
-                    self.poison().await;
-                }
-                return Err(e);
-            }
-        };
+            };
         if lifecycle_action.should_close_after_frame() {
             self.poison().await;
         }
@@ -336,11 +338,14 @@ impl IpcConnection {
             UnknownTypePolicy::SkipBounded => loop {
                 match self.recv_container_unchecked_one().await {
                     Ok(msg) => {
-                        self.unknown_budget.reset();
+                        self.unknown_budget.reset_consecutive();
                         return Ok(msg);
                     }
                     Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
-                        if let Err(e) = self.unknown_budget.on_unknown(self.last_frame_len) {
+                        if let Err(e) = self
+                            .unknown_budget
+                            .on_unknown(self.last_frame_len, Instant::now())
+                        {
                             log_fatal_protocol_error(&self.identity, self.state.phase_name(), &e);
                             self.poison().await;
                             return Err(e);
@@ -356,8 +361,8 @@ impl IpcConnection {
     /// Receive a [`ContainerToHost`] message.
     ///
     /// This is the `unchecked` default: unknown message types are
-    /// silently skipped (with a warning log) up to spec limits
-    /// (count and cumulative-byte budgets).
+    /// silently skipped (with a warning log) up to protocol limits:
+    /// consecutive count/bytes plus independent lifetime/rate guards.
     ///
     /// Command authorization is not applied. Prefer
     /// [`recv_event`](Self::recv_event) or

@@ -16,12 +16,12 @@ async fn spawn_container_roundtrip() {
     let handler = tokio::spawn(async move {
         let (cmd, responder) = rx.recv().await.expect("should receive");
         assert_eq!(cmd.group.as_ref(), "main");
-        responder.respond(Ok(ContainerId::from("ctr-42")));
+        responder.respond(Ok(ContainerId::new("ctr-42").expect("valid container id")));
     });
 
     let result = bus
         .call(SpawnContainer {
-            group: GroupId::from("main"),
+            group: GroupId::new("main").expect("valid group id"),
         })
         .await;
 
@@ -43,7 +43,7 @@ async fn spawn_container_error_class() {
 
     let result = bus
         .call(SpawnContainer {
-            group: GroupId::from("main"),
+            group: GroupId::new("main").expect("valid group id"),
         })
         .await;
 
@@ -66,7 +66,7 @@ async fn transient_error_is_retriable() {
 
     let result = bus
         .call(SpawnContainer {
-            group: GroupId::from("main"),
+            group: GroupId::new("main").expect("valid group id"),
         })
         .await;
 
@@ -173,16 +173,18 @@ async fn multiple_callers_single_handler() {
         let mut count = 0u32;
         while let Some((_cmd, responder)) = rx.recv().await {
             count += 1;
-            responder.respond(Ok(ContainerId::from(format!("ctr-{count}"))));
+            responder.respond(Ok(
+                ContainerId::new(format!("ctr-{count}")).expect("valid container id")
+            ));
         }
         count
     });
 
     let r1 = bus.call(SpawnContainer {
-        group: GroupId::from("a"),
+        group: GroupId::new("a").expect("valid group id"),
     });
     let r2 = bus2.call(SpawnContainer {
-        group: GroupId::from("b"),
+        group: GroupId::new("b").expect("valid group id"),
     });
 
     let (res1, res2) = tokio::join!(r1, r2);

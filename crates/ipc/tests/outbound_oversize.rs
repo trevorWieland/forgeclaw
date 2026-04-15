@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use forgeclaw_core::{GroupId, JobId};
 use forgeclaw_ipc::{
-    CommandBody, CommandPayload, ContainerToHost, FrameError, GroupCapabilities, GroupExtensions,
+    ContainerToHost, GroupCapabilities, GroupExtensions, GroupExtensionsError,
     GroupExtensionsVersion, GroupInfo, HistoricalMessage, HistoricalMessages, HostToContainer,
-    InitConfig, InitContext, InitPayload, IpcClient, IpcError, IpcServer, MAX_FRAME_BYTES,
-    MessagesPayload, ReadyPayload, RegisterGroupPayload, ShutdownPayload, ShutdownReason,
+    InitConfig, InitContext, InitPayload, IpcClient, IpcError, IpcInboundEvent, IpcServer,
+    MAX_FRAME_BYTES, MessagesPayload, ProtocolError, ReadyPayload, ShutdownPayload, ShutdownReason,
 };
 use tempfile::tempdir;
 
@@ -42,7 +42,7 @@ fn sample_ready() -> ReadyPayload {
 
 fn sample_group() -> GroupInfo {
     GroupInfo {
-        id: GroupId::from("group-main"),
+        id: GroupId::new("group-main").expect("valid group id"),
         name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
@@ -51,7 +51,7 @@ fn sample_group() -> GroupInfo {
 
 fn sample_init() -> InitPayload {
     InitPayload {
-        job_id: JobId::from("job-oversize-1"),
+        job_id: JobId::new("job-oversize-1").expect("valid job id"),
         context: InitContext {
             messages: HistoricalMessages::default(),
             group: sample_group(),
@@ -69,20 +69,17 @@ fn sample_init() -> InitPayload {
     }
 }
 
-fn oversize_container_message() -> ContainerToHost {
-    let mut ext =
-        GroupExtensions::new(GroupExtensionsVersion::new("1").expect("valid extension version"));
-    ext.insert(
-        "blob",
+fn oversize_extensions_error() -> GroupExtensionsError {
+    let mut data = serde_json::Map::new();
+    data.insert(
+        "blob".to_owned(),
         serde_json::Value::String("x".repeat(MAX_FRAME_BYTES + 1_024)),
+    );
+    GroupExtensions::with_data(
+        GroupExtensionsVersion::new("1").expect("valid extension version"),
+        data,
     )
-    .expect("non-reserved extension key");
-    ContainerToHost::Command(CommandPayload {
-        body: CommandBody::RegisterGroup(RegisterGroupPayload {
-            name: "oversize-group".parse().expect("valid name"),
-            extensions: Some(ext),
-        }),
-    })
+    .expect_err("oversize extensions should fail constructor")
 }
 
 fn oversize_host_message() -> HostToContainer {
@@ -95,7 +92,7 @@ fn oversize_host_message() -> HostToContainer {
     };
 
     HostToContainer::Messages(MessagesPayload {
-        job_id: JobId::from("job-oversize-1"),
+        job_id: JobId::new("job-oversize-1").expect("valid job id"),
         messages: std::iter::repeat_n(template, 90)
             .collect::<Vec<_>>()
             .try_into()
@@ -104,18 +101,22 @@ fn oversize_host_message() -> HostToContainer {
 }
 
 #[tokio::test]
-async fn client_unsplit_send_oversize_is_rejected_and_poisoned() {
+async fn client_unsplit_extensions_oversize_is_rejected_and_connection_remains_usable() {
     let dir = tempdir().expect("tempdir");
     let path = socket_path(&dir, "oversize-client-unsplit.sock");
     let server = IpcServer::bind(&path).expect("bind");
 
     let accept_task = tokio::spawn(async move {
         let pending = server.accept(sample_group()).await.expect("accept");
-        let (_conn, _ready) = pending
+        let (mut conn, _ready) = pending
             .handshake(sample_init(), HS_TIMEOUT)
             .await
             .expect("handshake");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        let event = conn.recv_event().await.expect("recv follow-up heartbeat");
+        assert!(matches!(
+            event,
+            IpcInboundEvent::Message(ContainerToHost::Heartbeat(_))
+        ));
     });
 
     let pending = IpcClient::connect(&path).await.expect("connect");
@@ -124,47 +125,42 @@ async fn client_unsplit_send_oversize_is_rejected_and_poisoned() {
         .await
         .expect("handshake");
 
-    let err = client
-        .send(&oversize_container_message())
-        .await
-        .expect_err("oversize send must fail");
+    let err = oversize_extensions_error();
     assert!(
-        matches!(
-            err,
-            IpcError::Frame(FrameError::Oversize {
-                max: MAX_FRAME_BYTES,
-                ..
-            })
-        ),
-        "expected Oversize, got {err:?}"
+        matches!(err, GroupExtensionsError::EncodedBytesExceeded { .. }),
+        "expected encoded-bytes bound error, got {err:?}"
     );
 
-    let err = client
+    client
         .send(&ContainerToHost::Heartbeat(
             forgeclaw_ipc::HeartbeatPayload {
                 timestamp: "2026-04-03T10:00:00Z".parse().expect("valid timestamp"),
             },
         ))
         .await
-        .expect_err("poisoned client should be closed");
-    assert!(matches!(err, IpcError::Closed));
+        .expect("client should remain usable after outbound oversize preflight failure");
 
     accept_task.await.expect("join");
 }
 
 #[tokio::test]
-async fn client_split_writer_send_oversize_is_rejected_and_poisoned() {
+async fn client_split_writer_extensions_oversize_is_rejected_and_connection_remains_usable() {
     let dir = tempdir().expect("tempdir");
     let path = socket_path(&dir, "oversize-client-split.sock");
     let server = IpcServer::bind(&path).expect("bind");
 
     let accept_task = tokio::spawn(async move {
         let pending = server.accept(sample_group()).await.expect("accept");
-        let (_conn, _ready) = pending
+        let (conn, _ready) = pending
             .handshake(sample_init(), HS_TIMEOUT)
             .await
             .expect("handshake");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        let (_writer, mut reader) = conn.into_split();
+        let event = reader.recv_event().await.expect("recv follow-up heartbeat");
+        assert!(matches!(
+            event,
+            IpcInboundEvent::Message(ContainerToHost::Heartbeat(_))
+        ));
     });
 
     let pending = IpcClient::connect(&path).await.expect("connect");
@@ -174,27 +170,26 @@ async fn client_split_writer_send_oversize_is_rejected_and_poisoned() {
         .expect("handshake");
     let (mut writer, _reader) = client.into_split();
 
-    let err = writer
-        .send(&oversize_container_message())
-        .await
-        .expect_err("oversize send must fail");
-    assert!(matches!(err, IpcError::Frame(FrameError::Oversize { .. })));
+    let err = oversize_extensions_error();
+    assert!(matches!(
+        err,
+        GroupExtensionsError::EncodedBytesExceeded { .. }
+    ));
 
-    let err = writer
+    writer
         .send(&ContainerToHost::Heartbeat(
             forgeclaw_ipc::HeartbeatPayload {
                 timestamp: "2026-04-03T10:00:00Z".parse().expect("valid timestamp"),
             },
         ))
         .await
-        .expect_err("poisoned writer should be closed");
-    assert!(matches!(err, IpcError::Closed));
+        .expect("split writer should remain usable after outbound oversize preflight failure");
 
     accept_task.await.expect("join");
 }
 
 #[tokio::test]
-async fn server_unsplit_send_oversize_is_rejected_and_poisoned() {
+async fn server_unsplit_send_oversize_is_rejected_but_connection_remains_usable() {
     let dir = tempdir().expect("tempdir");
     let path = socket_path(&dir, "oversize-server-unsplit.sock");
     let server = IpcServer::bind(&path).expect("bind");
@@ -210,29 +205,37 @@ async fn server_unsplit_send_oversize_is_rejected_and_poisoned() {
             .send_host(&oversize_host_message())
             .await
             .expect_err("oversize send must fail");
-        assert!(matches!(err, IpcError::Frame(FrameError::Oversize { .. })));
+        assert!(matches!(
+            err,
+            IpcError::Protocol(ProtocolError::OutboundValidation {
+                message_type: "messages",
+                field_path,
+                reason,
+                ..
+            }) if field_path == "$frame_bytes" && reason.contains("encoded frame size")
+        ));
 
-        let err = conn
-            .send_host(&HostToContainer::Shutdown(ShutdownPayload {
-                reason: ShutdownReason::HostShutdown,
-                deadline_ms: 1_000,
-            }))
-            .await
-            .expect_err("poisoned connection should be closed");
-        assert!(matches!(err, IpcError::Closed));
+        conn.send_host(&HostToContainer::Shutdown(ShutdownPayload {
+            reason: ShutdownReason::HostShutdown,
+            deadline_ms: 1_000,
+        }))
+        .await
+        .expect("connection should remain usable after outbound oversize preflight failure");
     });
 
     let pending = IpcClient::connect(&path).await.expect("connect");
-    let (_client, _init) = pending
+    let (mut client, _init) = pending
         .handshake(sample_ready(), HS_TIMEOUT)
         .await
         .expect("handshake");
+    let shutdown = client.recv().await.expect("recv shutdown");
+    assert!(matches!(shutdown, HostToContainer::Shutdown(_)));
 
     accept_task.await.expect("join");
 }
 
 #[tokio::test]
-async fn server_split_writer_send_oversize_is_rejected_and_poisoned() {
+async fn server_split_writer_send_oversize_is_rejected_but_connection_remains_usable() {
     let dir = tempdir().expect("tempdir");
     let path = socket_path(&dir, "oversize-server-split.sock");
     let server = IpcServer::bind(&path).expect("bind");
@@ -249,23 +252,32 @@ async fn server_split_writer_send_oversize_is_rejected_and_poisoned() {
             .send_host(&oversize_host_message())
             .await
             .expect_err("oversize send must fail");
-        assert!(matches!(err, IpcError::Frame(FrameError::Oversize { .. })));
+        assert!(matches!(
+            err,
+            IpcError::Protocol(ProtocolError::OutboundValidation {
+                message_type: "messages",
+                field_path,
+                reason,
+                ..
+            }) if field_path == "$frame_bytes" && reason.contains("encoded frame size")
+        ));
 
-        let err = writer
+        writer
             .send_host(&HostToContainer::Shutdown(ShutdownPayload {
                 reason: ShutdownReason::HostShutdown,
                 deadline_ms: 1_000,
             }))
             .await
-            .expect_err("poisoned writer should be closed");
-        assert!(matches!(err, IpcError::Closed));
+            .expect("writer should remain usable after outbound oversize preflight failure");
     });
 
     let pending = IpcClient::connect(&path).await.expect("connect");
-    let (_client, _init) = pending
+    let (mut client, _init) = pending
         .handshake(sample_ready(), HS_TIMEOUT)
         .await
         .expect("handshake");
+    let shutdown = client.recv().await.expect("recv shutdown");
+    assert!(matches!(shutdown, HostToContainer::Shutdown(_)));
 
     accept_task.await.expect("join");
 }

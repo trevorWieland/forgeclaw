@@ -144,6 +144,44 @@ fn too_many_unknown_bytes_is_fatal() {
 }
 
 #[test]
+fn too_many_unknown_messages_total_is_fatal() {
+    let err = IpcError::Protocol(ProtocolError::TooManyUnknownMessagesTotal {
+        count: 400,
+        limit: 256,
+    });
+    assert!(err.is_fatal());
+}
+
+#[test]
+fn too_many_unknown_bytes_total_is_fatal() {
+    let err = IpcError::Protocol(ProtocolError::TooManyUnknownBytesTotal {
+        bytes: 5_000_000,
+        limit: 4_194_304,
+    });
+    assert!(err.is_fatal());
+}
+
+#[test]
+fn unknown_message_rate_limit_exceeded_is_fatal() {
+    let err = IpcError::Protocol(ProtocolError::UnknownMessageRateLimitExceeded {
+        burst_capacity: 2,
+        refill_per_second: 1,
+    });
+    assert!(err.is_fatal());
+}
+
+#[test]
+fn outbound_validation_is_not_fatal() {
+    let err = IpcError::Protocol(ProtocolError::OutboundValidation {
+        direction: "container_to_host",
+        message_type: "command",
+        field_path: "payload.target_group".to_owned(),
+        reason: "must contain at least one non-whitespace character".to_owned(),
+    });
+    assert!(!err.is_fatal());
+}
+
+#[test]
 fn unauthorized_display() {
     let err = ProtocolError::Unauthorized {
         command: "register_group",
@@ -198,8 +236,8 @@ fn not_command_is_not_fatal() {
 #[test]
 fn group_mismatch_display() {
     let err = ProtocolError::GroupMismatch {
-        init_group_id: "group-a".into(),
-        session_group_id: "group-b".into(),
+        init_group_id: forgeclaw_core::GroupId::new("group-a").expect("valid group id"),
+        session_group_id: forgeclaw_core::GroupId::new("group-b").expect("valid group id"),
     };
     let s = err.to_string();
     assert!(s.contains("group-a"));
@@ -209,8 +247,34 @@ fn group_mismatch_display() {
 #[test]
 fn group_mismatch_is_fatal() {
     let err = IpcError::Protocol(ProtocolError::GroupMismatch {
-        init_group_id: "group-a".into(),
-        session_group_id: "group-b".into(),
+        init_group_id: forgeclaw_core::GroupId::new("group-a").expect("valid group id"),
+        session_group_id: forgeclaw_core::GroupId::new("group-b").expect("valid group id"),
+    });
+    assert!(err.is_fatal());
+}
+
+#[test]
+fn peer_credential_rejected_display() {
+    let err = ProtocolError::PeerCredentialRejected {
+        reason: "peer uid mismatch".to_owned(),
+        expected_uid: Some(1000),
+        expected_gid: Some(1000),
+        actual_uid: Some(2000),
+        actual_gid: Some(2000),
+    };
+    let s = err.to_string();
+    assert!(s.contains("peer credential rejected"));
+    assert!(s.contains("peer uid mismatch"));
+}
+
+#[test]
+fn peer_credential_rejected_is_fatal() {
+    let err = IpcError::Protocol(ProtocolError::PeerCredentialRejected {
+        reason: "peer gid mismatch".to_owned(),
+        expected_uid: None,
+        expected_gid: Some(1000),
+        actual_uid: Some(1000),
+        actual_gid: Some(2000),
     });
     assert!(err.is_fatal());
 }
@@ -231,8 +295,8 @@ fn job_id_mismatch_is_fatal() {
     let err = IpcError::Protocol(ProtocolError::JobIdMismatch {
         direction: "container_to_host",
         message_type: "output_delta",
-        expected: "job-1".into(),
-        got: "job-2".into(),
+        expected: forgeclaw_core::JobId::new("job-1").expect("valid job id"),
+        got: forgeclaw_core::JobId::new("job-2").expect("valid job id"),
     });
     assert!(err.is_fatal());
 }
@@ -283,7 +347,7 @@ fn shutdown_deadline_exceeded_is_not_fatal() {
 fn invalid_command_payload_display() {
     let err = ProtocolError::InvalidCommandPayload {
         command: "register_group",
-        reason: "extensions.version is required",
+        reason: "extensions.version is required".to_owned(),
     };
     assert_eq!(
         err.to_string(),
@@ -295,7 +359,7 @@ fn invalid_command_payload_display() {
 fn invalid_command_payload_is_fatal() {
     let err = IpcError::Protocol(ProtocolError::InvalidCommandPayload {
         command: "register_group",
-        reason: "extensions.version is required",
+        reason: "extensions.version is required".to_owned(),
     });
     assert!(err.is_fatal());
 }

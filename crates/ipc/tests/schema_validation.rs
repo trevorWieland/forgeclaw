@@ -106,6 +106,58 @@ fn container_to_host_schema_rejects_register_group_extensions_missing_version() 
 }
 
 #[test]
+fn container_to_host_schema_rejects_register_group_extensions_version_over_128() {
+    let schema_value = load_schema("container_to_host.schema.json");
+    let validator = jsonschema::validator_for(&schema_value).expect("compile schema");
+    let too_long_version = serde_json::json!({
+        "type": "command",
+        "command": "register_group",
+        "payload": {
+            "name": "new-group",
+            "extensions": {
+                "version": "x".repeat(129)
+            }
+        }
+    });
+    let err = validator
+        .validate(&too_long_version)
+        .expect_err("extensions.version >128 should fail schema");
+    assert!(
+        !err.to_string().is_empty(),
+        "schema validation should report a concrete error"
+    );
+}
+
+#[test]
+fn container_to_host_schema_rejects_register_group_extensions_over_32_properties() {
+    let schema_value = load_schema("container_to_host.schema.json");
+    let validator = jsonschema::validator_for(&schema_value).expect("compile schema");
+    let mut extensions = serde_json::Map::new();
+    extensions.insert(
+        "version".to_owned(),
+        serde_json::Value::String("1".to_owned()),
+    );
+    for i in 0..32 {
+        extensions.insert(format!("k{i}"), serde_json::Value::from(i));
+    }
+    let payload = serde_json::json!({
+        "type": "command",
+        "command": "register_group",
+        "payload": {
+            "name": "new-group",
+            "extensions": extensions
+        }
+    });
+    let err = validator
+        .validate(&payload)
+        .expect_err("extensions maxProperties should fail schema");
+    assert!(
+        !err.to_string().is_empty(),
+        "schema validation should report a concrete error"
+    );
+}
+
+#[test]
 fn container_to_host_schema_rejects_invalid_heartbeat_timestamp() {
     let schema_value = load_schema("container_to_host.schema.json");
     let validator = jsonschema::validator_for(&schema_value).expect("compile schema");

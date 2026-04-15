@@ -44,7 +44,7 @@ const HS_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn sample_group() -> GroupInfo {
     GroupInfo {
-        id: GroupId::from("group-main"),
+        id: GroupId::new("group-main").expect("valid group id"),
         name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
@@ -53,11 +53,11 @@ fn sample_group() -> GroupInfo {
 
 fn sample_init() -> InitPayload {
     InitPayload {
-        job_id: JobId::from("job-integration-1"),
+        job_id: JobId::new("job-integration-1").expect("valid job id"),
         context: InitContext {
             messages: HistoricalMessages::default(),
             group: GroupInfo {
-                id: GroupId::from("group-main"),
+                id: GroupId::new("group-main").expect("valid group id"),
                 name: "Main".parse().expect("valid name"),
                 is_main: true,
                 capabilities: GroupCapabilities::default(),
@@ -215,7 +215,7 @@ async fn full_duplex_exchange_after_handshake() {
 
     client
         .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
-            job_id: JobId::from("job-integration-1"),
+            job_id: JobId::new("job-integration-1").expect("valid job id"),
             result: Some("done".parse().expect("valid result")),
             session_id: None,
             token_usage: None,
@@ -344,7 +344,7 @@ async fn messages_exchange_after_init() {
             .await
             .expect("server handshake");
         conn.send_host(&HostToContainer::Messages(MessagesPayload {
-            job_id: JobId::from("job-integration-1"),
+            job_id: JobId::new("job-integration-1").expect("valid job id"),
             messages: vec![HistoricalMessage {
                 sender: "Alice".parse().expect("valid sender"),
                 text: "Also check the logs".parse().expect("valid text"),
@@ -368,7 +368,7 @@ async fn messages_exchange_after_init() {
 
     client
         .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
-            job_id: JobId::from("job-integration-1"),
+            job_id: JobId::new("job-integration-1").expect("valid job id"),
             result: Some("done".parse().expect("valid result")),
             session_id: None,
             token_usage: None,
@@ -394,18 +394,18 @@ async fn session_identity_survives_split_with_group_binding() {
             .await
             .expect("handshake");
         {
-            let id = conn.identity().lock().expect("lock");
+            let id = conn.identity();
             let group = id.group();
             assert!(group.is_main, "should be main group");
             assert!(id.is_main());
         }
         let (writer, reader) = conn.into_split();
         {
-            let id = writer.identity().lock().expect("lock");
+            let id = writer.identity();
             assert_eq!(id.group().id.as_ref(), "group-main");
         }
         {
-            let id = reader.identity().lock().expect("lock");
+            let id = reader.identity();
             assert_eq!(id.group().id.as_ref(), "group-main");
         }
     });
@@ -427,7 +427,7 @@ async fn handshake_rejects_group_mismatch() {
 
     let mut init = sample_init();
     init.context.group = GroupInfo {
-        id: GroupId::from("group-other"),
+        id: GroupId::new("group-other").expect("valid group id"),
         name: "Other".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities::default(),
@@ -461,7 +461,7 @@ async fn handshake_overwrites_same_id_different_metadata_from_session_identity()
     let server = IpcServer::bind(&path).expect("bind");
 
     let session_group = GroupInfo {
-        id: GroupId::from("group-main"),
+        id: GroupId::new("group-main").expect("valid group id"),
         name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
@@ -469,7 +469,7 @@ async fn handshake_overwrites_same_id_different_metadata_from_session_identity()
 
     let mut init = sample_init();
     init.context.group = GroupInfo {
-        id: GroupId::from("group-main"),
+        id: GroupId::new("group-main").expect("valid group id"),
         name: "Main (Updated)".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities { tanren: true },

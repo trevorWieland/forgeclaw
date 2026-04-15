@@ -21,7 +21,10 @@ const UNAUTHORIZED_LOG_EVERY: u64 = 10;
 #[path = "protocol_logging.rs"]
 mod logging;
 
-pub(super) use logging::{log_fatal_protocol_error, log_unauthorized_command, log_unknown_message};
+pub(super) use logging::{
+    log_fatal_protocol_error, log_outbound_validation_rejection, log_unauthorized_command,
+    log_unknown_message,
+};
 
 /// Per-connection runtime protocol state.
 #[derive(Debug, Clone)]
@@ -236,10 +239,14 @@ pub(super) fn enforce_outbound_state(
     msg: &HostToContainer,
     now: Instant,
 ) -> Result<LifecycleAction, IpcError> {
+    let phase_before = state.lifecycle.phase();
     let action = enforce_host_to_container(&mut state.lifecycle, msg)?;
     match msg {
         HostToContainer::Messages(_) => {
-            state.heartbeat_deadline = Some(now + DEFAULT_HEARTBEAT_TIMEOUT);
+            if matches!(phase_before, ConnectionPhase::Idle) {
+                // Only (re)arm heartbeat when entering Processing.
+                state.heartbeat_deadline = Some(now + DEFAULT_HEARTBEAT_TIMEOUT);
+            }
             state.draining_deadline = None;
             state.draining_timeout_ms = None;
         }
@@ -278,3 +285,7 @@ pub(super) fn enforce_inbound_state(
 #[cfg(test)]
 #[path = "protocol_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "protocol_logging_tests.rs"]
+mod logging_tests;

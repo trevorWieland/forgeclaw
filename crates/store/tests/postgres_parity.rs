@@ -146,8 +146,8 @@ async fn pg_concurrent_inserts_preserve_seq_ordering() {
     const N: usize = 32;
 
     let store = Arc::new(fresh_store().await);
-    let group = GroupId::from("pg-concurrent");
-    let channel = ChannelId::from("ch");
+    let group = GroupId::new("pg-concurrent").expect("valid group id");
+    let channel = ChannelId::new("ch").expect("valid channel id");
 
     let mut join_set: JoinSet<()> = JoinSet::new();
     for i in 0..N {

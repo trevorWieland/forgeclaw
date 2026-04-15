@@ -1,32 +1,35 @@
-use std::io::Write;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use forgeclaw_core::GroupId;
+use forgeclaw_core::{GroupId, JobId};
 use tokio::time::Instant;
-use tracing_subscriber::fmt::MakeWriter;
 
 use super::{
     ConnectionPhase, ConnectionState, UnauthorizedEnforcementAction, enforce_inbound_state,
-    enforce_outbound_state, log_fatal_protocol_error, record_unauthorized_rejection,
-    record_unauthorized_rejection_at,
+    enforce_outbound_state, record_unauthorized_rejection, record_unauthorized_rejection_at,
 };
-use crate::error::{FrameError, IpcError, ProtocolError};
+use crate::error::{IpcError, ProtocolError};
 use crate::message::{
-    CommandBody, CommandPayload, ContainerToHost, ErrorPayload, GroupCapabilities, GroupInfo,
-    HistoricalMessages, HostToContainer, MessagesPayload, OutputCompletePayload,
-    OutputDeltaPayload, ProgressPayload, SendMessagePayload, ShutdownPayload, ShutdownReason,
-    StopReason,
+    CommandBody, CommandPayload, ContainerToHost, ErrorPayload, HistoricalMessages,
+    HostToContainer, MessagesPayload, OutputCompletePayload, OutputDeltaPayload, ProgressPayload,
+    SendMessagePayload, ShutdownPayload, ShutdownReason, StopReason,
 };
-use crate::peer_cred::SessionIdentity;
+use crate::policy::DEFAULT_HEARTBEAT_TIMEOUT;
 use crate::policy::UnknownFrameBudget;
 use crate::server::UnauthorizedCommandLimitConfig;
 use crate::version::{PROTOCOL_VERSION, negotiate};
 
+fn group_id(value: &str) -> GroupId {
+    GroupId::new(value).expect("valid group id")
+}
+
+fn parse_job_id(value: &str) -> JobId {
+    JobId::new(value).expect("valid job id")
+}
+
 fn state_with_job(now: Instant, job_id: &str) -> ConnectionState {
     ConnectionState::new(
         now,
-        job_id.into(),
+        parse_job_id(job_id),
         negotiate(PROTOCOL_VERSION).expect("local version must negotiate"),
         UnauthorizedCommandLimitConfig::default(),
     )
@@ -34,13 +37,13 @@ fn state_with_job(now: Instant, job_id: &str) -> ConnectionState {
 
 fn idle_state(now: Instant, job_id: &str) -> ConnectionState {
     let mut state = state_with_job(now, job_id);
-    state.lifecycle = crate::lifecycle::LifecycleState::new(job_id.into());
+    state.lifecycle = crate::lifecycle::LifecycleState::new(parse_job_id(job_id));
     state.lifecycle.clone_from(&{
-        let mut lifecycle = crate::lifecycle::LifecycleState::new(job_id.into());
+        let mut lifecycle = crate::lifecycle::LifecycleState::new(parse_job_id(job_id));
         let _ = crate::lifecycle::enforce_container_to_host(
             &mut lifecycle,
             &ContainerToHost::OutputComplete(OutputCompletePayload {
-                job_id: job_id.into(),
+                job_id: parse_job_id(job_id),
                 result: None,
                 session_id: None,
                 token_usage: None,
@@ -109,7 +112,7 @@ fn lifecycle_transitions_are_enforced() {
     let err = enforce_outbound_state(
         &mut state,
         &HostToContainer::Messages(MessagesPayload {
-            job_id: "job-1".into(),
+            job_id: parse_job_id("job-1"),
             messages: HistoricalMessages::default(),
         }),
         now,
@@ -129,7 +132,7 @@ fn inbound_output_delta_rejected_when_idle() {
         &mut state,
         &ContainerToHost::OutputDelta(OutputDeltaPayload {
             text: "x".parse().expect("valid text"),
-            job_id: "job-1".into(),
+            job_id: parse_job_id("job-1"),
         }),
         now,
     )
@@ -147,7 +150,7 @@ fn inbound_output_complete_transitions_processing_to_idle() {
     enforce_inbound_state(
         &mut state,
         &ContainerToHost::OutputComplete(OutputCompletePayload {
-            job_id: "job-1".into(),
+            job_id: parse_job_id("job-1"),
             result: None,
             session_id: None,
             token_usage: None,
@@ -166,7 +169,7 @@ fn inbound_rejects_repeated_output_complete_while_draining() {
     enforce_inbound_state(
         &mut state,
         &ContainerToHost::OutputComplete(OutputCompletePayload {
-            job_id: "job-1".into(),
+            job_id: parse_job_id("job-1"),
             result: None,
             session_id: None,
             token_usage: None,
@@ -180,7 +183,7 @@ fn inbound_rejects_repeated_output_complete_while_draining() {
     let err = enforce_inbound_state(
         &mut state,
         &ContainerToHost::OutputComplete(OutputCompletePayload {
-            job_id: "job-1".into(),
+            job_id: parse_job_id("job-1"),
             result: None,
             session_id: None,
             token_usage: None,
@@ -203,7 +206,7 @@ fn inbound_rejects_command_when_idle() {
         &mut state,
         &ContainerToHost::Command(CommandPayload {
             body: CommandBody::SendMessage(SendMessagePayload {
-                target_group: "group-main".into(),
+                target_group: group_id("group-main"),
                 text: "hello".parse().expect("valid text"),
             }),
         }),
@@ -224,7 +227,7 @@ fn inbound_rejects_job_mismatch_for_output_delta() {
         &mut state,
         &ContainerToHost::OutputDelta(OutputDeltaPayload {
             text: "x".parse().expect("valid text"),
-            job_id: "job-2".into(),
+            job_id: parse_job_id("job-2"),
         }),
         now,
     )
@@ -242,7 +245,7 @@ fn inbound_rejects_job_mismatch_for_progress() {
     let err = enforce_inbound_state(
         &mut state,
         &ContainerToHost::Progress(ProgressPayload {
-            job_id: "job-2".into(),
+            job_id: parse_job_id("job-2"),
             stage: "stage".parse().expect("valid stage"),
             detail: None,
             percent: None,
@@ -266,7 +269,7 @@ fn inbound_rejects_job_mismatch_for_error_with_job() {
             code: crate::message::ErrorCode::AdapterError,
             message: "boom".parse().expect("valid error message"),
             fatal: false,
-            job_id: Some("job-2".into()),
+            job_id: Some(parse_job_id("job-2")),
         }),
         now,
     )
@@ -284,7 +287,7 @@ fn outbound_messages_reject_job_mismatch_during_processing() {
     let err = enforce_outbound_state(
         &mut state,
         &HostToContainer::Messages(MessagesPayload {
-            job_id: "job-2".into(),
+            job_id: parse_job_id("job-2"),
             messages: HistoricalMessages::default(),
         }),
         now,
@@ -303,7 +306,7 @@ fn outbound_messages_rebind_job_when_idle() {
     enforce_outbound_state(
         &mut state,
         &HostToContainer::Messages(MessagesPayload {
-            job_id: "job-2".into(),
+            job_id: parse_job_id("job-2"),
             messages: HistoricalMessages::default(),
         }),
         now,
@@ -311,6 +314,56 @@ fn outbound_messages_rebind_job_when_idle() {
     .expect("messages should rebind in idle");
     assert_eq!(state.lifecycle.phase(), ConnectionPhase::Processing);
     assert_eq!(state.lifecycle.active_job_id().as_ref(), "job-2");
+}
+
+#[test]
+fn outbound_messages_does_not_extend_processing_heartbeat_deadline() {
+    let now = Instant::now();
+    let mut state = state_with_job(now, "job-1");
+    let initial_deadline = state
+        .heartbeat_deadline
+        .expect("processing state should have heartbeat deadline");
+
+    let later = now + Duration::from_secs(10);
+    enforce_outbound_state(
+        &mut state,
+        &HostToContainer::Messages(MessagesPayload {
+            job_id: parse_job_id("job-1"),
+            messages: HistoricalMessages::default(),
+        }),
+        later,
+    )
+    .expect("messages allowed during processing");
+
+    assert_eq!(
+        state.heartbeat_deadline,
+        Some(initial_deadline),
+        "outbound messages must not refresh heartbeat while already processing"
+    );
+}
+
+#[test]
+fn outbound_messages_arms_fresh_heartbeat_when_reentering_processing_from_idle() {
+    let now = Instant::now();
+    let mut state = idle_state(now, "job-1");
+    state.heartbeat_deadline = None;
+    let later = now + Duration::from_secs(7);
+
+    enforce_outbound_state(
+        &mut state,
+        &HostToContainer::Messages(MessagesPayload {
+            job_id: parse_job_id("job-2"),
+            messages: HistoricalMessages::default(),
+        }),
+        later,
+    )
+    .expect("messages should re-enter processing from idle");
+
+    assert_eq!(
+        state.heartbeat_deadline,
+        Some(later + DEFAULT_HEARTBEAT_TIMEOUT),
+        "idle->processing should arm a new heartbeat deadline"
+    );
 }
 
 #[test]
@@ -359,7 +412,7 @@ fn unauthorized_limiter_applies_backoff_then_disconnects() {
     let now = Instant::now();
     let mut state = ConnectionState::new(
         now,
-        "job-1".into(),
+        parse_job_id("job-1"),
         negotiate(PROTOCOL_VERSION).expect("local version must negotiate"),
         UnauthorizedCommandLimitConfig {
             burst_capacity: 1,
@@ -380,112 +433,4 @@ fn unauthorized_limiter_applies_backoff_then_disconnects() {
     let third = record_unauthorized_rejection_at(&mut state, now + Duration::from_millis(10));
     assert_eq!(third.action, UnauthorizedEnforcementAction::Disconnect);
     assert_eq!(third.log.strikes, 2);
-}
-
-#[derive(Clone, Default)]
-struct CaptureWriter {
-    inner: Arc<Mutex<Vec<u8>>>,
-}
-
-impl CaptureWriter {
-    fn output(&self) -> String {
-        let bytes = self.inner.lock().expect("lock").clone();
-        String::from_utf8(bytes).expect("utf8 log output")
-    }
-}
-
-struct CaptureGuard {
-    inner: Arc<Mutex<Vec<u8>>>,
-}
-
-impl Write for CaptureGuard {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.inner.lock().expect("lock").extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for CaptureWriter {
-    type Writer = CaptureGuard;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        CaptureGuard {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-
-fn sample_identity() -> Arc<Mutex<SessionIdentity>> {
-    Arc::new(Mutex::new(SessionIdentity::new(
-        None,
-        GroupInfo {
-            id: GroupId::from("group-main"),
-            name: "Main".parse().expect("valid name"),
-            is_main: true,
-            capabilities: GroupCapabilities::default(),
-        },
-    )))
-}
-
-#[test]
-fn fatal_logging_includes_identity_and_error_class() {
-    let capture = CaptureWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .json()
-        .with_ansi(false)
-        .without_time()
-        .with_writer(capture.clone())
-        .finish();
-    let dispatch = tracing::Dispatch::new(subscriber);
-    let identity = sample_identity();
-    tracing::dispatcher::with_default(&dispatch, || {
-        log_fatal_protocol_error(
-            &identity,
-            "handshake",
-            &IpcError::Frame(FrameError::InvalidUtf8),
-        );
-    });
-    let output = capture.output();
-    assert!(
-        output.contains("\"protocol_phase\":\"handshake\""),
-        "{output}"
-    );
-    assert!(
-        output.contains("\"error_class\":\"frame_invalid_utf8\""),
-        "{output}"
-    );
-    assert!(output.contains("\"group_id\":\"group-main\""), "{output}");
-}
-
-#[test]
-fn fatal_logging_truncates_peer_controlled_protocol_version() {
-    let capture = CaptureWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .json()
-        .with_ansi(false)
-        .without_time()
-        .with_writer(capture.clone())
-        .finish();
-    let dispatch = tracing::Dispatch::new(subscriber);
-    let identity = sample_identity();
-    let long_peer = "x".repeat(8_000);
-    let err = IpcError::Protocol(ProtocolError::UnsupportedVersion {
-        peer: long_peer.clone(),
-        local: "1.0",
-    });
-
-    tracing::dispatcher::with_default(&dispatch, || {
-        log_fatal_protocol_error(&identity, "handshake", &err);
-    });
-
-    let output = capture.output();
-    assert!(output.contains("<truncated"), "{output}");
-    assert!(
-        !output.contains(&long_peer),
-        "full peer value leaked to logs"
-    );
 }

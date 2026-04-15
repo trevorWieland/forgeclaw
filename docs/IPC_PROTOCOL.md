@@ -17,6 +17,8 @@ The IPC protocol defines bidirectional communication between the Forgeclaw host 
 **Host Bind Policy** (Unix hardening):
 - The immediate socket parent directory must be mode `0700`.
 - The socket file is bound with mode `0600`.
+- Socket paths must be absolute and fail-closed normalized; `.` and `..`
+  traversal components are rejected.
 - Ancestor symlinks are rejected except vetted system aliases:
   - macOS: `/var -> /private/var`, `/tmp -> /private/tmp`
   - Linux: `/var/run -> /run`, `/var/lock -> /run/lock`
@@ -24,6 +26,8 @@ The IPC protocol defines bidirectional communication between the Forgeclaw host 
   stable and listener/path inode fingerprints must match. Any mismatch
   is a fail-closed bind-race error.
 - Guaranteed-supported deployment pattern: use a dedicated private host-owned directory and place the socket there.
+- Trusted path input is required: callers should treat the bind path as
+  host-authored configuration, not untrusted user/container input.
 
 ## Framing
 
@@ -43,6 +47,9 @@ All messages are length-prefixed JSON frames:
 ## Wire Constraints
 
 These constraints are normative for protocol `1.x`. Implementations must enforce them consistently in runtime validation and schema validation.
+Runtime enforcement applies on both:
+- inbound decode/receive paths, and
+- outbound send paths before serialization (invalid payloads are rejected and never written to the wire).
 
 | Field / Structure | Constraint |
 |---|---|
@@ -63,6 +70,11 @@ These constraints are normative for protocol `1.x`. Implementations must enforce
 | `session_id` | maxLength 128 |
 | self-improvement list item text (`scopes[]`, `acceptance_tests[]`) | maxLength 1024 |
 | `provider_proxy_url` | absolute `http(s)` URL, maxLength 2048 |
+| `register_group.extensions.version` | non-empty (contains `\\S`), maxLength 128 |
+| `register_group.extensions` | top-level maxProperties 32 (including `version`) |
+| `register_group.extensions` keys (all nesting levels) | maxLength 128 |
+| `register_group.extensions` JSON nesting | max depth 8 |
+| `register_group.extensions` encoded object size | max encoded bytes 65536 |
 
 For additive `1.x` changes, new fields may be introduced, but documented constraints on existing fields are never loosened silently.
 
@@ -215,6 +227,12 @@ The `capabilities` object is host-authoritative and determines which command fam
 
 `extensions` must be a JSON object when provided. Arrays/scalars are invalid.
 `extensions.version` is a required wire-contract field whenever `extensions` is present.
+`extensions.version` must be non-empty (contains at least one non-whitespace character) and maxLength 128.
+The `extensions` envelope is bounded for abuse resistance:
+- maxProperties 32 at the top level (including `version`),
+- key maxLength 128 (at all nesting levels),
+- max depth 8 for nested JSON values,
+- max encoded bytes 65536 for the full `extensions` object.
 All supported runtime versions enforce this requirement.
 
 #### `error`
@@ -393,12 +411,26 @@ minor-aware behavior gates can remain explicit and centralized.
   - 32 consecutive unknown frames, and
   - 1 MiB cumulative bytes across the current consecutive-unknown streak.
   On either limit breach, the host closes the connection. Any recognized message resets both unknown counters.
+  In addition, host-side implementations enforce independent non-consecutive abuse controls by default:
+  - total unknown-frame cap per connection lifetime,
+  - total unknown-byte cap per connection lifetime, and
+  - unknown-frame token-bucket rate limiting.
+  These controls are configurable and can be explicitly disabled for testing.
 - **Missing required field**: Treated as malformed. Socket closed.
 - **Job ID mismatch** (job-scoped message whose `job_id` does not match the active job): Treated as protocol violation. Socket closed.
 - **Socket disconnect without `output_complete`**: Host treats the in-progress job as failed. Container transitioned to `Exited` with error status.
 - **Heartbeat timeout** (no heartbeat for 60 seconds during `Processing`): Host sends `shutdown` with a short deadline, then kills the container if it doesn't respond.
+- **Blocked post-handshake write** (peer not reading): sender applies a
+  per-connection write deadline (default 5 seconds). Timeout is fatal:
+  connection is poisoned and closed.
+- Host outbound `messages` traffic does not reset the heartbeat timer;
+  only inbound container liveness signals (`heartbeat`) refresh the
+  processing heartbeat deadline.
 - **Lifecycle violation** (valid message at wrong phase): Host logs the violation and closes the connection.
-- **Unauthorized command abuse**: Single unauthorized commands are rejected and logged. Repeated unauthorized commands are connection-bounded with per-connection token-bucket controls (default: burst 8, refill 2/sec, 200ms backoff, disconnect after 5 exhausted-budget strikes).
+- **Unauthorized command abuse**: Single unauthorized commands are rejected and logged. Every unauthorized rejection is recorded at structured audit/debug level; warn/error channels may still be sampled for operator-noise control. Repeated unauthorized commands are connection-bounded with per-connection token-bucket controls (default: burst 8, refill 2/sec, 200ms backoff, disconnect after 5 exhausted-budget strikes).
+- **Peer credential policy rejection**: Host may fail closed at accept
+  time if captured OS peer credentials do not satisfy configured policy
+  (for example strict UID/GID in hardened mode).
 
 ## Implementing an Adapter
 

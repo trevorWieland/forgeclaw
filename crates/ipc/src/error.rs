@@ -148,6 +148,44 @@ pub enum ProtocolError {
         limit: usize,
     },
 
+    /// The peer exceeded the total unknown-message count budget for
+    /// the lifetime of a single connection.
+    ///
+    /// This budget is independent of the consecutive-streak counters.
+    #[error("too many unknown messages over connection lifetime: {count} (limit {limit})")]
+    TooManyUnknownMessagesTotal {
+        /// Total unknown-message frames observed on this connection.
+        count: usize,
+        /// Configured per-connection total limit.
+        limit: usize,
+    },
+
+    /// The peer exceeded the total unknown-message byte budget for
+    /// the lifetime of a single connection.
+    ///
+    /// This budget is independent of the consecutive-streak counters.
+    #[error(
+        "too many unknown message bytes over connection lifetime: {bytes} bytes (limit {limit})"
+    )]
+    TooManyUnknownBytesTotal {
+        /// Total unknown-message bytes observed on this connection.
+        bytes: usize,
+        /// Configured per-connection total byte limit.
+        limit: usize,
+    },
+
+    /// Unknown-message traffic exceeded the configured token-bucket
+    /// rate limiter.
+    #[error(
+        "unknown message rate limit exceeded: burst {burst_capacity}, refill {refill_per_second}/sec"
+    )]
+    UnknownMessageRateLimitExceeded {
+        /// Token-bucket burst capacity.
+        burst_capacity: u32,
+        /// Token refill rate per second.
+        refill_per_second: u32,
+    },
+
     /// A command was rejected because the session lacks the required
     /// authorization.
     ///
@@ -191,6 +229,23 @@ pub enum ProtocolError {
         init_group_id: GroupId,
         /// The group ID the host passed as the authoritative identity.
         session_group_id: GroupId,
+    },
+
+    /// Accept-time peer credential policy rejected the connection.
+    #[error(
+        "peer credential rejected: {reason} (expected uid={expected_uid:?}, gid={expected_gid:?}; actual uid={actual_uid:?}, gid={actual_gid:?})"
+    )]
+    PeerCredentialRejected {
+        /// Human-readable policy rejection reason.
+        reason: String,
+        /// Expected UID (if policy configured one).
+        expected_uid: Option<u32>,
+        /// Expected GID (if policy configured one).
+        expected_gid: Option<u32>,
+        /// Observed peer UID from OS credentials.
+        actual_uid: Option<u32>,
+        /// Observed peer GID from OS credentials.
+        actual_gid: Option<u32>,
     },
 
     /// A message was valid JSON but arrived at an illegal protocol
@@ -261,7 +316,24 @@ pub enum ProtocolError {
         /// Wire command name.
         command: &'static str,
         /// Validation failure reason.
-        reason: &'static str,
+        reason: String,
+    },
+
+    /// Outbound message validation rejected a would-be wire payload
+    /// before serialization.
+    #[error(
+        "outbound validation failed: {direction} message `{message_type}` field `{field_path}` — {reason}"
+    )]
+    OutboundValidation {
+        /// Message direction (`host_to_container` or
+        /// `container_to_host`).
+        direction: &'static str,
+        /// Wire `type` discriminator.
+        message_type: &'static str,
+        /// Dot-path to the failing field.
+        field_path: String,
+        /// Human-readable validation failure.
+        reason: String,
     },
 }
 
@@ -333,6 +405,7 @@ impl IpcError {
                     | ProtocolError::Unauthorized { .. }
                     | ProtocolError::HeartbeatTimeout { .. }
                     | ProtocolError::ShutdownDeadlineExceeded { .. }
+                    | ProtocolError::OutboundValidation { .. }
             ),
             Self::Serialize(_) | Self::Closed => false,
         }

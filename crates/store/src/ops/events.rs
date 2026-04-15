@@ -62,15 +62,24 @@ pub(crate) async fn list_events(
         .all(db)
         .await?;
 
-    Ok(rows.into_iter().map(row_to_stored).collect())
+    rows.into_iter().map(row_to_stored).collect()
 }
 
-fn row_to_stored(row: events::Model) -> StoredEvent {
-    StoredEvent {
+fn row_to_stored(row: events::Model) -> Result<StoredEvent, StoreError> {
+    Ok(StoredEvent {
         id: row.id,
         kind: row.kind,
-        group_id: row.group_id.map(GroupId::from),
+        group_id: row
+            .group_id
+            .map(|id| {
+                GroupId::new(id).map_err(|e| StoreError::SchemaDrift {
+                    table: Some("events".to_owned()),
+                    column: Some("group_id".to_owned()),
+                    reason: e.to_string(),
+                })
+            })
+            .transpose()?,
         payload: row.payload,
         created_at: row.created_at,
-    }
+    })
 }

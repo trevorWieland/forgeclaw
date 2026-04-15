@@ -44,7 +44,7 @@ fn sample_ready(version: &str) -> ReadyPayload {
 
 fn sample_init(group: &GroupInfo) -> InitPayload {
     InitPayload {
-        job_id: JobId::from("job-auth-1"),
+        job_id: JobId::new("job-auth-1").expect("valid job id"),
         context: InitContext {
             messages: HistoricalMessages::default(),
             group: group.clone(),
@@ -105,7 +105,7 @@ async fn setup_unauthorized_then_authorized_event_test(
     client
         .send(&ContainerToHost::Command(CommandPayload {
             body: CommandBody::SendMessage(SendMessagePayload {
-                target_group: GroupId::from("group-worker"),
+                target_group: GroupId::new("group-worker").expect("valid group id"),
                 text: "allowed".parse().expect("valid message"),
             }),
         }))
@@ -121,7 +121,7 @@ async fn default_recv_event_surfaces_unauthorized_then_continues_unsplit() {
     let dir = tempdir().expect("tempdir");
     let path = socket_path(&dir, "auth-default-unsplit.sock");
     let group = GroupInfo {
-        id: GroupId::from("group-worker"),
+        id: GroupId::new("group-worker").expect("valid group id"),
         name: "Worker".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities::default(),
@@ -150,7 +150,7 @@ async fn default_recv_event_surfaces_unauthorized_then_continues_split() {
     let dir = tempdir().expect("tempdir");
     let path = socket_path(&dir, "auth-default-split.sock");
     let group = GroupInfo {
-        id: GroupId::from("group-worker"),
+        id: GroupId::new("group-worker").expect("valid group id"),
         name: "Worker".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities::default(),
@@ -180,7 +180,7 @@ async fn negotiated_protocol_version_persisted_unsplit_for_peer_v1_0() {
     let path = socket_path(&dir, "auth-legacy-v1-0.sock");
     let server = IpcServer::bind(&path).expect("bind");
     let group = GroupInfo {
-        id: GroupId::from("group-main"),
+        id: GroupId::new("group-main").expect("valid group id"),
         name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
@@ -214,7 +214,7 @@ async fn negotiated_protocol_version_persisted_for_split_halves() {
     let path = socket_path(&dir, "auth-versioned-v1-0-split.sock");
     let server = IpcServer::bind(&path).expect("bind");
     let group = GroupInfo {
-        id: GroupId::from("group-main"),
+        id: GroupId::new("group-main").expect("valid group id"),
         name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),

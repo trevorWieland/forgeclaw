@@ -107,6 +107,16 @@ fn protocol_docs_publish_wire_constraints() {
     assert!(docs.contains("max 64 entries"));
     assert!(docs.contains("Core ID fields"));
     assert!(docs.contains("maxLength 128"));
+    assert!(docs.contains("outbound send paths before serialization"));
+    assert!(docs.contains("Every unauthorized rejection is recorded"));
+    assert!(docs.contains("total unknown-frame cap per connection lifetime"));
+    assert!(docs.contains("Trusted path input is required"));
+    assert!(docs.contains("Host outbound `messages` traffic does not reset the heartbeat timer"));
+    assert!(docs.contains("Peer credential policy rejection"));
+    assert!(docs.contains("extensions.version"));
+    assert!(docs.contains("maxProperties 32"));
+    assert!(docs.contains("max depth 8"));
+    assert!(docs.contains("max encoded bytes 65536"));
 }
 
 #[test]
@@ -169,4 +179,13 @@ fn committed_schema_encodes_128_char_bounds_for_command_ids() {
     assert_eq!(cancel_task_id["maxLength"], 128);
     let pause_task_id = &c2h_schema["$defs"]["PauseTaskPayload"]["properties"]["task_id"];
     assert_eq!(pause_task_id["maxLength"], 128);
+
+    let register_extensions =
+        &c2h_schema["$defs"]["RegisterGroupPayload"]["properties"]["extensions"];
+    assert_eq!(register_extensions["maxProperties"], 32);
+    assert_eq!(register_extensions["propertyNames"]["maxLength"], 128);
+    assert_eq!(
+        register_extensions["properties"]["version"]["maxLength"],
+        128
+    );
 }

@@ -46,7 +46,7 @@ fn sample_ready(version: &str) -> ReadyPayload {
 
 fn sample_group() -> GroupInfo {
     GroupInfo {
-        id: GroupId::from("group-main"),
+        id: GroupId::new("group-main").expect("valid group id"),
         name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
@@ -55,7 +55,7 @@ fn sample_group() -> GroupInfo {
 
 fn sample_init() -> InitPayload {
     InitPayload {
-        job_id: JobId::from("job-integration-1"),
+        job_id: JobId::new("job-integration-1").expect("valid job id"),
         context: InitContext {
             messages: HistoricalMessages::default(),
             group: sample_group(),
@@ -450,7 +450,7 @@ async fn unknown_budget_resets_after_recognized_message() {
     let delta = serde_json::to_vec(&ContainerToHost::OutputDelta(
         forgeclaw_ipc::OutputDeltaPayload {
             text: "delta".parse().expect("valid text"),
-            job_id: JobId::from("job-integration-1"),
+            job_id: JobId::new("job-integration-1").expect("valid job id"),
         },
     ))
     .expect("serialize");
@@ -467,7 +467,7 @@ async fn unknown_budget_resets_after_recognized_message() {
     }
     let complete = serde_json::to_vec(&ContainerToHost::OutputComplete(
         forgeclaw_ipc::OutputCompletePayload {
-            job_id: JobId::from("job-integration-1"),
+            job_id: JobId::new("job-integration-1").expect("valid job id"),
             result: Some("done".parse().expect("valid result")),
             session_id: None,
             token_usage: None,

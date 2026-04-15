@@ -10,30 +10,67 @@
 
 mod pending;
 mod protocol;
+mod transport_core;
 
 pub use pending::PendingClient;
 
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use forgeclaw_core::JobId;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::codec::{Framed, FramedRead, FramedWrite};
 
-use crate::codec::{
-    DEFAULT_MAX_UNKNOWN_SKIPS, FrameCodec, decode_host_to_container, encode_container_to_host,
-};
+use crate::codec::{DEFAULT_MAX_UNKNOWN_SKIPS, FrameCodec};
 use crate::error::{IpcError, ProtocolError};
 use crate::message::{ContainerToHost, HostToContainer};
 use crate::policy::{DEFAULT_MAX_UNKNOWN_BYTES, UnknownFrameBudget};
 use crate::recv_policy::UnknownTypePolicy;
 use crate::util::{SharedWriteHalf, ShutdownHandle, truncate_for_log};
 
-use self::protocol::{ClientConnectionState, enforce_inbound_state, enforce_outbound_state};
+use self::protocol::ClientConnectionState;
+use self::transport_core::{decode_and_enforce_inbound, preflight_and_enforce_outbound};
+
+/// Container-side client options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpcClientOptions {
+    /// Post-handshake write timeout for outbound sends.
+    pub write_timeout: Duration,
+}
+
+impl Default for IpcClientOptions {
+    fn default() -> Self {
+        Self {
+            write_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+fn log_outbound_validation_rejection(err: &IpcError) {
+    let IpcError::Protocol(ProtocolError::OutboundValidation {
+        direction,
+        message_type,
+        field_path,
+        reason,
+    }) = err
+    else {
+        return;
+    };
+    tracing::warn!(
+        target: "forgeclaw_ipc::client",
+        direction,
+        message_type,
+        field_path = %truncate_for_log(field_path),
+        reason = %truncate_for_log(reason),
+        "rejected outbound IPC message before serialization"
+    );
+}
 
 /// An established container-side IPC client.
 ///
@@ -47,7 +84,8 @@ pub struct IpcClient {
     poisoned: bool,
     unknown_budget: UnknownFrameBudget,
     last_frame_len: usize,
-    state: Arc<std::sync::Mutex<ClientConnectionState>>,
+    state: Arc<AsyncMutex<ClientConnectionState>>,
+    write_timeout: Duration,
 }
 
 impl IpcClient {
@@ -56,20 +94,31 @@ impl IpcClient {
     /// Returns a [`PendingClient`] that must complete the handshake
     /// before send/recv operations become available.
     pub async fn connect(path: impl AsRef<Path>) -> Result<PendingClient, IpcError> {
+        Self::connect_with_options(path, IpcClientOptions::default()).await
+    }
+
+    /// Connect to an IPC server using explicit client options.
+    pub async fn connect_with_options(
+        path: impl AsRef<Path>,
+        options: IpcClientOptions,
+    ) -> Result<PendingClient, IpcError> {
         let stream = UnixStream::connect(path.as_ref()).await?;
-        Ok(PendingClient::from_stream(stream))
+        Ok(PendingClient::from_stream(stream, options))
     }
 
     /// Construct from an already-handshaked transport.
-    pub(crate) fn from_parts(framed: Framed<UnixStream, FrameCodec>, active_job_id: JobId) -> Self {
+    pub(crate) fn from_parts(
+        framed: Framed<UnixStream, FrameCodec>,
+        active_job_id: JobId,
+        write_timeout: Duration,
+    ) -> Self {
         Self {
             framed,
             poisoned: false,
             unknown_budget: UnknownFrameBudget::default(),
             last_frame_len: 0,
-            state: Arc::new(std::sync::Mutex::new(ClientConnectionState::new(
-                active_job_id,
-            ))),
+            state: Arc::new(AsyncMutex::new(ClientConnectionState::new(active_job_id))),
+            write_timeout,
         }
     }
 
@@ -80,11 +129,11 @@ impl IpcClient {
         Ok(())
     }
 
-    fn with_state_mut<T>(
+    async fn with_state_mut<T>(
         &self,
         f: impl FnOnce(&mut ClientConnectionState) -> Result<T, IpcError>,
     ) -> Result<T, IpcError> {
-        let mut state = self.state.lock().map_err(|_| IpcError::Closed)?;
+        let mut state = self.state.lock().await;
         f(&mut state)
     }
 
@@ -96,26 +145,23 @@ impl IpcClient {
     /// Send a [`ContainerToHost`] message.
     pub async fn send(&mut self, msg: &ContainerToHost) -> Result<(), IpcError> {
         self.check_poisoned()?;
-        let close_after_send = match self.with_state_mut(|state| enforce_outbound_state(state, msg))
+        let (bytes, close_after_send): (Bytes, _) = match self
+            .with_state_mut(|state| preflight_and_enforce_outbound(state, msg))
+            .await
         {
-            Ok(action) => action,
+            Ok(result) => result,
             Err(e) => {
+                log_outbound_validation_rejection(&e);
                 if e.is_fatal() {
                     self.poison().await;
                 }
                 return Err(e);
             }
         };
-        let bytes: Bytes = match encode_container_to_host(msg) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                if e.is_fatal() {
-                    self.poison().await;
-                }
-                return Err(e);
-            }
+        let result = match tokio::time::timeout(self.write_timeout, self.framed.send(bytes)).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(IpcError::Timeout(self.write_timeout)),
         };
-        let result = self.framed.send(bytes).await;
         if let Err(ref e) = result {
             if e.is_fatal() {
                 self.poison().await;
@@ -140,18 +186,11 @@ impl IpcClient {
             }
         };
         self.last_frame_len = frame.len();
-        let msg = match decode_host_to_container(&frame) {
-            Ok(msg) => msg,
-            Err(e) => {
-                if e.is_fatal() {
-                    self.poison().await;
-                }
-                return Err(e);
-            }
-        };
-        let close_after_recv = match self.with_state_mut(|state| enforce_inbound_state(state, &msg))
+        let (msg, close_after_recv) = match self
+            .with_state_mut(|state| decode_and_enforce_inbound(state, &frame))
+            .await
         {
-            Ok(action) => action,
+            Ok(result) => result,
             Err(e) => {
                 if e.is_fatal() {
                     self.poison().await;
@@ -233,6 +272,7 @@ impl IpcClient {
                 writer,
                 poisoned: Arc::clone(&poisoned),
                 state: Arc::clone(&self.state),
+                write_timeout: self.write_timeout,
                 shutdown_handle: shutdown_handle.clone(),
             },
             IpcClientReader {
@@ -258,16 +298,17 @@ impl IpcClient {
 pub struct IpcClientWriter {
     writer: FramedWrite<SharedWriteHalf<tokio::net::unix::OwnedWriteHalf>, FrameCodec>,
     poisoned: Arc<AtomicBool>,
-    state: Arc<std::sync::Mutex<ClientConnectionState>>,
+    state: Arc<AsyncMutex<ClientConnectionState>>,
+    write_timeout: Duration,
     shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
 }
 
 impl IpcClientWriter {
-    fn with_state_mut<T>(
+    async fn with_state_mut<T>(
         &self,
         f: impl FnOnce(&mut ClientConnectionState) -> Result<T, IpcError>,
     ) -> Result<T, IpcError> {
-        let mut state = self.state.lock().map_err(|_| IpcError::Closed)?;
+        let mut state = self.state.lock().await;
         f(&mut state)
     }
 
@@ -276,10 +317,13 @@ impl IpcClientWriter {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(IpcError::Closed);
         }
-        let close_after_send = match self.with_state_mut(|state| enforce_outbound_state(state, msg))
+        let (bytes, close_after_send): (Bytes, _) = match self
+            .with_state_mut(|state| preflight_and_enforce_outbound(state, msg))
+            .await
         {
-            Ok(action) => action,
+            Ok(result) => result,
             Err(e) => {
+                log_outbound_validation_rejection(&e);
                 if e.is_fatal() {
                     self.poisoned.store(true, Ordering::Release);
                     self.shutdown_handle.trigger().await;
@@ -287,17 +331,10 @@ impl IpcClientWriter {
                 return Err(e);
             }
         };
-        let bytes: Bytes = match encode_container_to_host(msg) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                if e.is_fatal() {
-                    self.poisoned.store(true, Ordering::Release);
-                    self.shutdown_handle.trigger().await;
-                }
-                return Err(e);
-            }
+        let result = match tokio::time::timeout(self.write_timeout, self.writer.send(bytes)).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(IpcError::Timeout(self.write_timeout)),
         };
-        let result = self.writer.send(bytes).await;
         if let Err(ref e) = result {
             if e.is_fatal() {
                 self.poisoned.store(true, Ordering::Release);
@@ -322,15 +359,15 @@ pub struct IpcClientReader {
     shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
     unknown_budget: UnknownFrameBudget,
     last_frame_len: usize,
-    state: Arc<std::sync::Mutex<ClientConnectionState>>,
+    state: Arc<AsyncMutex<ClientConnectionState>>,
 }
 
 impl IpcClientReader {
-    fn with_state_mut<T>(
+    async fn with_state_mut<T>(
         &self,
         f: impl FnOnce(&mut ClientConnectionState) -> Result<T, IpcError>,
     ) -> Result<T, IpcError> {
-        let mut state = self.state.lock().map_err(|_| IpcError::Closed)?;
+        let mut state = self.state.lock().await;
         f(&mut state)
     }
 
@@ -355,18 +392,11 @@ impl IpcClientReader {
             }
         };
         self.last_frame_len = frame.len();
-        let msg = match decode_host_to_container(&frame) {
-            Ok(msg) => msg,
-            Err(e) => {
-                if e.is_fatal() {
-                    self.poison().await;
-                }
-                return Err(e);
-            }
-        };
-        let close_after_recv = match self.with_state_mut(|state| enforce_inbound_state(state, &msg))
+        let (msg, close_after_recv) = match self
+            .with_state_mut(|state| decode_and_enforce_inbound(state, &frame))
+            .await
         {
-            Ok(action) => action,
+            Ok(result) => result,
             Err(e) => {
                 if e.is_fatal() {
                     self.poison().await;

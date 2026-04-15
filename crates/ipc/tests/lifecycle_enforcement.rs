@@ -44,7 +44,7 @@ fn sample_ready(version: &str) -> ReadyPayload {
 
 fn sample_group() -> GroupInfo {
     GroupInfo {
-        id: GroupId::from("group-main"),
+        id: GroupId::new("group-main").expect("valid group id"),
         name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
@@ -53,7 +53,7 @@ fn sample_group() -> GroupInfo {
 
 fn sample_init() -> InitPayload {
     InitPayload {
-        job_id: JobId::from("job-integration-1"),
+        job_id: JobId::new("job-integration-1").expect("valid job id"),
         context: InitContext {
             messages: HistoricalMessages::default(),
             group: sample_group(),
@@ -115,7 +115,7 @@ async fn lifecycle_rejects_output_delta_after_idle_without_messages() {
         .expect("client handshake");
     client
         .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
-            job_id: JobId::from("job-integration-1"),
+            job_id: JobId::new("job-integration-1").expect("valid job id"),
             result: None,
             session_id: None,
             token_usage: None,
@@ -128,7 +128,7 @@ async fn lifecycle_rejects_output_delta_after_idle_without_messages() {
         .send(&ContainerToHost::OutputDelta(
             forgeclaw_ipc::OutputDeltaPayload {
                 text: "late delta".parse().expect("valid text"),
-                job_id: JobId::from("job-integration-1"),
+                job_id: JobId::new("job-integration-1").expect("valid job id"),
             },
         ))
         .await
@@ -156,7 +156,7 @@ async fn lifecycle_rejects_messages_after_shutdown() {
         .await
         .expect("send shutdown");
         conn.send_host(&HostToContainer::Messages(MessagesPayload {
-            job_id: JobId::from("job-integration-1"),
+            job_id: JobId::new("job-integration-1").expect("valid job id"),
             messages: vec![HistoricalMessage {
                 sender: "Alice".parse().expect("valid sender"),
                 text: "follow-up".parse().expect("valid text"),
@@ -211,7 +211,7 @@ async fn lifecycle_rejects_command_after_output_complete_until_messages() {
         .expect("client handshake");
     client
         .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
-            job_id: JobId::from("job-integration-1"),
+            job_id: JobId::new("job-integration-1").expect("valid job id"),
             result: None,
             session_id: None,
             token_usage: None,
@@ -222,7 +222,7 @@ async fn lifecycle_rejects_command_after_output_complete_until_messages() {
     client
         .send(&ContainerToHost::Command(CommandPayload {
             body: CommandBody::SendMessage(SendMessagePayload {
-                target_group: GroupId::from("group-main"),
+                target_group: GroupId::new("group-main").expect("valid group id"),
                 text: "late command".parse().expect("valid text"),
             }),
         }))
@@ -264,7 +264,7 @@ async fn lifecycle_rejects_repeated_output_complete_while_draining() {
     assert!(matches!(msg, HostToContainer::Shutdown(_)));
     client
         .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
-            job_id: JobId::from("job-integration-1"),
+            job_id: JobId::new("job-integration-1").expect("valid job id"),
             result: None,
             session_id: None,
             token_usage: None,
@@ -274,7 +274,7 @@ async fn lifecycle_rejects_repeated_output_complete_while_draining() {
         .expect("first completion");
     client
         .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
-            job_id: JobId::from("job-integration-1"),
+            job_id: JobId::new("job-integration-1").expect("valid job id"),
             result: None,
             session_id: None,
             token_usage: None,

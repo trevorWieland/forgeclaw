@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use tokio::net::UnixListener;
 
-use crate::error::IpcError;
+use crate::error::{IpcError, ProtocolError};
 use crate::message::shared::GroupInfo;
-use crate::peer_cred::{self, SessionIdentity};
+use crate::peer_cred::{self, PeerCredentials, SessionIdentity};
+use crate::policy::UnknownTrafficLimitConfig;
 
 use super::PendingConnection;
 
@@ -36,11 +37,148 @@ impl Default for UnauthorizedCommandLimitConfig {
     }
 }
 
+/// Error returned when peer-credential policy rejects an accepted peer.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{reason}")]
+pub struct PeerCredentialPolicyError {
+    /// Human-readable reason for policy rejection.
+    pub reason: String,
+}
+
+impl PeerCredentialPolicyError {
+    /// Create a new policy rejection reason.
+    #[must_use]
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Peer-credential authorization policy for accepted connections.
+type PeerCredentialPolicyCallback = dyn Fn(Option<PeerCredentials>, &GroupInfo) -> Result<(), PeerCredentialPolicyError>
+    + Send
+    + Sync;
+
+/// Peer-credential authorization policy for accepted connections.
+#[derive(Default)]
+pub enum PeerCredentialPolicy {
+    /// Capture credentials for audit context but do not gate accept.
+    #[default]
+    CaptureOnly,
+    /// Require exact UID/GID match when provided.
+    RequireExact {
+        /// Expected peer UID, if configured.
+        uid: Option<u32>,
+        /// Expected peer GID, if configured.
+        gid: Option<u32>,
+    },
+    /// Custom caller-provided authorization callback.
+    Custom(Arc<PeerCredentialPolicyCallback>),
+}
+
+impl std::fmt::Debug for PeerCredentialPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CaptureOnly => f.write_str("CaptureOnly"),
+            Self::RequireExact { uid, gid } => f
+                .debug_struct("RequireExact")
+                .field("uid", uid)
+                .field("gid", gid)
+                .finish(),
+            Self::Custom(_) => f.write_str("Custom(..)"),
+        }
+    }
+}
+
+impl Clone for PeerCredentialPolicy {
+    fn clone(&self) -> Self {
+        match self {
+            Self::CaptureOnly => Self::CaptureOnly,
+            Self::RequireExact { uid, gid } => Self::RequireExact {
+                uid: *uid,
+                gid: *gid,
+            },
+            Self::Custom(callback) => Self::Custom(Arc::clone(callback)),
+        }
+    }
+}
+
+impl PeerCredentialPolicy {
+    fn enforce(&self, creds: Option<PeerCredentials>, group: &GroupInfo) -> Result<(), IpcError> {
+        match self {
+            Self::CaptureOnly => Ok(()),
+            Self::RequireExact { uid, gid } => {
+                let observed = creds.map(|cred| (cred.uid, cred.gid));
+                if uid.is_some() && *uid != observed.map(|(value, _)| value) {
+                    return Err(IpcError::Protocol(ProtocolError::PeerCredentialRejected {
+                        reason: "peer uid mismatch".to_owned(),
+                        expected_uid: *uid,
+                        expected_gid: *gid,
+                        actual_uid: observed.map(|(value, _)| value),
+                        actual_gid: observed.map(|(_, value)| value),
+                    }));
+                }
+                if gid.is_some() && *gid != observed.map(|(_, value)| value) {
+                    return Err(IpcError::Protocol(ProtocolError::PeerCredentialRejected {
+                        reason: "peer gid mismatch".to_owned(),
+                        expected_uid: *uid,
+                        expected_gid: *gid,
+                        actual_uid: observed.map(|(value, _)| value),
+                        actual_gid: observed.map(|(_, value)| value),
+                    }));
+                }
+                Ok(())
+            }
+            Self::Custom(callback) => callback(creds, group).map_err(|e| {
+                IpcError::Protocol(ProtocolError::PeerCredentialRejected {
+                    reason: e.reason,
+                    expected_uid: None,
+                    expected_gid: None,
+                    actual_uid: creds.map(|c| c.uid),
+                    actual_gid: creds.map(|c| c.gid),
+                })
+            }),
+        }
+    }
+}
+
 /// Host-side server options.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone)]
 pub struct IpcServerOptions {
     /// Unauthorized-command limiter config for accepted connections.
     pub unauthorized_limit: UnauthorizedCommandLimitConfig,
+    /// Unknown-message abuse controls for accepted connections.
+    ///
+    /// Defaults are enabled. Set individual fields to `0` to disable
+    /// specific controls explicitly.
+    pub unknown_traffic_limit: UnknownTrafficLimitConfig,
+    /// Peer-credential authorization policy at accept time.
+    pub peer_credential_policy: PeerCredentialPolicy,
+    /// Post-handshake write timeout for outbound sends.
+    pub write_timeout: Duration,
+}
+
+impl IpcServerOptions {
+    /// Hardened option preset with strict peer credential matching.
+    #[must_use]
+    pub fn hardened(uid: Option<u32>, gid: Option<u32>) -> Self {
+        Self {
+            peer_credential_policy: PeerCredentialPolicy::RequireExact { uid, gid },
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for IpcServerOptions {
+    fn default() -> Self {
+        Self {
+            unauthorized_limit: UnauthorizedCommandLimitConfig::default(),
+            unknown_traffic_limit: UnknownTrafficLimitConfig::default(),
+            peer_credential_policy: PeerCredentialPolicy::default(),
+            write_timeout: Duration::from_secs(5),
+        }
+    }
 }
 
 /// Unix-socket server for the host side of the IPC protocol.
@@ -155,11 +293,25 @@ impl IpcServer {
             );
             IpcError::Io(e)
         })?;
-        let identity = Arc::new(std::sync::Mutex::new(SessionIdentity::new(creds, group)));
+        if let Err(e) = self.options.peer_credential_policy.enforce(creds, &group) {
+            tracing::warn!(
+                target: "forgeclaw_ipc::server",
+                peer_uid = creds.map(|c| c.uid),
+                peer_gid = creds.map(|c| c.gid),
+                group_id = %group.id.as_ref(),
+                group_name = %group.name.as_ref(),
+                error = %e,
+                "peer-credential policy rejected connection"
+            );
+            return Err(e);
+        }
+        let identity = Arc::new(SessionIdentity::new(creds, group));
         Ok(PendingConnection::from_stream(
             stream,
             identity,
             self.options.unauthorized_limit,
+            self.options.unknown_traffic_limit,
+            self.options.write_timeout,
         ))
     }
 
@@ -300,61 +452,5 @@ fn clean_stale_socket(path: &Path) -> Result<(), IpcError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::net::UnixListener;
-    use tempfile::tempdir;
-
-    #[test]
-    fn stale_socket_is_unlinked() {
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("stale.sock");
-        // Create a socket and immediately drop the listener (stale).
-        let listener = UnixListener::bind(&path).expect("bind");
-        drop(listener);
-        assert!(path.exists(), "socket file should exist after drop");
-        clean_stale_socket(&path).expect("should clean stale socket");
-        assert!(!path.exists(), "stale socket should be removed");
-    }
-
-    #[test]
-    fn live_socket_returns_addr_in_use() {
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("live.sock");
-        let _listener = UnixListener::bind(&path).expect("bind");
-        let err = clean_stale_socket(&path).expect_err("should fail");
-        assert!(
-            matches!(&err, IpcError::Io(e) if e.kind() == std::io::ErrorKind::AddrInUse),
-            "expected AddrInUse, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn non_connection_refused_probe_does_not_unlink() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("perm.sock");
-        // Create a stale socket, then remove all permissions so the
-        // connect probe gets PermissionDenied instead of
-        // ConnectionRefused.
-        let listener = UnixListener::bind(&path).expect("bind");
-        drop(listener);
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
-        let err = clean_stale_socket(&path).expect_err("should fail");
-        assert!(
-            matches!(&err, IpcError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
-            "expected PermissionDenied, got {err:?}"
-        );
-        // File should NOT have been unlinked.
-        assert!(path.exists(), "socket should still exist");
-        // Restore permissions for cleanup.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("restore");
-    }
-
-    #[test]
-    fn missing_path_is_ok() {
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("nonexistent.sock");
-        clean_stale_socket(&path).expect("missing path should succeed");
-    }
-}
+#[path = "listener_tests.rs"]
+mod tests;

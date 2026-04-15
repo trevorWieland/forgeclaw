@@ -5,20 +5,20 @@
 //!
 //! ## Construction
 //!
-//! - **Validated** — [`GroupId::new()`] (and the same for every ID type)
-//!   rejects empty/whitespace-only values and values longer than 128
-//!   characters with an [`IdError`]. Use this at ingress boundaries
-//!   (config loading, API endpoints, IPC).
+//! IDs are always validated:
+//! - [`GroupId::new()`] (and same for every ID type)
+//! - `str::parse::<GroupId>()`
+//! - [`TryFrom<String>`] / [`TryFrom<&str>`]
 //!
-//! - **Unchecked** — [`From<String>`] / [`From<&str>`] accept any value
-//!   without validation.  Use only in internal code that has already
-//!   validated the input or in tests.
+//! Construction rejects empty/whitespace-only values and values longer
+//! than 128 characters with an [`IdError`].
 //!
-//! Deserialization (`serde::Deserialize`) uses the validated path — empty
-//! or whitespace-only strings are rejected at parse time.
+//! Deserialization (`serde::Deserialize`) also uses the validated path —
+//! empty or whitespace-only strings are rejected at parse time.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::str::FromStr;
 
 const MAX_ID_CHARS: usize = 128;
 
@@ -33,8 +33,9 @@ pub struct IdError {
 /// Generate a newtype ID wrapper around `String`.
 ///
 /// Each generated type implements `Debug`, `Clone`, `PartialEq`, `Eq`, `Hash`,
-/// `Display`, `Serialize`, `From<String>`, `From<&str>`, and `AsRef<str>`,
-/// plus a validated `new()` constructor and a custom `Deserialize` that
+/// `Display`, `Serialize`, `FromStr`, `TryFrom<String>`, `TryFrom<&str>`,
+/// and `AsRef<str>`, plus a validated `new()` constructor and a custom
+/// `Deserialize` that
 /// rejects empty/whitespace values and values over 128 characters.
 macro_rules! define_id {
     ($(#[doc = $doc:expr] $name:ident),+ $(,)?) => {
@@ -73,7 +74,7 @@ macro_rules! define_id {
                 /// Create a validated ID, rejecting empty or whitespace-only
                 /// values and values longer than 128 characters.
                 ///
-                /// Prefer this over `From` at ingress boundaries.
+                /// Prefer this at ingress boundaries.
                 ///
                 /// # Errors
                 ///
@@ -108,15 +109,27 @@ macro_rules! define_id {
                 }
             }
 
-            impl From<String> for $name {
-                fn from(s: String) -> Self {
-                    Self(s)
+            impl FromStr for $name {
+                type Err = IdError;
+
+                fn from_str(s: &str) -> Result<Self, Self::Err> {
+                    Self::new(s)
                 }
             }
 
-            impl From<&str> for $name {
-                fn from(s: &str) -> Self {
-                    Self(s.to_owned())
+            impl TryFrom<String> for $name {
+                type Error = IdError;
+
+                fn try_from(value: String) -> Result<Self, Self::Error> {
+                    Self::new(value)
+                }
+            }
+
+            impl TryFrom<&str> for $name {
+                type Error = IdError;
+
+                fn try_from(value: &str) -> Result<Self, Self::Error> {
+                    Self::new(value)
                 }
             }
 

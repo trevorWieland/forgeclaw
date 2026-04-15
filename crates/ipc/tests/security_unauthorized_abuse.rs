@@ -43,7 +43,7 @@ fn sample_ready(version: &str) -> ReadyPayload {
 
 fn sample_init(group: &GroupInfo) -> InitPayload {
     InitPayload {
-        job_id: JobId::from("job-auth-1"),
+        job_id: JobId::new("job-auth-1").expect("valid job id"),
         context: InitContext {
             messages: HistoricalMessages::default(),
             group: group.clone(),
@@ -80,11 +80,12 @@ async fn run_unauthorized_abuse_sequence(path: &std::path::Path, split: bool) ->
                 backoff: Duration::from_millis(5),
                 disconnect_after_strikes: 2,
             },
+            ..IpcServerOptions::default()
         },
     )
     .expect("bind");
     let group = GroupInfo {
-        id: GroupId::from("group-worker"),
+        id: GroupId::new("group-worker").expect("valid group id"),
         name: "Worker".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities::default(),

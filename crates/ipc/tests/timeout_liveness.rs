@@ -6,8 +6,8 @@ use std::time::Duration;
 use forgeclaw_core::{GroupId, JobId};
 use forgeclaw_ipc::{
     ContainerToHost, GroupCapabilities, GroupInfo, HistoricalMessages, HostToContainer, InitConfig,
-    InitContext, InitPayload, IpcClient, IpcError, IpcServer, ProtocolError, ReadyPayload,
-    ShutdownPayload, ShutdownReason,
+    InitContext, InitPayload, IpcClient, IpcError, IpcServer, MessagesPayload, ProtocolError,
+    ReadyPayload, ShutdownPayload, ShutdownReason,
 };
 use tempfile::tempdir;
 use tokio::io::AsyncWriteExt;
@@ -44,7 +44,7 @@ fn sample_ready(version: &str) -> ReadyPayload {
 
 fn sample_group() -> GroupInfo {
     GroupInfo {
-        id: GroupId::from("group-main"),
+        id: GroupId::new("group-main").expect("valid group id"),
         name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
@@ -53,7 +53,7 @@ fn sample_group() -> GroupInfo {
 
 fn sample_init() -> InitPayload {
     InitPayload {
-        job_id: JobId::from("job-integration-1"),
+        job_id: JobId::new("job-integration-1").expect("valid job id"),
         context: InitContext {
             messages: HistoricalMessages::default(),
             group: sample_group(),
@@ -223,6 +223,111 @@ async fn heartbeat_timeout_during_processing_split_reader() {
     );
     let shutdown = client.recv().await.expect("recv shutdown");
     assert!(matches!(shutdown, HostToContainer::Shutdown(_)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn outbound_messages_near_deadline_do_not_extend_heartbeat_timeout_unsplit() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ipc-heartbeat-unsplit-no-extend.sock");
+    let server = IpcServer::bind(&path).expect("bind");
+
+    let accept_task = tokio::spawn(async move {
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (mut conn, _ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
+            .await
+            .expect("handshake");
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        conn.send_host(&HostToContainer::Messages(MessagesPayload {
+            job_id: JobId::new("job-integration-1").expect("valid job id"),
+            messages: HistoricalMessages::default(),
+        }))
+        .await
+        .expect("follow-up messages should be allowed");
+        conn.recv_event()
+            .await
+            .expect_err("should timeout at original deadline")
+    });
+
+    let pending = IpcClient::connect(&path).await.expect("connect");
+    let (_client, _init) = pending
+        .handshake(sample_ready("1.0"), HS_TIMEOUT)
+        .await
+        .expect("client handshake");
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(61)).await;
+    tokio::task::yield_now().await;
+
+    assert!(
+        accept_task.is_finished(),
+        "server must timeout at 60s even if host sends follow-up messages at t=59s"
+    );
+    let err = accept_task.await.expect("join");
+    assert!(
+        matches!(
+            err,
+            IpcError::Protocol(ProtocolError::HeartbeatTimeout {
+                phase: "processing",
+                timeout_secs: 60
+            })
+        ),
+        "expected HeartbeatTimeout, got {err:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn outbound_messages_near_deadline_do_not_extend_heartbeat_timeout_split_reader() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ipc-heartbeat-split-no-extend.sock");
+    let server = IpcServer::bind(&path).expect("bind");
+
+    let accept_task = tokio::spawn(async move {
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (conn, _ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
+            .await
+            .expect("handshake");
+        let (mut writer, mut reader) = conn.into_split();
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        writer
+            .send_host(&HostToContainer::Messages(MessagesPayload {
+                job_id: JobId::new("job-integration-1").expect("valid job id"),
+                messages: HistoricalMessages::default(),
+            }))
+            .await
+            .expect("follow-up messages should be allowed");
+        reader
+            .recv_event()
+            .await
+            .expect_err("should timeout at original deadline")
+    });
+
+    let pending = IpcClient::connect(&path).await.expect("connect");
+    let (_client, _init) = pending
+        .handshake(sample_ready("1.0"), HS_TIMEOUT)
+        .await
+        .expect("client handshake");
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(61)).await;
+    tokio::task::yield_now().await;
+
+    assert!(
+        accept_task.is_finished(),
+        "split reader must timeout at 60s even if writer sends follow-up messages at t=59s"
+    );
+    let err = accept_task.await.expect("join");
+    assert!(
+        matches!(
+            err,
+            IpcError::Protocol(ProtocolError::HeartbeatTimeout {
+                phase: "processing",
+                timeout_secs: 60
+            })
+        ),
+        "expected HeartbeatTimeout, got {err:?}"
+    );
 }
 
 #[tokio::test(start_paused = true)]

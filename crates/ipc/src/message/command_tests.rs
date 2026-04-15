@@ -14,7 +14,7 @@ fn sample_extensions() -> GroupExtensions {
 fn send_message_roundtrip() {
     let cmd = CommandPayload {
         body: CommandBody::SendMessage(SendMessagePayload {
-            target_group: GroupId::from("group-main"),
+            target_group: GroupId::new("group-main").expect("valid group id"),
             text: "Task completed successfully.".parse().expect("valid text"),
         }),
     };
@@ -30,7 +30,7 @@ fn send_message_roundtrip() {
 fn schedule_task_roundtrip() {
     let cmd = CommandPayload {
         body: CommandBody::ScheduleTask(ScheduleTaskPayload {
-            group: GroupId::from("group-main"),
+            group: GroupId::new("group-main").expect("valid group id"),
             schedule_type: ScheduleType::Cron,
             schedule_value: "0 9 * * *".parse().expect("valid schedule"),
             prompt: "Check status".parse().expect("valid prompt"),
@@ -48,7 +48,7 @@ fn schedule_task_roundtrip() {
 fn schedule_task_omits_context_mode_when_none() {
     let cmd = CommandPayload {
         body: CommandBody::ScheduleTask(ScheduleTaskPayload {
-            group: GroupId::from("g"),
+            group: GroupId::new("g").expect("valid group id"),
             schedule_type: ScheduleType::Once,
             schedule_value: "2026-04-12T00:00:00Z".parse().expect("valid schedule"),
             prompt: "p".parse().expect("valid prompt"),
@@ -64,7 +64,7 @@ fn schedule_task_omits_context_mode_when_none() {
 fn pause_task_roundtrip() {
     let cmd = CommandPayload {
         body: CommandBody::PauseTask(PauseTaskPayload {
-            task_id: TaskId::from("task-1"),
+            task_id: TaskId::new("task-1").expect("valid task id"),
         }),
     };
     let json = serde_json::to_value(&cmd).expect("serialize");
@@ -78,7 +78,7 @@ fn pause_task_roundtrip() {
 fn cancel_task_roundtrip() {
     let cmd = CommandPayload {
         body: CommandBody::CancelTask(CancelTaskPayload {
-            task_id: TaskId::from("task-2"),
+            task_id: TaskId::new("task-2").expect("valid task id"),
         }),
     };
     let json = serde_json::to_value(&cmd).expect("serialize");
@@ -114,6 +114,18 @@ fn group_extensions_version_rejects_whitespace_only() {
 }
 
 #[test]
+fn group_extensions_version_rejects_over_128_chars() {
+    let err = GroupExtensionsVersion::new("x".repeat(129)).expect_err("overflow must fail");
+    assert!(matches!(
+        err,
+        GroupExtensionsVersionError::TooLong {
+            max: 128,
+            actual: 129
+        }
+    ));
+}
+
+#[test]
 fn group_extensions_with_data_rejects_reserved_key() {
     let mut data = serde_json::Map::new();
     data.insert("version".to_owned(), json!("bad"));
@@ -129,6 +141,66 @@ fn group_extensions_insert_rejects_reserved_key() {
         .insert("version", json!("x"))
         .expect_err("reserved key must fail");
     assert!(matches!(err, GroupExtensionsError::ReservedKey(_)));
+}
+
+#[test]
+fn group_extensions_rejects_more_than_32_total_properties() {
+    let mut data = serde_json::Map::new();
+    for i in 0..32 {
+        data.insert(format!("k{i}"), json!(i));
+    }
+    let err = GroupExtensions::with_data(GroupExtensionsVersion::new("1").expect("valid"), data)
+        .expect_err("more than 32 total properties should fail");
+    assert!(matches!(
+        err,
+        GroupExtensionsError::TooManyProperties {
+            max: 32,
+            actual: 33
+        }
+    ));
+}
+
+#[test]
+fn group_extensions_rejects_overlong_key() {
+    let mut ext = GroupExtensions::new(GroupExtensionsVersion::new("1").expect("valid"));
+    let key = "k".repeat(129);
+    let err = ext
+        .insert(key, json!(true))
+        .expect_err("overlong key should fail");
+    assert!(matches!(err, GroupExtensionsError::KeyTooLong { .. }));
+}
+
+#[test]
+fn group_extensions_rejects_depth_over_8() {
+    let deep = json!([[[[[[[["too deep"]]]]]]]]);
+    let mut data = serde_json::Map::new();
+    data.insert("nested".to_owned(), deep);
+    let err = GroupExtensions::with_data(GroupExtensionsVersion::new("1").expect("valid"), data)
+        .expect_err("depth > 8 should fail");
+    assert!(matches!(err, GroupExtensionsError::MaxDepthExceeded { .. }));
+}
+
+#[test]
+fn group_extensions_rejects_encoded_size_over_64kib() {
+    let mut data = serde_json::Map::new();
+    data.insert("blob".to_owned(), json!("x".repeat(70_000)));
+    let err = GroupExtensions::with_data(GroupExtensionsVersion::new("1").expect("valid"), data)
+        .expect_err("encoded size over 64KiB should fail");
+    assert!(matches!(
+        err,
+        GroupExtensionsError::EncodedBytesExceeded { .. }
+    ));
+}
+
+#[test]
+fn group_extensions_accepts_boundary_limits() {
+    let mut data = serde_json::Map::new();
+    for i in 0..31 {
+        data.insert(format!("k{i}"), json!(i));
+    }
+    let ext = GroupExtensions::with_data(GroupExtensionsVersion::new("1").expect("valid"), data)
+        .expect("31 extension keys + version should pass");
+    assert_eq!(ext.data().len(), 31);
 }
 
 #[test]
@@ -210,21 +282,21 @@ fn dispatch_self_improvement_roundtrip() {
 fn classify_returns_scoped_for_group_commands() {
     let scoped_commands = [
         CommandBody::SendMessage(SendMessagePayload {
-            target_group: GroupId::from("g"),
+            target_group: GroupId::new("g").expect("valid group id"),
             text: "t".parse().expect("valid text"),
         }),
         CommandBody::ScheduleTask(ScheduleTaskPayload {
-            group: GroupId::from("g"),
+            group: GroupId::new("g").expect("valid group id"),
             schedule_type: ScheduleType::Once,
             schedule_value: "v".parse().expect("valid schedule"),
             prompt: "p".parse().expect("valid prompt"),
             context_mode: None,
         }),
         CommandBody::PauseTask(PauseTaskPayload {
-            task_id: TaskId::from("t"),
+            task_id: TaskId::new("t").expect("valid task id"),
         }),
         CommandBody::CancelTask(CancelTaskPayload {
-            task_id: TaskId::from("t"),
+            task_id: TaskId::new("t").expect("valid task id"),
         }),
         CommandBody::DispatchTanren(DispatchTanrenPayload {
             project: "p".parse().expect("valid project"),

@@ -15,7 +15,7 @@ pub(crate) async fn get_group(
     let row = groups::Entity::find_by_id(id.as_ref().to_owned())
         .one(db)
         .await?;
-    Ok(row.map(row_to_registered))
+    row.map(row_to_registered).transpose()
 }
 
 /// Upsert a group, preserving `created_at` on conflict.
@@ -47,13 +47,17 @@ pub(crate) async fn upsert_group(
     Ok(())
 }
 
-fn row_to_registered(row: groups::Model) -> RegisteredGroup {
-    RegisteredGroup {
-        id: GroupId::from(row.id),
+fn row_to_registered(row: groups::Model) -> Result<RegisteredGroup, StoreError> {
+    Ok(RegisteredGroup {
+        id: GroupId::new(row.id).map_err(|e| StoreError::SchemaDrift {
+            table: Some("groups".to_owned()),
+            column: Some("id".to_owned()),
+            reason: e.to_string(),
+        })?,
         display_name: row.display_name,
         config_json: row.config_json,
         active: row.active,
         created_at: row.created_at,
         updated_at: row.updated_at,
-    }
+    })
 }

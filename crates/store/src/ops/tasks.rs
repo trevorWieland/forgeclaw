@@ -34,7 +34,11 @@ pub(crate) async fn create_task(
         updated_at: Set(now),
     };
     am.insert(db).await?;
-    Ok(TaskId::from(id))
+    TaskId::new(id).map_err(|e| StoreError::SchemaDrift {
+        table: Some("tasks".to_owned()),
+        column: Some("id".to_owned()),
+        reason: e.to_string(),
+    })
 }
 
 /// Return up to `limit` tasks whose `next_run <= now` with status
@@ -108,8 +112,16 @@ fn row_to_stored(row: tasks::Model) -> Result<StoredTask, StoreError> {
         reason: e.to_string(),
     })?;
     Ok(StoredTask {
-        id: TaskId::from(row.id),
-        group_id: GroupId::from(row.group_id),
+        id: TaskId::new(row.id).map_err(|e| StoreError::SchemaDrift {
+            table: Some("tasks".to_owned()),
+            column: Some("id".to_owned()),
+            reason: e.to_string(),
+        })?,
+        group_id: GroupId::new(row.group_id).map_err(|e| StoreError::SchemaDrift {
+            table: Some("tasks".to_owned()),
+            column: Some("group_id".to_owned()),
+            reason: e.to_string(),
+        })?,
         prompt: row.prompt,
         schedule_kind,
         schedule_value: row.schedule_value,

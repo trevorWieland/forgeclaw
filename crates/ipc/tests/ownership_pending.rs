@@ -45,7 +45,7 @@ fn sample_ready() -> ReadyPayload {
 
 fn sample_init(group: &GroupInfo) -> InitPayload {
     InitPayload {
-        job_id: forgeclaw_core::JobId::from("job-own-1"),
+        job_id: forgeclaw_core::JobId::new("job-own-1").expect("valid job id"),
         context: InitContext {
             messages: HistoricalMessages::default(),
             group: group.clone(),
@@ -99,14 +99,14 @@ async fn pause_task_returns_ownership_pending() {
     let path = socket_path(&dir, "auth-pause.sock");
 
     let group = GroupInfo {
-        id: GroupId::from("group-worker"),
+        id: GroupId::new("group-worker").expect("valid group id"),
         name: "Worker".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities::default(),
     };
     let command = ContainerToHost::Command(CommandPayload {
         body: CommandBody::PauseTask(forgeclaw_ipc::PauseTaskPayload {
-            task_id: forgeclaw_core::TaskId::from("task-1"),
+            task_id: forgeclaw_core::TaskId::new("task-1").expect("valid task id"),
         }),
     });
 
@@ -123,12 +123,18 @@ async fn pause_task_returns_ownership_pending() {
     let AuthorizedCommand::Scoped(ScopedAuthorizedCommand::PauseTask(pending)) = cmd else {
         unreachable!();
     };
-    assert_eq!(pending.session_group(), &GroupId::from("group-worker"));
+    assert_eq!(
+        pending.session_group(),
+        &GroupId::new("group-worker").expect("valid group id")
+    );
     assert!(!pending.is_main());
     let payload = pending
-        .verify(&GroupId::from("group-worker"))
+        .verify(&GroupId::new("group-worker").expect("valid group id"))
         .expect("same-group should pass");
-    assert_eq!(payload.task_id, forgeclaw_core::TaskId::from("task-1"));
+    assert_eq!(
+        payload.task_id,
+        forgeclaw_core::TaskId::new("task-1").expect("valid task id")
+    );
 }
 
 #[tokio::test]
@@ -137,14 +143,14 @@ async fn ownership_pending_verify_rejects_cross_group() {
     let path = socket_path(&dir, "auth-pause-cross.sock");
 
     let group = GroupInfo {
-        id: GroupId::from("group-worker"),
+        id: GroupId::new("group-worker").expect("valid group id"),
         name: "Worker".parse().expect("valid name"),
         is_main: false,
         capabilities: GroupCapabilities::default(),
     };
     let command = ContainerToHost::Command(CommandPayload {
         body: CommandBody::PauseTask(forgeclaw_ipc::PauseTaskPayload {
-            task_id: forgeclaw_core::TaskId::from("task-1"),
+            task_id: forgeclaw_core::TaskId::new("task-1").expect("valid task id"),
         }),
     });
 
@@ -162,7 +168,7 @@ async fn ownership_pending_verify_rejects_cross_group() {
         unreachable!();
     };
     let err = pending
-        .verify(&GroupId::from("group-other"))
+        .verify(&GroupId::new("group-other").expect("valid group id"))
         .expect_err("cross-group should fail");
     assert!(
         matches!(err, IpcError::Protocol(ProtocolError::Unauthorized { .. })),
@@ -176,14 +182,14 @@ async fn ownership_pending_main_always_passes() {
     let path = socket_path(&dir, "auth-pause-main.sock");
 
     let group = GroupInfo {
-        id: GroupId::from("group-main"),
+        id: GroupId::new("group-main").expect("valid group id"),
         name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
     };
     let command = ContainerToHost::Command(CommandPayload {
         body: CommandBody::PauseTask(forgeclaw_ipc::PauseTaskPayload {
-            task_id: forgeclaw_core::TaskId::from("task-1"),
+            task_id: forgeclaw_core::TaskId::new("task-1").expect("valid task id"),
         }),
     });
 
@@ -202,7 +208,10 @@ async fn ownership_pending_main_always_passes() {
     };
     assert!(pending.is_main());
     let payload = pending
-        .verify(&GroupId::from("group-totally-different"))
+        .verify(&GroupId::new("group-totally-different").expect("valid group id"))
         .expect("main always passes");
-    assert_eq!(payload.task_id, forgeclaw_core::TaskId::from("task-1"));
+    assert_eq!(
+        payload.task_id,
+        forgeclaw_core::TaskId::new("task-1").expect("valid task id")
+    );
 }

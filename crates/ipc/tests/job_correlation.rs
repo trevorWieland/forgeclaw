@@ -44,7 +44,7 @@ fn sample_ready(version: &str) -> ReadyPayload {
 
 fn sample_group() -> GroupInfo {
     GroupInfo {
-        id: GroupId::from("group-main"),
+        id: GroupId::new("group-main").expect("valid group id"),
         name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
@@ -53,7 +53,7 @@ fn sample_group() -> GroupInfo {
 
 fn sample_init() -> InitPayload {
     InitPayload {
-        job_id: JobId::from("job-integration-1"),
+        job_id: JobId::new("job-integration-1").expect("valid job id"),
         context: InitContext {
             messages: HistoricalMessages::default(),
             group: sample_group(),
@@ -165,7 +165,7 @@ async fn unsplit_rejects_mismatched_job_scoped_messages() {
         "ipc-job-unsplit-delta.sock",
         ContainerToHost::OutputDelta(OutputDeltaPayload {
             text: "x".parse().expect("valid text"),
-            job_id: JobId::from("job-other"),
+            job_id: JobId::new("job-other").expect("valid job id"),
         }),
         true,
     )
@@ -174,7 +174,7 @@ async fn unsplit_rejects_mismatched_job_scoped_messages() {
     run_unsplit_correlation_case(
         "ipc-job-unsplit-progress.sock",
         ContainerToHost::Progress(ProgressPayload {
-            job_id: JobId::from("job-other"),
+            job_id: JobId::new("job-other").expect("valid job id"),
             stage: "tool_execution".parse().expect("valid stage"),
             detail: None,
             percent: None,
@@ -186,7 +186,7 @@ async fn unsplit_rejects_mismatched_job_scoped_messages() {
     run_unsplit_correlation_case(
         "ipc-job-unsplit-complete.sock",
         ContainerToHost::OutputComplete(OutputCompletePayload {
-            job_id: JobId::from("job-other"),
+            job_id: JobId::new("job-other").expect("valid job id"),
             result: None,
             session_id: None,
             token_usage: None,
@@ -202,7 +202,7 @@ async fn unsplit_rejects_mismatched_job_scoped_messages() {
             code: ErrorCode::AdapterError,
             message: "boom".parse().expect("valid error message"),
             fatal: false,
-            job_id: Some(JobId::from("job-other")),
+            job_id: Some(JobId::new("job-other").expect("valid job id")),
         }),
         true,
     )
@@ -280,7 +280,7 @@ async fn split_rejects_mismatched_job_scoped_messages() {
         "ipc-job-split-delta.sock",
         ContainerToHost::OutputDelta(OutputDeltaPayload {
             text: "x".parse().expect("valid text"),
-            job_id: JobId::from("job-other"),
+            job_id: JobId::new("job-other").expect("valid job id"),
         }),
         true,
     )
@@ -289,7 +289,7 @@ async fn split_rejects_mismatched_job_scoped_messages() {
     run_split_correlation_case(
         "ipc-job-split-progress.sock",
         ContainerToHost::Progress(ProgressPayload {
-            job_id: JobId::from("job-other"),
+            job_id: JobId::new("job-other").expect("valid job id"),
             stage: "tool_execution".parse().expect("valid stage"),
             detail: None,
             percent: None,
@@ -301,7 +301,7 @@ async fn split_rejects_mismatched_job_scoped_messages() {
     run_split_correlation_case(
         "ipc-job-split-complete.sock",
         ContainerToHost::OutputComplete(OutputCompletePayload {
-            job_id: JobId::from("job-other"),
+            job_id: JobId::new("job-other").expect("valid job id"),
             result: None,
             session_id: None,
             token_usage: None,
@@ -317,7 +317,7 @@ async fn split_rejects_mismatched_job_scoped_messages() {
             code: ErrorCode::AdapterError,
             message: "boom".parse().expect("valid error message"),
             fatal: false,
-            job_id: Some(JobId::from("job-other")),
+            job_id: Some(JobId::new("job-other").expect("valid job id")),
         }),
         true,
     )
@@ -349,7 +349,7 @@ async fn host_messages_job_mismatch_rejected_while_processing() {
             .await
             .expect("handshake");
         conn.send_host(&HostToContainer::Messages(MessagesPayload {
-            job_id: JobId::from("job-other"),
+            job_id: JobId::new("job-other").expect("valid job id"),
             messages: vec![HistoricalMessage {
                 sender: "Alice".parse().expect("valid sender"),
                 text: "follow-up".parse().expect("valid text"),
@@ -396,7 +396,7 @@ async fn host_messages_rebinds_in_idle_and_enforces_new_job_split() {
 
         writer
             .send_host(&HostToContainer::Messages(MessagesPayload {
-                job_id: JobId::from("job-integration-2"),
+                job_id: JobId::new("job-integration-2").expect("valid job id"),
                 messages: vec![HistoricalMessage {
                     sender: "Alice".parse().expect("valid sender"),
                     text: "new job".parse().expect("valid text"),
@@ -417,7 +417,7 @@ async fn host_messages_rebinds_in_idle_and_enforces_new_job_split() {
         .expect("client handshake");
     client
         .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
-            job_id: JobId::from("job-integration-1"),
+            job_id: JobId::new("job-integration-1").expect("valid job id"),
             result: None,
             session_id: None,
             token_usage: None,
@@ -432,7 +432,7 @@ async fn host_messages_rebinds_in_idle_and_enforces_new_job_split() {
     client
         .send(&ContainerToHost::OutputDelta(OutputDeltaPayload {
             text: "old job delta".parse().expect("valid text"),
-            job_id: JobId::from("job-integration-1"),
+            job_id: JobId::new("job-integration-1").expect("valid job id"),
         }))
         .await
         .expect_err("old-job delta should fail client-side");

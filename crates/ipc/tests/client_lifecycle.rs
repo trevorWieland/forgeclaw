@@ -42,7 +42,7 @@ fn sample_ready() -> ReadyPayload {
 
 fn sample_group() -> GroupInfo {
     GroupInfo {
-        id: GroupId::from("group-main"),
+        id: GroupId::new("group-main").expect("valid group id"),
         name: "Main".parse().expect("valid name"),
         is_main: true,
         capabilities: GroupCapabilities::default(),
@@ -51,7 +51,7 @@ fn sample_group() -> GroupInfo {
 
 fn sample_init() -> InitPayload {
     InitPayload {
-        job_id: JobId::from("job-client-1"),
+        job_id: JobId::new("job-client-1").expect("valid job id"),
         context: InitContext {
             messages: HistoricalMessages::default(),
             group: sample_group(),
@@ -142,7 +142,7 @@ async fn client_recv_rejects_messages_rebind_during_processing() {
         raw_write_host_message(
             &mut stream,
             &HostToContainer::Messages(MessagesPayload {
-                job_id: JobId::from("job-other"),
+                job_id: JobId::new("job-other").expect("valid job id"),
                 messages: HistoricalMessages::default(),
             }),
         )
@@ -237,7 +237,7 @@ async fn client_send_rejects_mismatched_job_while_processing() {
     let err = client
         .send(&ContainerToHost::OutputDelta(OutputDeltaPayload {
             text: "wrong job".parse().expect("valid text"),
-            job_id: JobId::from("job-other"),
+            job_id: JobId::new("job-other").expect("valid job id"),
         }))
         .await
         .expect_err("mismatched job send should fail");
@@ -268,7 +268,7 @@ async fn client_send_rejects_command_after_idle_transition() {
 
     client
         .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
-            job_id: JobId::from("job-client-1"),
+            job_id: JobId::new("job-client-1").expect("valid job id"),
             result: None,
             session_id: None,
             token_usage: None,
@@ -280,7 +280,7 @@ async fn client_send_rejects_command_after_idle_transition() {
     let err = client
         .send(&ContainerToHost::Command(forgeclaw_ipc::CommandPayload {
             body: forgeclaw_ipc::CommandBody::SendMessage(forgeclaw_ipc::SendMessagePayload {
-                target_group: GroupId::from("group-main"),
+                target_group: GroupId::new("group-main").expect("valid group id"),
                 text: "late command".parse().expect("valid text"),
             }),
         }))
@@ -317,7 +317,7 @@ async fn client_split_send_rejects_output_delta_after_idle() {
 
     writer
         .send(&ContainerToHost::OutputComplete(OutputCompletePayload {
-            job_id: JobId::from("job-client-1"),
+            job_id: JobId::new("job-client-1").expect("valid job id"),
             result: None,
             session_id: None,
             token_usage: None,
@@ -329,7 +329,7 @@ async fn client_split_send_rejects_output_delta_after_idle() {
     let err = writer
         .send(&ContainerToHost::OutputDelta(OutputDeltaPayload {
             text: "late delta".parse().expect("valid text"),
-            job_id: JobId::from("job-client-1"),
+            job_id: JobId::new("job-client-1").expect("valid job id"),
         }))
         .await
         .expect_err("delta in idle must fail");

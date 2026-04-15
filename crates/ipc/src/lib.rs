@@ -43,12 +43,27 @@
 //! leg in a single call that consumes the pending type and returns the
 //! established connection, so higher-level crates never have to reach
 //! into the send/recv primitives just to establish a session.
+//!
+//! # Security Boundaries
+//!
+//! - **Trusted bind-path source**: callers must provide a host-owned
+//!   absolute socket path. Path normalization is fail-closed: `.`/`..`
+//!   traversal segments are rejected before any directory creation.
+//! - **Peer credentials**: accepted peers always have credentials
+//!   captured (when available). Authorization policy is explicit via
+//!   [`PeerCredentialPolicy`], with
+//!   [`IpcServerOptions::hardened`](crate::server::IpcServerOptions::hardened)
+//!   providing strict UID/GID matching defaults.
+//! - **Liveness semantics**: processing heartbeat timeout is extended by
+//!   inbound container liveness (`heartbeat`) only; host outbound
+//!   follow-up `messages` do not refresh the heartbeat deadline.
 
 pub mod client;
 pub mod codec;
 pub mod error;
 pub(crate) mod lifecycle;
 pub mod message;
+pub(crate) mod outbound_validation;
 pub mod peer_cred;
 pub(crate) mod policy;
 pub mod recv_policy;
@@ -56,7 +71,7 @@ pub mod server;
 pub(crate) mod util;
 pub mod version;
 
-pub use client::{IpcClient, IpcClientReader, IpcClientWriter, PendingClient};
+pub use client::{IpcClient, IpcClientOptions, IpcClientReader, IpcClientWriter, PendingClient};
 pub use codec::{
     FrameCodec, LENGTH_PREFIX_BYTES, MAX_FRAME_BYTES, decode_container_to_host,
     decode_host_to_container,
@@ -79,7 +94,7 @@ pub use peer_cred::{PeerCredentials, SessionIdentity};
 pub use recv_policy::UnknownTypePolicy;
 pub use server::{
     IpcConnection, IpcConnectionReader, IpcConnectionWriter, IpcInboundEvent, IpcServer,
-    IpcServerOptions, PendingConnection, UnauthorizedCommandLimitConfig,
-    UnauthorizedCommandRejection,
+    IpcServerOptions, PeerCredentialPolicy, PeerCredentialPolicyError, PendingConnection,
+    UnauthorizedCommandLimitConfig, UnauthorizedCommandRejection, UnknownTrafficLimitConfig,
 };
 pub use version::{NegotiatedProtocolVersion, PROTOCOL_VERSION, is_compatible, negotiate};

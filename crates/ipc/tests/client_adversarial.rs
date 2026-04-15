@@ -49,11 +49,11 @@ fn sample_ready() -> ReadyPayload {
 
 fn sample_init() -> InitPayload {
     InitPayload {
-        job_id: JobId::from("job-adv-1"),
+        job_id: JobId::new("job-adv-1").expect("valid job id"),
         context: InitContext {
             messages: HistoricalMessages::default(),
             group: GroupInfo {
-                id: GroupId::from("group-main"),
+                id: GroupId::new("group-main").expect("valid group id"),
                 name: "Main".parse().expect("valid name"),
                 is_main: true,
                 capabilities: GroupCapabilities::default(),

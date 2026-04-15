@@ -170,7 +170,7 @@ mod tests {
     fn authorized_command_accessors_match_category() {
         let scoped =
             AuthorizedCommand::from(ScopedAuthorizedCommand::SendMessage(SendMessagePayload {
-                target_group: GroupId::from("group-a"),
+                target_group: GroupId::new("group-a").expect("valid group id"),
                 text: "hello".parse().expect("valid text"),
             }));
         assert!(scoped.as_scoped().is_some());
@@ -190,13 +190,13 @@ mod tests {
     fn into_category_returns_only_matching_variant() {
         let scoped =
             AuthorizedCommand::from(ScopedAuthorizedCommand::SendMessage(SendMessagePayload {
-                target_group: GroupId::from("group-a"),
+                target_group: GroupId::new("group-a").expect("valid group id"),
                 text: "hello".parse().expect("valid text"),
             }));
         assert!(scoped.into_scoped().is_some());
         let scoped =
             AuthorizedCommand::from(ScopedAuthorizedCommand::SendMessage(SendMessagePayload {
-                target_group: GroupId::from("group-a"),
+                target_group: GroupId::new("group-a").expect("valid group id"),
                 text: "hello".parse().expect("valid text"),
             }));
         assert!(scoped.into_privileged().is_none());

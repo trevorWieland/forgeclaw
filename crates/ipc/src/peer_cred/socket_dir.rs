@@ -1,10 +1,11 @@
 use std::io;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::IpcError;
 
 /// Validate that the socket directory is safe for binding.
 pub(crate) fn validate_socket_dir(socket_path: &Path) -> Result<(), IpcError> {
+    validate_socket_path_input(socket_path)?;
     let parent = socket_path.parent().ok_or_else(|| {
         IpcError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -12,20 +13,89 @@ pub(crate) fn validate_socket_dir(socket_path: &Path) -> Result<(), IpcError> {
         ))
     })?;
 
-    let nearest_existing = nearest_existing_ancestor(parent)?;
-    validate_lexical_ancestor_chain(nearest_existing)?;
-    create_missing_parent_segments(parent, nearest_existing)?;
-    validate_parent_directory_shape(parent)?;
-    validate_parent_directory_mode(parent)
+    let (nearest_existing_lexical, nearest_existing_canonical) = nearest_existing_ancestor(parent)?;
+    validate_lexical_ancestor_chain(&nearest_existing_lexical)?;
+    let relative = normalized_relative_components(parent, &nearest_existing_lexical)?;
+    let canonical_parent = canonical_parent_path(&nearest_existing_canonical, &relative);
+    create_missing_parent_segments(&nearest_existing_canonical, &relative)?;
+    validate_parent_directory_shape(&canonical_parent)?;
+    validate_parent_directory_mode(&canonical_parent)?;
+    validate_parent_canonical_identity(parent, &canonical_parent)
 }
 
-fn nearest_existing_ancestor(path: &Path) -> Result<&Path, IpcError> {
+fn validate_socket_path_input(socket_path: &Path) -> Result<(), IpcError> {
+    if !socket_path.is_absolute() {
+        return Err(IpcError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("socket path must be absolute: {}", socket_path.display()),
+        )));
+    }
+    if socket_path_contains_explicit_traversal_segment(socket_path) {
+        return Err(IpcError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "socket path must not contain traversal component `.` or `..`: {}",
+                socket_path.display()
+            ),
+        )));
+    }
+    for component in socket_path.components() {
+        match component {
+            Component::ParentDir | Component::CurDir => {
+                return Err(IpcError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "socket path must not contain traversal component `{}`: {}",
+                        component.as_os_str().to_string_lossy(),
+                        socket_path.display()
+                    ),
+                )));
+            }
+            Component::Prefix(_) => {
+                return Err(IpcError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unsupported socket path prefix: {}", socket_path.display()),
+                )));
+            }
+            Component::RootDir | Component::Normal(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn socket_path_contains_explicit_traversal_segment(socket_path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        socket_path
+            .as_os_str()
+            .as_bytes()
+            .split(|byte| *byte == b'/')
+            .any(|segment| segment == b"." || segment == b"..")
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Windows paths are not supported by this socket hardening module,
+        // but keep behavior deterministic for tests.
+        socket_path
+            .to_string_lossy()
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+    }
+}
+
+fn nearest_existing_ancestor(path: &Path) -> Result<(PathBuf, PathBuf), IpcError> {
     for ancestor in path.ancestors() {
         if ancestor == Path::new("") {
             continue;
         }
         match std::fs::symlink_metadata(ancestor) {
-            Ok(_) => return Ok(ancestor),
+            Ok(_) => {
+                let canonical = std::fs::canonicalize(ancestor).map_err(IpcError::Io)?;
+                return Ok((ancestor.to_path_buf(), canonical));
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(IpcError::Io(e)),
         }
@@ -36,13 +106,10 @@ fn nearest_existing_ancestor(path: &Path) -> Result<&Path, IpcError> {
     )))
 }
 
-fn create_missing_parent_segments(parent: &Path, start: &Path) -> Result<(), IpcError> {
-    use std::os::unix::fs::PermissionsExt;
-
+fn normalized_relative_components(parent: &Path, start: &Path) -> Result<Vec<PathBuf>, IpcError> {
     if parent == start {
-        return Ok(());
+        return Ok(Vec::new());
     }
-
     let relative = parent.strip_prefix(start).map_err(|e| {
         IpcError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -54,9 +121,48 @@ fn create_missing_parent_segments(parent: &Path, start: &Path) -> Result<(), Ipc
         ))
     })?;
 
-    let mut current = start.to_path_buf();
+    let mut parts = Vec::new();
     for component in relative.components() {
-        current.push(component.as_os_str());
+        match component {
+            Component::Normal(normal) => parts.push(PathBuf::from(normal)),
+            Component::CurDir | Component::ParentDir => {
+                return Err(IpcError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "invalid path traversal segment in socket parent: {}",
+                        parent.display()
+                    ),
+                )));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(IpcError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid socket parent path shape: {}", parent.display()),
+                )));
+            }
+        }
+    }
+    Ok(parts)
+}
+
+fn canonical_parent_path(start_canonical: &Path, parts: &[PathBuf]) -> PathBuf {
+    let mut current = start_canonical.to_path_buf();
+    for part in parts {
+        current.push(part);
+    }
+    current
+}
+
+fn create_missing_parent_segments(start: &Path, parts: &[PathBuf]) -> Result<(), IpcError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if parts.is_empty() {
+        return Ok(());
+    }
+
+    let mut current = start.to_path_buf();
+    for component in parts {
+        current.push(component);
         match std::fs::symlink_metadata(&current) {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
@@ -86,6 +192,24 @@ fn create_missing_parent_segments(parent: &Path, start: &Path) -> Result<(), Ipc
             }
             Err(e) => return Err(IpcError::Io(e)),
         }
+    }
+    Ok(())
+}
+
+fn validate_parent_canonical_identity(
+    parent: &Path,
+    canonical_parent: &Path,
+) -> Result<(), IpcError> {
+    let resolved_parent = std::fs::canonicalize(parent).map_err(IpcError::Io)?;
+    if resolved_parent != canonical_parent {
+        return Err(IpcError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "socket parent canonical identity mismatch: expected {}, got {}",
+                canonical_parent.display(),
+                resolved_parent.display()
+            ),
+        )));
     }
     Ok(())
 }
