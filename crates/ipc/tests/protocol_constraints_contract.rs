@@ -117,6 +117,7 @@ fn protocol_docs_publish_wire_constraints() {
     assert!(docs.contains("maxProperties 32"));
     assert!(docs.contains("max depth 8"));
     assert!(docs.contains("max encoded bytes 65536"));
+    assert!(docs.contains("x-maxEncodedBytes: 65536"));
 }
 
 #[test]
@@ -183,6 +184,7 @@ fn committed_schema_encodes_128_char_bounds_for_command_ids() {
     let register_extensions =
         &c2h_schema["$defs"]["RegisterGroupPayload"]["properties"]["extensions"];
     assert_eq!(register_extensions["maxProperties"], 32);
+    assert_eq!(register_extensions["x-maxEncodedBytes"], 65536);
     assert_eq!(register_extensions["propertyNames"]["maxLength"], 128);
     assert_eq!(
         register_extensions["properties"]["version"]["maxLength"],

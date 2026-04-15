@@ -816,7 +816,6 @@ dependencies = [
  "criterion",
  "forgeclaw-core",
  "forgeclaw-ipc",
- "futures-util",
  "insta",
  "jsonschema",
  "proptest",

@@ -7,19 +7,17 @@
 
 use std::time::Duration;
 
-use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
-use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
-use tokio_util::codec::Framed;
+use tokio::time::Instant;
 
 use crate::codec::{
-    DEFAULT_MAX_UNKNOWN_SKIPS, FrameCodec, decode_host_to_container, encode_container_to_host,
+    DEFAULT_MAX_UNKNOWN_SKIPS, decode_host_to_container, encode_container_to_host_frame,
 };
 use crate::error::{IpcError, ProtocolError};
 use crate::message::{ContainerToHost, HostToContainer, InitPayload, ReadyPayload};
-use crate::policy::{DEFAULT_MAX_UNKNOWN_BYTES, UnknownFrameBudget};
-use crate::util::truncate_for_log;
+use crate::policy::{DEFAULT_MAX_UNKNOWN_BYTES, UnknownTrafficBudget};
+use crate::transport::{FrameReader, FrameWriter};
+use crate::util::{SharedWriteHalf, ShutdownHandle, truncate_for_log};
 
 use super::{IpcClient, IpcClientOptions};
 
@@ -51,19 +49,28 @@ fn log_outbound_validation_rejection(err: &IpcError) {
 /// an [`IpcClient`] with the full post-handshake API.
 #[derive(Debug)]
 pub struct PendingClient {
-    framed: Framed<UnixStream, FrameCodec>,
+    reader: FrameReader<tokio::net::unix::OwnedReadHalf>,
+    writer: FrameWriter<SharedWriteHalf<tokio::net::unix::OwnedWriteHalf>>,
+    shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
     poisoned: bool,
-    unknown_budget: UnknownFrameBudget,
+    unknown_budget: UnknownTrafficBudget,
     last_frame_len: usize,
     options: IpcClientOptions,
 }
 
 impl PendingClient {
     pub(crate) fn from_stream(stream: UnixStream, options: IpcClientOptions) -> Self {
+        let (read_half, write_half) = stream.into_split();
+        let (shared_write, shutdown_handle) = SharedWriteHalf::new(write_half);
         Self {
-            framed: Framed::new(stream, FrameCodec::new()),
+            reader: FrameReader::new(read_half),
+            writer: FrameWriter::new(shared_write),
+            shutdown_handle,
             poisoned: false,
-            unknown_budget: UnknownFrameBudget::default(),
+            unknown_budget: UnknownTrafficBudget::new(
+                Instant::now(),
+                options.unknown_traffic_limit,
+            ),
             last_frame_len: 0,
             options,
         }
@@ -84,9 +91,11 @@ impl PendingClient {
         match tokio::time::timeout(timeout, self.handshake_inner(ready)).await {
             Ok(Ok(init)) => {
                 let client = IpcClient::from_parts(
-                    self.framed,
+                    self.reader,
+                    self.writer,
+                    self.shutdown_handle,
                     init.job_id.clone(),
-                    self.options.write_timeout,
+                    self.options,
                 );
                 Ok((client, init))
             }
@@ -121,7 +130,7 @@ impl PendingClient {
 
     /// Cleanly close the connection without completing the handshake.
     pub async fn close(mut self) -> Result<(), IpcError> {
-        self.framed.close().await?;
+        self.writer.shutdown().await?;
         Ok(())
     }
 
@@ -134,22 +143,23 @@ impl PendingClient {
 
     async fn poison(&mut self) {
         self.poisoned = true;
-        let _ = self.framed.get_mut().shutdown().await;
+        self.shutdown_handle.trigger().await;
     }
 
     async fn send(&mut self, msg: &ContainerToHost) -> Result<(), IpcError> {
         self.check_poisoned()?;
-        let bytes: Bytes = match encode_container_to_host(msg) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                log_outbound_validation_rejection(&e);
-                if e.is_fatal() {
-                    self.poison().await;
-                }
-                return Err(e);
+        let result = self
+            .writer
+            .send_with(|buf| encode_container_to_host_frame(msg, buf))
+            .await;
+        if let Err(ref e) = result {
+            if matches!(
+                e,
+                IpcError::Protocol(ProtocolError::OutboundValidation { .. })
+            ) {
+                log_outbound_validation_rejection(e);
             }
-        };
-        let result = self.framed.send(bytes).await;
+        }
         if let Err(ref e) = result {
             if e.is_fatal() {
                 self.poison().await;
@@ -160,14 +170,12 @@ impl PendingClient {
 
     async fn recv_strict(&mut self) -> Result<HostToContainer, IpcError> {
         self.check_poisoned()?;
-        let frame = match self.framed.next().await.transpose() {
-            Ok(Some(f)) => f,
-            Ok(None) => {
-                self.poisoned = true;
-                return Err(IpcError::Closed);
-            }
+        let frame = match self.reader.recv_frame().await {
+            Ok(frame) => frame,
             Err(e) => {
-                self.poison().await;
+                if e.is_fatal() {
+                    self.poison().await;
+                }
                 return Err(e);
             }
         };
@@ -185,11 +193,14 @@ impl PendingClient {
         loop {
             match self.recv_strict().await {
                 Ok(msg) => {
-                    self.unknown_budget.reset();
+                    self.unknown_budget.reset_consecutive();
                     return Ok(msg);
                 }
                 Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
-                    if let Err(err) = self.unknown_budget.on_unknown(self.last_frame_len) {
+                    if let Err(err) = self
+                        .unknown_budget
+                        .on_unknown(self.last_frame_len, Instant::now())
+                    {
                         self.poison().await;
                         return Err(err);
                     }
@@ -200,6 +211,8 @@ impl PendingClient {
                         skip_count_limit = DEFAULT_MAX_UNKNOWN_SKIPS,
                         skip_bytes = self.unknown_budget.bytes(),
                         skip_bytes_limit = DEFAULT_MAX_UNKNOWN_BYTES,
+                        total_skip_count = self.unknown_budget.total_count(),
+                        total_skip_bytes = self.unknown_budget.total_bytes(),
                         "ignoring unknown message type (forward compatibility)"
                     );
                 }

@@ -1,6 +1,5 @@
 ---
 source: crates/ipc/tests/schema_generation.rs
-assertion_line: 12
 expression: json
 ---
 {
@@ -4930,7 +4929,8 @@ expression: json
           },
           "required": [
             "version"
-          ]
+          ],
+          "x-maxEncodedBytes": 65536
         },
         "name": {
           "description": "Human-readable group name.",

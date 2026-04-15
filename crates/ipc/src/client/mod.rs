@@ -19,19 +19,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
 use forgeclaw_core::JobId;
-use futures_util::{SinkExt, StreamExt};
-use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio_util::codec::{Framed, FramedRead, FramedWrite};
+use tokio::time::Instant;
 
-use crate::codec::{DEFAULT_MAX_UNKNOWN_SKIPS, FrameCodec};
+use crate::codec::{DEFAULT_MAX_UNKNOWN_SKIPS, encode_container_to_host_frame};
 use crate::error::{IpcError, ProtocolError};
 use crate::message::{ContainerToHost, HostToContainer};
-use crate::policy::{DEFAULT_MAX_UNKNOWN_BYTES, UnknownFrameBudget};
+use crate::policy::{DEFAULT_MAX_UNKNOWN_BYTES, UnknownTrafficBudget, UnknownTrafficLimitConfig};
 use crate::recv_policy::UnknownTypePolicy;
+use crate::transport::{FrameReader, FrameWriter};
 use crate::util::{SharedWriteHalf, ShutdownHandle, truncate_for_log};
 
 use self::protocol::ClientConnectionState;
@@ -42,12 +40,15 @@ use self::transport_core::{decode_and_enforce_inbound, preflight_and_enforce_out
 pub struct IpcClientOptions {
     /// Post-handshake write timeout for outbound sends.
     pub write_timeout: Duration,
+    /// Unknown-message abuse controls for inbound receive paths.
+    pub unknown_traffic_limit: UnknownTrafficLimitConfig,
 }
 
 impl Default for IpcClientOptions {
     fn default() -> Self {
         Self {
             write_timeout: Duration::from_secs(5),
+            unknown_traffic_limit: UnknownTrafficLimitConfig::default(),
         }
     }
 }
@@ -80,9 +81,11 @@ fn log_outbound_validation_rejection(err: &IpcError) {
 /// [`IpcError::Closed`].
 #[derive(Debug)]
 pub struct IpcClient {
-    framed: Framed<UnixStream, FrameCodec>,
+    reader: FrameReader<tokio::net::unix::OwnedReadHalf>,
+    writer: FrameWriter<SharedWriteHalf<tokio::net::unix::OwnedWriteHalf>>,
+    shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
     poisoned: bool,
-    unknown_budget: UnknownFrameBudget,
+    unknown_budget: UnknownTrafficBudget,
     last_frame_len: usize,
     state: Arc<AsyncMutex<ClientConnectionState>>,
     write_timeout: Duration,
@@ -108,17 +111,24 @@ impl IpcClient {
 
     /// Construct from an already-handshaked transport.
     pub(crate) fn from_parts(
-        framed: Framed<UnixStream, FrameCodec>,
+        reader: FrameReader<tokio::net::unix::OwnedReadHalf>,
+        writer: FrameWriter<SharedWriteHalf<tokio::net::unix::OwnedWriteHalf>>,
+        shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
         active_job_id: JobId,
-        write_timeout: Duration,
+        options: IpcClientOptions,
     ) -> Self {
         Self {
-            framed,
+            reader,
+            writer,
+            shutdown_handle,
             poisoned: false,
-            unknown_budget: UnknownFrameBudget::default(),
+            unknown_budget: UnknownTrafficBudget::new(
+                Instant::now(),
+                options.unknown_traffic_limit,
+            ),
             last_frame_len: 0,
             state: Arc::new(AsyncMutex::new(ClientConnectionState::new(active_job_id))),
-            write_timeout,
+            write_timeout: options.write_timeout,
         }
     }
 
@@ -139,13 +149,13 @@ impl IpcClient {
 
     async fn poison(&mut self) {
         self.poisoned = true;
-        let _ = self.framed.get_mut().shutdown().await;
+        self.shutdown_handle.trigger().await;
     }
 
     /// Send a [`ContainerToHost`] message.
     pub async fn send(&mut self, msg: &ContainerToHost) -> Result<(), IpcError> {
         self.check_poisoned()?;
-        let (bytes, close_after_send): (Bytes, _) = match self
+        let close_after_send = match self
             .with_state_mut(|state| preflight_and_enforce_outbound(state, msg))
             .await
         {
@@ -158,10 +168,24 @@ impl IpcClient {
                 return Err(e);
             }
         };
-        let result = match tokio::time::timeout(self.write_timeout, self.framed.send(bytes)).await {
+        let result = match tokio::time::timeout(
+            self.write_timeout,
+            self.writer
+                .send_with(|buf| encode_container_to_host_frame(msg, buf)),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_elapsed) => Err(IpcError::Timeout(self.write_timeout)),
         };
+        if let Err(ref e) = result {
+            if matches!(
+                e,
+                IpcError::Protocol(ProtocolError::OutboundValidation { .. })
+            ) {
+                log_outbound_validation_rejection(e);
+            }
+        }
         if let Err(ref e) = result {
             if e.is_fatal() {
                 self.poison().await;
@@ -174,14 +198,12 @@ impl IpcClient {
 
     async fn recv_one(&mut self) -> Result<HostToContainer, IpcError> {
         self.check_poisoned()?;
-        let frame = match self.framed.next().await.transpose() {
-            Ok(Some(f)) => f,
-            Ok(None) => {
-                self.poisoned = true;
-                return Err(IpcError::Closed);
-            }
+        let frame = match self.reader.recv_frame().await {
+            Ok(frame) => frame,
             Err(e) => {
-                self.poison().await;
+                if e.is_fatal() {
+                    self.poison().await;
+                }
                 return Err(e);
             }
         };
@@ -215,11 +237,14 @@ impl IpcClient {
             UnknownTypePolicy::SkipBounded => loop {
                 match self.recv_one().await {
                     Ok(msg) => {
-                        self.unknown_budget.reset();
+                        self.unknown_budget.reset_consecutive();
                         return Ok(msg);
                     }
                     Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
-                        if let Err(err) = self.unknown_budget.on_unknown(self.last_frame_len) {
+                        if let Err(err) = self
+                            .unknown_budget
+                            .on_unknown(self.last_frame_len, Instant::now())
+                        {
                             self.poison().await;
                             return Err(err);
                         }
@@ -230,6 +255,8 @@ impl IpcClient {
                             skip_count_limit = DEFAULT_MAX_UNKNOWN_SKIPS,
                             skip_bytes = self.unknown_budget.bytes(),
                             skip_bytes_limit = DEFAULT_MAX_UNKNOWN_BYTES,
+                            total_skip_count = self.unknown_budget.total_count(),
+                            total_skip_bytes = self.unknown_budget.total_bytes(),
                             "ignoring unknown message type (forward compatibility)"
                         );
                     }
@@ -252,34 +279,21 @@ impl IpcClient {
 
     /// Split into independent read and write halves for full-duplex.
     ///
-    /// Any bytes already buffered by the internal `Framed` reader
-    /// are preserved in the returned reader half.
     pub fn into_split(self) -> (IpcClientWriter, IpcClientReader) {
         let poisoned = Arc::new(AtomicBool::new(self.poisoned));
-        let parts = self.framed.into_parts();
-        let (read_half, write_half) = parts.io.into_split();
-        let (shared_write, shutdown_handle) = SharedWriteHalf::new(write_half);
-        let mut writer = FramedWrite::new(shared_write, FrameCodec::new());
-        if !parts.write_buf.is_empty() {
-            *writer.write_buffer_mut() = parts.write_buf;
-        }
-        let mut reader = FramedRead::new(read_half, FrameCodec::new());
-        if !parts.read_buf.is_empty() {
-            *reader.read_buffer_mut() = parts.read_buf;
-        }
         (
             IpcClientWriter {
-                writer,
+                writer: self.writer,
                 poisoned: Arc::clone(&poisoned),
                 state: Arc::clone(&self.state),
                 write_timeout: self.write_timeout,
-                shutdown_handle: shutdown_handle.clone(),
+                shutdown_handle: self.shutdown_handle.clone(),
             },
             IpcClientReader {
-                reader,
+                reader: self.reader,
                 poisoned,
-                shutdown_handle,
-                unknown_budget: UnknownFrameBudget::default(),
+                shutdown_handle: self.shutdown_handle,
+                unknown_budget: self.unknown_budget,
                 last_frame_len: 0,
                 state: self.state,
             },
@@ -288,7 +302,7 @@ impl IpcClient {
 
     /// Cleanly close the connection.
     pub async fn close(mut self) -> Result<(), IpcError> {
-        self.framed.close().await?;
+        self.writer.shutdown().await?;
         Ok(())
     }
 }
@@ -296,7 +310,7 @@ impl IpcClient {
 /// Write half of a split [`IpcClient`].
 #[derive(Debug)]
 pub struct IpcClientWriter {
-    writer: FramedWrite<SharedWriteHalf<tokio::net::unix::OwnedWriteHalf>, FrameCodec>,
+    writer: FrameWriter<SharedWriteHalf<tokio::net::unix::OwnedWriteHalf>>,
     poisoned: Arc<AtomicBool>,
     state: Arc<AsyncMutex<ClientConnectionState>>,
     write_timeout: Duration,
@@ -317,7 +331,7 @@ impl IpcClientWriter {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(IpcError::Closed);
         }
-        let (bytes, close_after_send): (Bytes, _) = match self
+        let close_after_send = match self
             .with_state_mut(|state| preflight_and_enforce_outbound(state, msg))
             .await
         {
@@ -331,10 +345,24 @@ impl IpcClientWriter {
                 return Err(e);
             }
         };
-        let result = match tokio::time::timeout(self.write_timeout, self.writer.send(bytes)).await {
+        let result = match tokio::time::timeout(
+            self.write_timeout,
+            self.writer
+                .send_with(|buf| encode_container_to_host_frame(msg, buf)),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_elapsed) => Err(IpcError::Timeout(self.write_timeout)),
         };
+        if let Err(ref e) = result {
+            if matches!(
+                e,
+                IpcError::Protocol(ProtocolError::OutboundValidation { .. })
+            ) {
+                log_outbound_validation_rejection(e);
+            }
+        }
         if let Err(ref e) = result {
             if e.is_fatal() {
                 self.poisoned.store(true, Ordering::Release);
@@ -354,10 +382,10 @@ impl IpcClientWriter {
 /// half so the peer observes EOF without waiting for the writer task.
 #[derive(Debug)]
 pub struct IpcClientReader {
-    reader: FramedRead<tokio::net::unix::OwnedReadHalf, FrameCodec>,
+    reader: FrameReader<tokio::net::unix::OwnedReadHalf>,
     poisoned: Arc<AtomicBool>,
     shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
-    unknown_budget: UnknownFrameBudget,
+    unknown_budget: UnknownTrafficBudget,
     last_frame_len: usize,
     state: Arc<AsyncMutex<ClientConnectionState>>,
 }
@@ -380,14 +408,12 @@ impl IpcClientReader {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(IpcError::Closed);
         }
-        let frame = match self.reader.next().await.transpose() {
-            Ok(Some(f)) => f,
-            Ok(None) => {
-                self.poison().await;
-                return Err(IpcError::Closed);
-            }
+        let frame = match self.reader.recv_frame().await {
+            Ok(frame) => frame,
             Err(e) => {
-                self.poison().await;
+                if e.is_fatal() {
+                    self.poison().await;
+                }
                 return Err(e);
             }
         };
@@ -421,11 +447,14 @@ impl IpcClientReader {
             UnknownTypePolicy::SkipBounded => loop {
                 match self.recv_one().await {
                     Ok(msg) => {
-                        self.unknown_budget.reset();
+                        self.unknown_budget.reset_consecutive();
                         return Ok(msg);
                     }
                     Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
-                        if let Err(err) = self.unknown_budget.on_unknown(self.last_frame_len) {
+                        if let Err(err) = self
+                            .unknown_budget
+                            .on_unknown(self.last_frame_len, Instant::now())
+                        {
                             self.poison().await;
                             return Err(err);
                         }
@@ -436,6 +465,8 @@ impl IpcClientReader {
                             skip_count_limit = DEFAULT_MAX_UNKNOWN_SKIPS,
                             skip_bytes = self.unknown_budget.bytes(),
                             skip_bytes_limit = DEFAULT_MAX_UNKNOWN_BYTES,
+                            total_skip_count = self.unknown_budget.total_count(),
+                            total_skip_bytes = self.unknown_budget.total_bytes(),
                             "ignoring unknown message type (forward compatibility)"
                         );
                     }

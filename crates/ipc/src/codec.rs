@@ -33,6 +33,7 @@ use crate::outbound_validation::{
     validate_outbound_container_to_host, validate_outbound_host_to_container,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use serde::Deserialize;
 use serde::Serialize;
 use std::io::Write;
 use tokio_util::codec::{Decoder, Encoder};
@@ -181,58 +182,100 @@ impl Decoder for FrameCodec {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct MessageTypeProbe<'a> {
+    #[serde(borrow, default)]
+    r#type: Option<std::borrow::Cow<'a, str>>,
+}
+
+fn probe_message_type(bytes: &[u8]) -> Result<Option<String>, IpcError> {
+    let probe: MessageTypeProbe<'_> = serde_json::from_slice(bytes)
+        .map_err(|e| IpcError::Frame(FrameError::MalformedJson(e.to_string())))?;
+    Ok(probe.r#type.map(std::borrow::Cow::into_owned))
+}
+
 /// Decode a frame payload into a typed protocol message.
 ///
-/// Performs one JSON parse into [`serde_json::Value`] and then:
-/// - classifies unknown `type` discriminators, and
-/// - deserializes the same value into `T`.
+/// Performs:
+/// - a cheap discriminator probe (`type`) to classify unknown types,
+/// - one typed deserialize into `T` from the original bytes.
 pub(crate) fn decode_typed_message<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
     known_types: &[&str],
 ) -> Result<T, IpcError> {
-    let utf8 = std::str::from_utf8(bytes).map_err(|_| IpcError::Frame(FrameError::InvalidUtf8))?;
-    let value: serde_json::Value = serde_json::from_str(utf8)
-        .map_err(|e| IpcError::Frame(FrameError::MalformedJson(e.to_string())))?;
-    if let Some(ty) = value.get("type").and_then(serde_json::Value::as_str) {
-        if !known_types.contains(&ty) {
-            return Err(IpcError::Protocol(ProtocolError::UnknownMessageType(
-                ty.to_owned(),
-            )));
+    std::str::from_utf8(bytes).map_err(|_| IpcError::Frame(FrameError::InvalidUtf8))?;
+    if let Some(ty) = probe_message_type(bytes)? {
+        if !known_types.contains(&ty.as_str()) {
+            return Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty)));
         }
     }
-    serde_json::from_value::<T>(value)
+    serde_json::from_slice::<T>(bytes)
         .map_err(|e| IpcError::Frame(FrameError::MalformedJson(e.to_string())))
 }
 
-/// Serialize a protocol message to an owned [`Bytes`] buffer suitable
-/// for feeding into a [`FrameCodec`] encoder.
-pub(crate) fn encode_message<T: Serialize>(msg: &T) -> Result<Bytes, IpcError> {
-    let mut writer = CappedBytesWriter::new(MAX_FRAME_BYTES);
-    match serde_json::to_writer(&mut writer, msg) {
-        Ok(()) => Ok(writer.into_bytes()),
-        Err(e) => {
-            if let Some(size) = writer.overflow_size() {
-                return Err(IpcError::Frame(FrameError::Oversize {
-                    size,
-                    max: MAX_FRAME_BYTES,
-                }));
-            }
-            Err(IpcError::serialize(&e))
+/// Serialize a protocol message directly into a framed write buffer.
+///
+/// This writes a 4-byte big-endian length prefix followed by JSON
+/// payload bytes into `dst` without allocating/copying an intermediate
+/// full payload buffer.
+pub(crate) fn encode_message_frame<T: Serialize>(
+    msg: &T,
+    dst: &mut BytesMut,
+) -> Result<(), IpcError> {
+    let start = dst.len();
+    dst.reserve(LENGTH_PREFIX_BYTES);
+    dst.put_u32(0);
+    let payload_start = dst.len();
+    let (result, payload_len, overflow) = {
+        let mut writer = CappedFrameWriter::new(dst, MAX_FRAME_BYTES);
+        let result = serde_json::to_writer(&mut writer, msg);
+        (result, writer.payload_len(), writer.overflow_size())
+    };
+
+    if let Err(e) = result {
+        dst.truncate(start);
+        if let Some(size) = overflow {
+            return Err(IpcError::Frame(FrameError::Oversize {
+                size,
+                max: MAX_FRAME_BYTES,
+            }));
         }
+        return Err(IpcError::serialize(&e));
     }
+
+    if payload_len == 0 {
+        dst.truncate(start);
+        return Err(IpcError::Frame(FrameError::EmptyFrame));
+    }
+
+    let len_u32 = u32::try_from(payload_len).map_err(|_| {
+        dst.truncate(start);
+        IpcError::Frame(FrameError::Oversize {
+            size: payload_len,
+            max: MAX_FRAME_BYTES,
+        })
+    })?;
+    dst[start..payload_start].copy_from_slice(&len_u32.to_be_bytes());
+    Ok(())
 }
 
-/// Typed alias — serialize a [`ContainerToHost`] message.
-pub(crate) fn encode_container_to_host(msg: &ContainerToHost) -> Result<Bytes, IpcError> {
+/// Typed alias — serialize and frame a [`ContainerToHost`] message.
+pub(crate) fn encode_container_to_host_frame(
+    msg: &ContainerToHost,
+    dst: &mut BytesMut,
+) -> Result<(), IpcError> {
     validate_outbound_container_to_host(msg)?;
-    encode_message(msg)
+    encode_message_frame(msg, dst)
         .map_err(|e| map_outbound_oversize_to_validation("container_to_host", msg.type_name(), e))
 }
 
-/// Typed alias — serialize a [`HostToContainer`] message.
-pub(crate) fn encode_host_to_container(msg: &HostToContainer) -> Result<Bytes, IpcError> {
+/// Typed alias — serialize and frame a [`HostToContainer`] message.
+pub(crate) fn encode_host_to_container_frame(
+    msg: &HostToContainer,
+    dst: &mut BytesMut,
+) -> Result<(), IpcError> {
     validate_outbound_host_to_container(msg)?;
-    encode_message(msg)
+    encode_message_frame(msg, dst)
         .map_err(|e| map_outbound_oversize_to_validation("host_to_container", msg.type_name(), e))
 }
 
@@ -254,39 +297,42 @@ fn map_outbound_oversize_to_validation(
     }
 }
 
-/// Streaming JSON writer that aborts once `max_bytes` is exceeded.
-struct CappedBytesWriter {
-    bytes: Vec<u8>,
+/// Streaming JSON writer into an existing frame buffer.
+struct CappedFrameWriter<'a> {
+    dst: &'a mut BytesMut,
     max_bytes: usize,
+    payload_len: usize,
     overflow_size: Option<usize>,
 }
 
-impl CappedBytesWriter {
-    fn new(max_bytes: usize) -> Self {
+impl<'a> CappedFrameWriter<'a> {
+    fn new(dst: &'a mut BytesMut, max_bytes: usize) -> Self {
         Self {
-            bytes: Vec::new(),
+            dst,
             max_bytes,
+            payload_len: 0,
             overflow_size: None,
         }
+    }
+
+    fn payload_len(&self) -> usize {
+        self.payload_len
     }
 
     fn overflow_size(&self) -> Option<usize> {
         self.overflow_size
     }
-
-    fn into_bytes(self) -> Bytes {
-        Bytes::from(self.bytes)
-    }
 }
 
-impl Write for CappedBytesWriter {
+impl Write for CappedFrameWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let next = self.bytes.len().saturating_add(buf.len());
+        let next = self.payload_len.saturating_add(buf.len());
         if next > self.max_bytes {
             self.overflow_size = Some(next);
             return Err(std::io::Error::other("serialized frame exceeds max size"));
         }
-        self.bytes.extend_from_slice(buf);
+        self.dst.extend_from_slice(buf);
+        self.payload_len = next;
         Ok(buf.len())
     }
 

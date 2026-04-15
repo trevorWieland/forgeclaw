@@ -67,7 +67,9 @@ pub(crate) mod outbound_validation;
 pub mod peer_cred;
 pub(crate) mod policy;
 pub mod recv_policy;
+pub(crate) mod semantics;
 pub mod server;
+pub(crate) mod transport;
 pub(crate) mod util;
 pub mod version;
 

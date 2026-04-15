@@ -233,6 +233,8 @@ The `extensions` envelope is bounded for abuse resistance:
 - key maxLength 128 (at all nesting levels),
 - max depth 8 for nested JSON values,
 - max encoded bytes 65536 for the full `extensions` object.
+JSON Schema publishes this encoded-size contract as extension metadata:
+`x-maxEncodedBytes: 65536`.
 All supported runtime versions enforce this requirement.
 
 #### `error`
@@ -411,7 +413,7 @@ minor-aware behavior gates can remain explicit and centralized.
   - 32 consecutive unknown frames, and
   - 1 MiB cumulative bytes across the current consecutive-unknown streak.
   On either limit breach, the host closes the connection. Any recognized message resets both unknown counters.
-  In addition, host-side implementations enforce independent non-consecutive abuse controls by default:
+  In addition, host/client implementations enforce independent non-consecutive abuse controls by default:
   - total unknown-frame cap per connection lifetime,
   - total unknown-byte cap per connection lifetime, and
   - unknown-frame token-bucket rate limiting.

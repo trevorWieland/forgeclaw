@@ -2,13 +2,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::Instant;
-use tokio_util::codec::{FramedRead, FramedWrite};
 
-use crate::codec::FrameCodec;
+use crate::codec::encode_host_to_container_frame;
 use crate::error::{IpcError, ProtocolError};
 use crate::message::authorized::AuthorizedCommand;
 use crate::message::command::ClassifiedCommand;
@@ -16,18 +13,20 @@ use crate::message::{ContainerToHost, HostToContainer};
 use crate::peer_cred::SessionIdentity;
 use crate::policy::UnknownTrafficBudget;
 use crate::recv_policy::UnknownTypePolicy;
-use crate::util::{SharedWriteHalf, ShutdownHandle};
+use crate::semantics::validate_classified_command;
+use crate::transport::{FrameReader, FrameWriter};
+use crate::util::ShutdownHandle;
 use crate::version::NegotiatedProtocolVersion;
 
 use super::protocol::{
     ConnectionState, UnauthorizedEnforcementAction, log_fatal_protocol_error,
-    log_outbound_validation_rejection, log_unauthorized_command, log_unknown_message,
-    record_unauthorized_rejection, recv_deadline, recv_timeout_error,
+    log_outbound_validation_rejection, log_unauthorized_command, record_unauthorized_rejection,
+    recv_deadline, recv_timeout_error,
 };
 use super::transport_core::{decode_and_enforce_inbound, preflight_and_enforce_outbound};
 use super::{
     CommandReceiveBehavior, IpcConnection, IpcInboundEvent, auth, authorized_result_to_event,
-    classify_command_message,
+    classify_command_message, handle_unknown_inbound,
 };
 
 impl IpcConnection {
@@ -39,18 +38,9 @@ impl IpcConnection {
         let poisoned = Arc::new(AtomicBool::new(self.poisoned));
         let negotiated_version = self.state.negotiated_version();
         let state = Arc::new(AsyncMutex::new(self.state));
-        let parts = self.framed.into_parts();
-        let (read_half, write_half) = parts.io.into_split();
-        // Wrap write half so the reader can shut it down directly.
-        let (shared_write, shutdown_handle) = SharedWriteHalf::new(write_half);
-        let mut writer = FramedWrite::new(shared_write, FrameCodec::new());
-        if !parts.write_buf.is_empty() {
-            *writer.write_buffer_mut() = parts.write_buf;
-        }
-        let mut reader = FramedRead::new(read_half, FrameCodec::new());
-        if !parts.read_buf.is_empty() {
-            *reader.read_buffer_mut() = parts.read_buf;
-        }
+        let writer = self.writer;
+        let reader = self.reader;
+        let shutdown_handle = self.shutdown_handle;
         (
             IpcConnectionWriter {
                 writer,
@@ -78,7 +68,7 @@ impl IpcConnection {
 /// Write half of a split [`IpcConnection`].
 #[derive(Debug)]
 pub struct IpcConnectionWriter {
-    writer: FramedWrite<SharedWriteHalf<tokio::net::unix::OwnedWriteHalf>, FrameCodec>,
+    writer: FrameWriter<crate::util::SharedWriteHalf<tokio::net::unix::OwnedWriteHalf>>,
     poisoned: Arc<AtomicBool>,
     identity: Arc<SessionIdentity>,
     state: Arc<AsyncMutex<ConnectionState>>,
@@ -108,29 +98,40 @@ impl IpcConnectionWriter {
             let state = self.state.lock().await;
             state.phase_name()
         };
-        let bytes: Bytes = {
+        {
             let mut state = self.state.lock().await;
-            match preflight_and_enforce_outbound(&mut state, msg, Instant::now()) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    if matches!(
-                        e,
-                        IpcError::Protocol(ProtocolError::OutboundValidation { .. })
-                    ) {
-                        log_outbound_validation_rejection(&self.identity, phase_name, &e);
-                    } else {
-                        self.poisoned.store(true, Ordering::Release);
-                        log_fatal_protocol_error(&self.identity, phase_name, &e);
-                        self.shutdown_handle.trigger().await;
-                    }
-                    return Err(e);
+            if let Err(e) = preflight_and_enforce_outbound(&mut state, msg, Instant::now()) {
+                if matches!(
+                    e,
+                    IpcError::Protocol(ProtocolError::OutboundValidation { .. })
+                ) {
+                    log_outbound_validation_rejection(&self.identity, phase_name, &e);
+                } else {
+                    self.poisoned.store(true, Ordering::Release);
+                    log_fatal_protocol_error(&self.identity, phase_name, &e);
+                    self.shutdown_handle.trigger().await;
                 }
+                return Err(e);
             }
         };
-        let result = match tokio::time::timeout(self.write_timeout, self.writer.send(bytes)).await {
+        let result = match tokio::time::timeout(
+            self.write_timeout,
+            self.writer
+                .send_with(|buf| encode_host_to_container_frame(msg, buf)),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_elapsed) => Err(IpcError::Timeout(self.write_timeout)),
         };
+        if let Err(ref e) = result {
+            if matches!(
+                e,
+                IpcError::Protocol(ProtocolError::OutboundValidation { .. })
+            ) {
+                log_outbound_validation_rejection(&self.identity, phase_name, e);
+            }
+        }
         if let Err(ref e) = result {
             if e.is_fatal() {
                 self.poisoned.store(true, Ordering::Release);
@@ -145,7 +146,7 @@ impl IpcConnectionWriter {
 /// Read half of a split [`IpcConnection`].
 #[derive(Debug)]
 pub struct IpcConnectionReader {
-    reader: FramedRead<tokio::net::unix::OwnedReadHalf, FrameCodec>,
+    reader: FrameReader<tokio::net::unix::OwnedReadHalf>,
     poisoned: Arc<AtomicBool>,
     unknown_budget: UnknownTrafficBudget,
     last_frame_len: usize,
@@ -177,24 +178,22 @@ impl IpcConnectionReader {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(IpcError::Closed);
         }
-        let next_frame = if let Some(deadline) = self.current_recv_deadline().await {
-            match tokio::time::timeout_at(deadline, self.reader.next()).await {
-                Ok(next) => next,
+        let frame_result = if let Some(deadline) = self.current_recv_deadline().await {
+            match tokio::time::timeout_at(deadline, self.reader.recv_frame()).await {
+                Ok(result) => result,
                 Err(_elapsed) => return self.recv_timeout_error().await,
             }
         } else {
-            self.reader.next().await
+            self.reader.recv_frame().await
         };
-        let frame = match next_frame.transpose() {
-            Ok(Some(f)) => f,
-            Ok(None) => {
-                self.poison().await;
-                return Err(IpcError::Closed);
-            }
+        let frame = match frame_result {
+            Ok(frame) => frame,
             Err(e) => {
                 let phase_name = self.current_phase_name().await;
-                log_fatal_protocol_error(&self.identity, phase_name, &e);
-                self.poison().await;
+                if e.is_fatal() {
+                    log_fatal_protocol_error(&self.identity, phase_name, &e);
+                    self.poison().await;
+                }
                 return Err(e);
             }
         };
@@ -237,16 +236,17 @@ impl IpcConnectionReader {
                         return Ok(msg);
                     }
                     Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
-                        if let Err(e) = self
-                            .unknown_budget
-                            .on_unknown(self.last_frame_len, Instant::now())
-                        {
+                        if let Err(e) = handle_unknown_inbound(
+                            &self.identity,
+                            &mut self.unknown_budget,
+                            self.last_frame_len,
+                            &ty,
+                        ) {
                             let phase_name = self.current_phase_name().await;
                             log_fatal_protocol_error(&self.identity, phase_name, &e);
                             self.poison().await;
                             return Err(e);
                         }
-                        log_unknown_message(&self.identity, &ty, &self.unknown_budget);
                     }
                     Err(e) => return Err(e),
                 }
@@ -295,6 +295,8 @@ impl IpcConnectionReader {
         &mut self,
         classified: ClassifiedCommand,
     ) -> Result<AuthorizedCommand, IpcError> {
+        self.with_state_mut(|state| validate_classified_command(state.semantics(), &classified))
+            .await?;
         let result = auth::authorize_command(classified, self.identity.as_ref());
         if let Err(IpcError::Protocol(ProtocolError::Unauthorized { command, reason })) = &result {
             let (phase, outcome) = self

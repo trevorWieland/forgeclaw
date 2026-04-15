@@ -252,9 +252,15 @@ async fn client_unsplit_send_times_out_and_poisons() {
     });
 
     let write_timeout = Duration::from_millis(25);
-    let pending = IpcClient::connect_with_options(&path, IpcClientOptions { write_timeout })
-        .await
-        .expect("connect");
+    let pending = IpcClient::connect_with_options(
+        &path,
+        IpcClientOptions {
+            write_timeout,
+            ..IpcClientOptions::default()
+        },
+    )
+    .await
+    .expect("connect");
     let (mut client, _) = pending
         .handshake(sample_ready("1.0"), HS_TIMEOUT)
         .await
@@ -311,9 +317,15 @@ async fn client_split_writer_send_times_out_and_poisons() {
     });
 
     let write_timeout = Duration::from_millis(25);
-    let pending = IpcClient::connect_with_options(&path, IpcClientOptions { write_timeout })
-        .await
-        .expect("connect");
+    let pending = IpcClient::connect_with_options(
+        &path,
+        IpcClientOptions {
+            write_timeout,
+            ..IpcClientOptions::default()
+        },
+    )
+    .await
+    .expect("connect");
     let (client, _) = pending
         .handshake(sample_ready("1.0"), HS_TIMEOUT)
         .await

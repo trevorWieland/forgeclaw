@@ -8,27 +8,25 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
-use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::time::Instant;
-use tokio_util::codec::Framed;
 
-use crate::codec::{FrameCodec, decode_container_to_host, encode_host_to_container};
+use crate::codec::{decode_container_to_host, encode_host_to_container_frame};
 use crate::error::{IpcError, ProtocolError};
 use crate::message::{ContainerToHost, GroupInfo, HostToContainer, InitPayload, ReadyPayload};
 use crate::peer_cred::SessionIdentity;
 use crate::policy::UnknownTrafficBudget;
+use crate::transport::{FrameReader, FrameWriter};
 use crate::util::truncate_for_log;
+use crate::util::{SharedWriteHalf, ShutdownHandle};
 use crate::version::{NegotiatedProtocolVersion, PROTOCOL_VERSION, negotiate};
 
-use super::IpcConnection;
 use super::UnknownTrafficLimitConfig;
 use super::listener::UnauthorizedCommandLimitConfig;
 use super::protocol::{
     log_fatal_protocol_error, log_outbound_validation_rejection, log_unknown_message,
 };
+use super::{ConnectionTransport, IpcConnection};
 
 /// A server-side connection that has not yet completed the handshake.
 ///
@@ -41,7 +39,9 @@ use super::protocol::{
 /// protocol handshake completes.
 #[derive(Debug)]
 pub struct PendingConnection {
-    framed: Framed<UnixStream, FrameCodec>,
+    reader: FrameReader<tokio::net::unix::OwnedReadHalf>,
+    writer: FrameWriter<SharedWriteHalf<tokio::net::unix::OwnedWriteHalf>>,
+    shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
     poisoned: bool,
     unknown_budget: UnknownTrafficBudget,
     last_frame_len: usize,
@@ -59,8 +59,12 @@ impl PendingConnection {
         unknown_traffic_limit: UnknownTrafficLimitConfig,
         write_timeout: Duration,
     ) -> Self {
+        let (read_half, write_half) = stream.into_split();
+        let (shared_write, shutdown_handle) = SharedWriteHalf::new(write_half);
         Self {
-            framed: Framed::new(stream, FrameCodec::new()),
+            reader: FrameReader::new(read_half),
+            writer: FrameWriter::new(shared_write),
+            shutdown_handle,
             poisoned: false,
             unknown_budget: UnknownTrafficBudget::new(Instant::now(), unknown_traffic_limit),
             last_frame_len: 0,
@@ -116,7 +120,11 @@ impl PendingConnection {
                     "IPC handshake complete"
                 );
                 let conn = IpcConnection::from_parts(
-                    self.framed,
+                    ConnectionTransport {
+                        reader: self.reader,
+                        writer: self.writer,
+                        shutdown_handle: self.shutdown_handle,
+                    },
                     self.identity,
                     active_job_id,
                     negotiated_version,
@@ -189,7 +197,7 @@ impl PendingConnection {
 
     /// Cleanly close the connection without completing the handshake.
     pub async fn close(mut self) -> Result<(), IpcError> {
-        self.framed.close().await?;
+        self.writer.shutdown().await?;
         Ok(())
     }
 
@@ -202,22 +210,23 @@ impl PendingConnection {
 
     async fn poison(&mut self) {
         self.poisoned = true;
-        let _ = self.framed.get_mut().shutdown().await;
+        self.shutdown_handle.trigger().await;
     }
 
     async fn send_host(&mut self, msg: &HostToContainer) -> Result<(), IpcError> {
         self.check_poisoned()?;
-        let bytes: Bytes = match encode_host_to_container(msg) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                log_outbound_validation_rejection(&self.identity, "handshake", &e);
-                if e.is_fatal() {
-                    self.poison().await;
-                }
-                return Err(e);
+        let result = self
+            .writer
+            .send_with(|buf| encode_host_to_container_frame(msg, buf))
+            .await;
+        if let Err(ref e) = result {
+            if matches!(
+                e,
+                IpcError::Protocol(ProtocolError::OutboundValidation { .. })
+            ) {
+                log_outbound_validation_rejection(&self.identity, "handshake", e);
             }
-        };
-        let result = self.framed.send(bytes).await;
+        }
         if let Err(ref e) = result {
             if e.is_fatal() {
                 self.poison().await;
@@ -228,15 +237,13 @@ impl PendingConnection {
 
     async fn recv_container_strict(&mut self) -> Result<ContainerToHost, IpcError> {
         self.check_poisoned()?;
-        let frame = match self.framed.next().await.transpose() {
-            Ok(Some(f)) => f,
-            Ok(None) => {
-                self.poisoned = true;
-                return Err(IpcError::Closed);
-            }
+        let frame = match self.reader.recv_frame().await {
+            Ok(frame) => frame,
             Err(e) => {
-                log_fatal_protocol_error(&self.identity, "handshake", &e);
-                self.poison().await;
+                if e.is_fatal() {
+                    log_fatal_protocol_error(&self.identity, "handshake", &e);
+                    self.poison().await;
+                }
                 return Err(e);
             }
         };

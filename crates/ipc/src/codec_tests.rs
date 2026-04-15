@@ -1,6 +1,6 @@
 use super::{
     FrameCodec, LENGTH_PREFIX_BYTES, MAX_FRAME_BYTES, decode_container_to_host,
-    decode_typed_message, encode_message,
+    decode_typed_message, encode_message_frame,
 };
 use crate::error::{FrameError, IpcError, ProtocolError};
 use crate::message::{ContainerToHost, ReadyPayload};
@@ -229,8 +229,10 @@ fn encode_message_roundtrips_through_decode() {
         adapter_version: "1.0.0".parse().expect("valid adapter version"),
         protocol_version: "1.0".parse().expect("valid protocol version"),
     });
-    let bytes = encode_message(&msg).expect("encode");
-    let back = decode_container_to_host(&bytes).expect("decode");
+    let mut framed = BytesMut::new();
+    encode_message_frame(&msg, &mut framed).expect("encode");
+    let payload = &framed[LENGTH_PREFIX_BYTES..];
+    let back = decode_container_to_host(payload).expect("decode");
     assert_eq!(back, msg);
 }
 
@@ -240,7 +242,8 @@ fn encode_message_rejects_oversize_before_full_buffer_materialization() {
         "type": "synthetic",
         "payload": "x".repeat(MAX_FRAME_BYTES + 256),
     });
-    let err = encode_message(&msg).expect_err("oversize payload must fail");
+    let mut framed = BytesMut::new();
+    let err = encode_message_frame(&msg, &mut framed).expect_err("oversize payload must fail");
     assert!(
         matches!(
             err,

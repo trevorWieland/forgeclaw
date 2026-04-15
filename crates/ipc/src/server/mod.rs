@@ -28,15 +28,10 @@ pub use pending::PendingConnection;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use forgeclaw_core::JobId;
-use futures_util::{SinkExt, StreamExt};
-use tokio::io::AsyncWriteExt;
-use tokio::net::UnixStream;
 use tokio::time::Instant;
-use tokio_util::codec::Framed;
 
-use crate::codec::FrameCodec;
+use crate::codec::encode_host_to_container_frame;
 use crate::error::{IpcError, ProtocolError};
 use crate::message::authorized::AuthorizedCommand;
 use crate::message::command::ClassifiedCommand;
@@ -44,6 +39,9 @@ use crate::message::{ContainerToHost, HostToContainer};
 use crate::peer_cred::SessionIdentity;
 use crate::policy::UnknownTrafficBudget;
 use crate::recv_policy::UnknownTypePolicy;
+use crate::semantics::validate_classified_command;
+use crate::transport::{FrameReader, FrameWriter};
+use crate::util::{SharedWriteHalf, ShutdownHandle};
 use crate::version::NegotiatedProtocolVersion;
 
 use self::protocol::{
@@ -87,6 +85,7 @@ async fn authorize_classified_command(
     identity: &Arc<SessionIdentity>,
     state: &mut ConnectionState,
 ) -> Result<AuthorizedCommand, IpcError> {
+    validate_classified_command(state.semantics(), &classified)?;
     let result = auth::authorize_command(classified, identity.as_ref());
     if let Err(IpcError::Protocol(ProtocolError::Unauthorized { command, reason })) = &result {
         let phase = state.phase_name();
@@ -139,6 +138,17 @@ pub(super) fn authorized_result_to_event(
     }
 }
 
+pub(super) fn handle_unknown_inbound(
+    identity: &Arc<SessionIdentity>,
+    unknown_budget: &mut UnknownTrafficBudget,
+    last_frame_len: usize,
+    ty: &str,
+) -> Result<(), IpcError> {
+    unknown_budget.on_unknown(last_frame_len, Instant::now())?;
+    log_unknown_message(identity, ty, unknown_budget);
+    Ok(())
+}
+
 /// Non-fatal unauthorized command rejection surfaced via
 /// [`IpcInboundEvent::Unauthorized`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +177,13 @@ pub enum IpcInboundEvent {
     Message(ContainerToHost),
 }
 
+#[derive(Debug)]
+pub(crate) struct ConnectionTransport {
+    pub(crate) reader: FrameReader<tokio::net::unix::OwnedReadHalf>,
+    pub(crate) writer: FrameWriter<SharedWriteHalf<tokio::net::unix::OwnedWriteHalf>>,
+    pub(crate) shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
+}
+
 /// An established host-side connection to a single container.
 ///
 /// Created by [`PendingConnection::handshake`] after a successful
@@ -178,7 +195,9 @@ pub enum IpcInboundEvent {
 /// connection and shut down the socket.
 #[derive(Debug)]
 pub struct IpcConnection {
-    framed: Framed<UnixStream, FrameCodec>,
+    reader: FrameReader<tokio::net::unix::OwnedReadHalf>,
+    writer: FrameWriter<SharedWriteHalf<tokio::net::unix::OwnedWriteHalf>>,
+    shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
     poisoned: bool,
     unknown_budget: UnknownTrafficBudget,
     last_frame_len: usize,
@@ -190,7 +209,7 @@ pub struct IpcConnection {
 impl IpcConnection {
     /// Construct from an already-handshaked transport.
     pub(crate) fn from_parts(
-        framed: Framed<UnixStream, FrameCodec>,
+        transport: ConnectionTransport,
         identity: Arc<SessionIdentity>,
         active_job_id: JobId,
         negotiated_version: NegotiatedProtocolVersion,
@@ -199,7 +218,9 @@ impl IpcConnection {
         write_timeout: Duration,
     ) -> Self {
         Self {
-            framed,
+            reader: transport.reader,
+            writer: transport.writer,
+            shutdown_handle: transport.shutdown_handle,
             poisoned: false,
             unknown_budget: UnknownTrafficBudget::new(Instant::now(), unknown_traffic_limit),
             last_frame_len: 0,
@@ -248,33 +269,43 @@ impl IpcConnection {
 
     async fn poison(&mut self) {
         self.poisoned = true;
-        let _ = self.framed.get_mut().shutdown().await;
+        self.shutdown_handle.trigger().await;
     }
 
     /// Send a [`HostToContainer`] message to the peer.
     pub async fn send_host(&mut self, msg: &HostToContainer) -> Result<(), IpcError> {
         self.check_poisoned()?;
         let phase_name_before = self.state.phase_name();
-        let bytes: Bytes =
-            match preflight_and_enforce_outbound(&mut self.state, msg, Instant::now()) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    if matches!(
-                        e,
-                        IpcError::Protocol(ProtocolError::OutboundValidation { .. })
-                    ) {
-                        log_outbound_validation_rejection(&self.identity, phase_name_before, &e);
-                    } else {
-                        log_fatal_protocol_error(&self.identity, phase_name_before, &e);
-                        self.poison().await;
-                    }
-                    return Err(e);
-                }
-            };
-        let result = match tokio::time::timeout(self.write_timeout, self.framed.send(bytes)).await {
+        if let Err(e) = preflight_and_enforce_outbound(&mut self.state, msg, Instant::now()) {
+            if matches!(
+                e,
+                IpcError::Protocol(ProtocolError::OutboundValidation { .. })
+            ) {
+                log_outbound_validation_rejection(&self.identity, phase_name_before, &e);
+            } else {
+                log_fatal_protocol_error(&self.identity, phase_name_before, &e);
+                self.poison().await;
+            }
+            return Err(e);
+        }
+        let result = match tokio::time::timeout(
+            self.write_timeout,
+            self.writer
+                .send_with(|buf| encode_host_to_container_frame(msg, buf)),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_elapsed) => Err(IpcError::Timeout(self.write_timeout)),
         };
+        if let Err(ref e) = result {
+            if matches!(
+                e,
+                IpcError::Protocol(ProtocolError::OutboundValidation { .. })
+            ) {
+                log_outbound_validation_rejection(&self.identity, phase_name_before, e);
+            }
+        }
         if let Err(ref e) = result {
             if e.is_fatal() {
                 log_fatal_protocol_error(&self.identity, self.state.phase_name(), e);
@@ -286,23 +317,21 @@ impl IpcConnection {
 
     async fn recv_container_unchecked_one(&mut self) -> Result<ContainerToHost, IpcError> {
         self.check_poisoned()?;
-        let next_frame = if let Some(deadline) = recv_deadline(&self.state) {
-            match tokio::time::timeout_at(deadline, self.framed.next()).await {
-                Ok(next) => next,
+        let frame_result = if let Some(deadline) = recv_deadline(&self.state) {
+            match tokio::time::timeout_at(deadline, self.reader.recv_frame()).await {
+                Ok(result) => result,
                 Err(_elapsed) => return Err(recv_timeout_error(&self.state)),
             }
         } else {
-            self.framed.next().await
+            self.reader.recv_frame().await
         };
-        let frame = match next_frame.transpose() {
-            Ok(Some(f)) => f,
-            Ok(None) => {
-                self.poisoned = true;
-                return Err(IpcError::Closed);
-            }
+        let frame = match frame_result {
+            Ok(frame) => frame,
             Err(e) => {
-                log_fatal_protocol_error(&self.identity, self.state.phase_name(), &e);
-                self.poison().await;
+                if e.is_fatal() {
+                    log_fatal_protocol_error(&self.identity, self.state.phase_name(), &e);
+                    self.poison().await;
+                }
                 return Err(e);
             }
         };
@@ -342,15 +371,16 @@ impl IpcConnection {
                         return Ok(msg);
                     }
                     Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty))) => {
-                        if let Err(e) = self
-                            .unknown_budget
-                            .on_unknown(self.last_frame_len, Instant::now())
-                        {
+                        if let Err(e) = handle_unknown_inbound(
+                            &self.identity,
+                            &mut self.unknown_budget,
+                            self.last_frame_len,
+                            &ty,
+                        ) {
                             log_fatal_protocol_error(&self.identity, self.state.phase_name(), &e);
                             self.poison().await;
                             return Err(e);
                         }
-                        log_unknown_message(&self.identity, &ty, &self.unknown_budget);
                     }
                     Err(e) => return Err(e),
                 }
@@ -435,7 +465,7 @@ impl IpcConnection {
 
     /// Cleanly close the connection.
     pub async fn close(mut self) -> Result<(), IpcError> {
-        self.framed.close().await?;
+        self.writer.shutdown().await?;
         Ok(())
     }
 }

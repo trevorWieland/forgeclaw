@@ -395,6 +395,7 @@ pub(super) fn group_extensions_schema(
             "maxLength": MAX_GROUP_EXTENSIONS_KEY_CHARS
         },
         "additionalProperties": bounded_extension_value_schema(MAX_GROUP_EXTENSIONS_NESTED_DEPTH),
+        "x-maxEncodedBytes": MAX_GROUP_EXTENSIONS_ENCODED_BYTES,
         "description": "Extension envelope with bounded key/value complexity. Top-level maxProperties includes the required `version` key."
     })
 }

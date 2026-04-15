@@ -251,3 +251,10 @@ fn host_to_container_schema_rejects_invalid_timestamp_with_valid_timezone() {
         "schema validation should report a concrete error"
     );
 }
+
+#[test]
+fn container_to_host_schema_publishes_extensions_encoded_size_metadata() {
+    let schema_value = load_schema("container_to_host.schema.json");
+    let extensions = &schema_value["$defs"]["RegisterGroupPayload"]["properties"]["extensions"];
+    assert_eq!(extensions["x-maxEncodedBytes"], 65536);
+}

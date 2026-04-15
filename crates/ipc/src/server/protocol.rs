@@ -11,6 +11,7 @@ use crate::lifecycle::{
 };
 use crate::message::{ContainerToHost, HostToContainer};
 use crate::policy::DEFAULT_HEARTBEAT_TIMEOUT;
+use crate::semantics::{ProtocolSemantics, validate_container_to_host, validate_host_to_container};
 use crate::version::NegotiatedProtocolVersion;
 
 use super::listener::UnauthorizedCommandLimitConfig;
@@ -31,6 +32,7 @@ pub(super) use logging::{
 pub(super) struct ConnectionState {
     lifecycle: LifecycleState,
     negotiated_version: NegotiatedProtocolVersion,
+    semantics: ProtocolSemantics,
     heartbeat_deadline: Option<Instant>,
     draining_deadline: Option<Instant>,
     draining_timeout_ms: Option<u64>,
@@ -54,6 +56,7 @@ impl ConnectionState {
         Self {
             lifecycle: LifecycleState::new(active_job_id),
             negotiated_version,
+            semantics: ProtocolSemantics::from_negotiated(negotiated_version),
             heartbeat_deadline: Some(now + DEFAULT_HEARTBEAT_TIMEOUT),
             draining_deadline: None,
             draining_timeout_ms: None,
@@ -73,6 +76,10 @@ impl ConnectionState {
 
     pub(super) fn negotiated_version(&self) -> NegotiatedProtocolVersion {
         self.negotiated_version
+    }
+
+    pub(super) fn semantics(&self) -> ProtocolSemantics {
+        self.semantics
     }
 }
 
@@ -239,6 +246,7 @@ pub(super) fn enforce_outbound_state(
     msg: &HostToContainer,
     now: Instant,
 ) -> Result<LifecycleAction, IpcError> {
+    validate_host_to_container(state.semantics, msg)?;
     let phase_before = state.lifecycle.phase();
     let action = enforce_host_to_container(&mut state.lifecycle, msg)?;
     match msg {
@@ -265,6 +273,7 @@ pub(super) fn enforce_inbound_state(
     msg: &ContainerToHost,
     now: Instant,
 ) -> Result<LifecycleAction, IpcError> {
+    validate_container_to_host(state.semantics, msg)?;
     let action = enforce_container_to_host(&mut state.lifecycle, msg)?;
     match msg {
         ContainerToHost::OutputComplete(_) => {

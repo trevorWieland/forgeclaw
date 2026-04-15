@@ -44,6 +44,11 @@ impl NegotiatedProtocolVersion {
     pub fn minor(self) -> u32 {
         self.minor
     }
+
+    #[cfg(test)]
+    pub(crate) const fn new_for_tests(major: u32, minor: u32) -> Self {
+        Self { major, minor }
+    }
 }
 
 /// Compares a peer's advertised protocol version against [`PROTOCOL_VERSION`].

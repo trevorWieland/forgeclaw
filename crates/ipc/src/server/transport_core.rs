@@ -1,7 +1,6 @@
-use bytes::Bytes;
 use tokio::time::Instant;
 
-use crate::codec::{decode_container_to_host, encode_host_to_container};
+use crate::codec::decode_container_to_host;
 use crate::error::IpcError;
 use crate::lifecycle::LifecycleAction;
 use crate::message::{ContainerToHost, HostToContainer};
@@ -12,10 +11,9 @@ pub(super) fn preflight_and_enforce_outbound(
     state: &mut ConnectionState,
     msg: &HostToContainer,
     now: Instant,
-) -> Result<Bytes, IpcError> {
-    let bytes = encode_host_to_container(msg)?;
+) -> Result<(), IpcError> {
     let _ = enforce_outbound_state(state, msg, now)?;
-    Ok(bytes)
+    Ok(())
 }
 
 pub(super) fn decode_and_enforce_inbound(

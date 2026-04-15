@@ -4925,7 +4925,8 @@
           },
           "required": [
             "version"
-          ]
+          ],
+          "x-maxEncodedBytes": 65536
         },
         "name": {
           "description": "Human-readable group name.",
