@@ -3,14 +3,22 @@ use crate::error::IpcError;
 use crate::lifecycle::LifecycleAction;
 use crate::message::{ContainerToHost, HostToContainer};
 
-use super::protocol::{ClientConnectionState, enforce_inbound_state, enforce_outbound_state};
+use super::protocol::{
+    ClientConnectionState, enforce_inbound_state, enforce_outbound_state, validate_outbound_state,
+};
 
-pub(super) fn preflight_and_enforce_outbound(
+pub(super) fn prepare_outbound(
+    state: &ClientConnectionState,
+    msg: &ContainerToHost,
+) -> Result<(), IpcError> {
+    validate_outbound_state(state, msg)
+}
+
+pub(super) fn commit_outbound(
     state: &mut ClientConnectionState,
     msg: &ContainerToHost,
 ) -> Result<LifecycleAction, IpcError> {
-    let action = enforce_outbound_state(state, msg)?;
-    Ok(action)
+    enforce_outbound_state(state, msg)
 }
 
 pub(super) fn decode_and_enforce_inbound(

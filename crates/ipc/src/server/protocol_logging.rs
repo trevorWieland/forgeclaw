@@ -172,6 +172,12 @@ fn format_error_for_log(err: &IpcError) -> String {
                 truncate_for_log(got.as_ref())
             )
         }
+        IpcError::Protocol(ProtocolError::IdleReadTimeout {
+            phase,
+            timeout_secs,
+        }) => {
+            format!("idle read timeout: phase={phase}, timeout_secs={timeout_secs}")
+        }
         IpcError::Protocol(ProtocolError::InvalidCommandPayload { command, reason }) => {
             format!(
                 "invalid command payload: command={}, reason={}",
@@ -190,6 +196,18 @@ fn format_error_for_log(err: &IpcError) -> String {
                 truncate_for_log(direction),
                 truncate_for_log(message_type),
                 truncate_for_log(field_path),
+                truncate_for_log(reason)
+            )
+        }
+        IpcError::Protocol(ProtocolError::OutboundStateDivergence {
+            direction,
+            message_type,
+            reason,
+        }) => {
+            format!(
+                "outbound state divergence: direction={}, type={}, reason={}",
+                truncate_for_log(direction),
+                truncate_for_log(message_type),
                 truncate_for_log(reason)
             )
         }
@@ -286,6 +304,7 @@ fn error_class(err: &IpcError) -> &'static str {
         }
         IpcError::Protocol(ProtocolError::LifecycleViolation { .. }) => "lifecycle_violation",
         IpcError::Protocol(ProtocolError::JobIdMismatch { .. }) => "job_id_mismatch",
+        IpcError::Protocol(ProtocolError::IdleReadTimeout { .. }) => "idle_read_timeout",
         IpcError::Protocol(ProtocolError::HeartbeatTimeout { .. }) => "heartbeat_timeout",
         IpcError::Protocol(ProtocolError::ShutdownDeadlineExceeded { .. }) => {
             "shutdown_deadline_exceeded"
@@ -294,6 +313,9 @@ fn error_class(err: &IpcError) -> &'static str {
             "invalid_command_payload"
         }
         IpcError::Protocol(ProtocolError::OutboundValidation { .. }) => "outbound_validation",
+        IpcError::Protocol(ProtocolError::OutboundStateDivergence { .. }) => {
+            "outbound_state_divergence"
+        }
         IpcError::Closed => "closed",
         IpcError::Timeout(_) => "timeout",
     }

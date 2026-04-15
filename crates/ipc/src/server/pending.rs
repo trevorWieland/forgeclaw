@@ -26,7 +26,7 @@ use super::listener::UnauthorizedCommandLimitConfig;
 use super::protocol::{
     log_fatal_protocol_error, log_outbound_validation_rejection, log_unknown_message,
 };
-use super::{ConnectionTransport, IpcConnection};
+use super::{ConnectionRuntimeOptions, ConnectionTransport, IpcConnection};
 
 /// A server-side connection that has not yet completed the handshake.
 ///
@@ -49,6 +49,7 @@ pub struct PendingConnection {
     unauthorized_limit: UnauthorizedCommandLimitConfig,
     unknown_traffic_limit: UnknownTrafficLimitConfig,
     write_timeout: Duration,
+    idle_read_timeout: Option<Duration>,
 }
 
 impl PendingConnection {
@@ -58,6 +59,7 @@ impl PendingConnection {
         unauthorized_limit: UnauthorizedCommandLimitConfig,
         unknown_traffic_limit: UnknownTrafficLimitConfig,
         write_timeout: Duration,
+        idle_read_timeout: Option<Duration>,
     ) -> Self {
         let (read_half, write_half) = stream.into_split();
         let (shared_write, shutdown_handle) = SharedWriteHalf::new(write_half);
@@ -72,6 +74,7 @@ impl PendingConnection {
             unauthorized_limit,
             unknown_traffic_limit,
             write_timeout,
+            idle_read_timeout,
         }
     }
 
@@ -128,9 +131,12 @@ impl PendingConnection {
                     self.identity,
                     active_job_id,
                     negotiated_version,
-                    self.unauthorized_limit,
-                    self.unknown_traffic_limit,
-                    self.write_timeout,
+                    ConnectionRuntimeOptions {
+                        unauthorized_limit: self.unauthorized_limit,
+                        unknown_traffic_limit: self.unknown_traffic_limit,
+                        write_timeout: self.write_timeout,
+                        idle_read_timeout: self.idle_read_timeout,
+                    },
                 );
                 Ok((conn, ready))
             }

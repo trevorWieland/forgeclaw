@@ -182,6 +182,16 @@ fn outbound_validation_is_not_fatal() {
 }
 
 #[test]
+fn outbound_state_divergence_is_fatal() {
+    let err = IpcError::Protocol(ProtocolError::OutboundStateDivergence {
+        direction: "host_to_container",
+        message_type: "messages",
+        reason: "job changed between prepare and commit".to_owned(),
+    });
+    assert!(err.is_fatal());
+}
+
+#[test]
 fn unauthorized_display() {
     let err = ProtocolError::Unauthorized {
         command: "register_group",
@@ -311,6 +321,27 @@ fn heartbeat_timeout_display() {
         err.to_string(),
         "heartbeat timeout: no heartbeat for 60s while in phase processing"
     );
+}
+
+#[test]
+fn idle_read_timeout_display() {
+    let err = ProtocolError::IdleReadTimeout {
+        phase: "idle",
+        timeout_secs: 60,
+    };
+    assert_eq!(
+        err.to_string(),
+        "idle read timeout: no full frame for 60s while in phase idle"
+    );
+}
+
+#[test]
+fn idle_read_timeout_is_fatal() {
+    let err = IpcError::Protocol(ProtocolError::IdleReadTimeout {
+        phase: "idle",
+        timeout_secs: 60,
+    });
+    assert!(err.is_fatal());
 }
 
 #[test]

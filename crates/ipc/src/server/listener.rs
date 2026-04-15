@@ -157,6 +157,8 @@ pub struct IpcServerOptions {
     pub peer_credential_policy: PeerCredentialPolicy,
     /// Post-handshake write timeout for outbound sends.
     pub write_timeout: Duration,
+    /// Idle-phase read timeout for inbound receives (`None` disables).
+    pub idle_read_timeout: Option<Duration>,
 }
 
 impl IpcServerOptions {
@@ -177,6 +179,7 @@ impl Default for IpcServerOptions {
             unknown_traffic_limit: UnknownTrafficLimitConfig::default(),
             peer_credential_policy: PeerCredentialPolicy::default(),
             write_timeout: Duration::from_secs(5),
+            idle_read_timeout: Some(Duration::from_secs(60)),
         }
     }
 }
@@ -312,6 +315,7 @@ impl IpcServer {
             self.options.unauthorized_limit,
             self.options.unknown_traffic_limit,
             self.options.write_timeout,
+            self.options.idle_read_timeout,
         ))
     }
 

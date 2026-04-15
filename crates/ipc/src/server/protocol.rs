@@ -31,11 +31,11 @@ pub(super) use logging::{
 #[derive(Debug, Clone)]
 pub(super) struct ConnectionState {
     lifecycle: LifecycleState,
-    negotiated_version: NegotiatedProtocolVersion,
     semantics: ProtocolSemantics,
     heartbeat_deadline: Option<Instant>,
     draining_deadline: Option<Instant>,
     draining_timeout_ms: Option<u64>,
+    idle_read_timeout: Option<Duration>,
     unauthorized_limit: UnauthorizedCommandLimitConfig,
     unauthorized_rejections: u64,
     unauthorized_tokens: f64,
@@ -51,15 +51,16 @@ impl ConnectionState {
         active_job_id: forgeclaw_core::JobId,
         negotiated_version: NegotiatedProtocolVersion,
         unauthorized_limit: UnauthorizedCommandLimitConfig,
+        idle_read_timeout: Option<Duration>,
     ) -> Self {
         let unauthorized_limit = normalize_unauthorized_limit(unauthorized_limit);
         Self {
             lifecycle: LifecycleState::new(active_job_id),
-            negotiated_version,
             semantics: ProtocolSemantics::from_negotiated(negotiated_version),
             heartbeat_deadline: Some(now + DEFAULT_HEARTBEAT_TIMEOUT),
             draining_deadline: None,
             draining_timeout_ms: None,
+            idle_read_timeout,
             unauthorized_limit,
             unauthorized_rejections: 0,
             unauthorized_tokens: f64::from(unauthorized_limit.burst_capacity),
@@ -72,10 +73,6 @@ impl ConnectionState {
 
     pub(super) fn phase_name(&self) -> &'static str {
         self.lifecycle.phase_name()
-    }
-
-    pub(super) fn negotiated_version(&self) -> NegotiatedProtocolVersion {
-        self.negotiated_version
     }
 
     pub(super) fn semantics(&self) -> ProtocolSemantics {
@@ -94,11 +91,12 @@ fn normalize_unauthorized_limit(
     }
 }
 
-pub(super) fn recv_deadline(state: &ConnectionState) -> Option<Instant> {
+pub(super) fn recv_deadline(state: &ConnectionState, now: Instant) -> Option<Instant> {
     match state.lifecycle.phase() {
         ConnectionPhase::Processing => state.heartbeat_deadline,
         ConnectionPhase::DrainingAwaitingCompletion => state.draining_deadline,
-        ConnectionPhase::Idle | ConnectionPhase::Closed => None,
+        ConnectionPhase::Idle => state.idle_read_timeout.map(|timeout| now + timeout),
+        ConnectionPhase::Closed => None,
     }
 }
 
@@ -114,7 +112,14 @@ pub(super) fn recv_timeout_error(state: &ConnectionState) -> IpcError {
                 deadline_ms: state.draining_timeout_ms.unwrap_or(0),
             })
         }
-        ConnectionPhase::Idle | ConnectionPhase::Closed => IpcError::Closed,
+        ConnectionPhase::Idle => {
+            let timeout = state.idle_read_timeout.map_or(0, |value| value.as_secs());
+            IpcError::Protocol(ProtocolError::IdleReadTimeout {
+                phase: state.phase_name(),
+                timeout_secs: timeout,
+            })
+        }
+        ConnectionPhase::Closed => IpcError::Closed,
     }
 }
 
@@ -239,6 +244,16 @@ fn unauthorized_enforcement_action(
     let backoff = state.unauthorized_limit.backoff;
     state.unauthorized_backoff_until = Some(now + backoff);
     (UnauthorizedEnforcementAction::Backoff, Some(backoff))
+}
+
+pub(super) fn validate_outbound_state(
+    state: &ConnectionState,
+    msg: &HostToContainer,
+) -> Result<(), IpcError> {
+    validate_host_to_container(state.semantics, msg)?;
+    let mut lifecycle = state.lifecycle.clone();
+    let _ = enforce_host_to_container(&mut lifecycle, msg)?;
+    Ok(())
 }
 
 pub(super) fn enforce_outbound_state(

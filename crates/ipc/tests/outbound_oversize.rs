@@ -8,7 +8,8 @@ use forgeclaw_ipc::{
     ContainerToHost, GroupCapabilities, GroupExtensions, GroupExtensionsError,
     GroupExtensionsVersion, GroupInfo, HistoricalMessage, HistoricalMessages, HostToContainer,
     InitConfig, InitContext, InitPayload, IpcClient, IpcError, IpcInboundEvent, IpcServer,
-    MAX_FRAME_BYTES, MessagesPayload, ProtocolError, ReadyPayload, ShutdownPayload, ShutdownReason,
+    MAX_FRAME_BYTES, MessagesPayload, OutputCompletePayload, OutputDeltaPayload, ProtocolError,
+    ReadyPayload, ShutdownPayload, ShutdownReason, StopReason,
 };
 use tempfile::tempdir;
 
@@ -82,7 +83,7 @@ fn oversize_extensions_error() -> GroupExtensionsError {
     .expect_err("oversize extensions should fail constructor")
 }
 
-fn oversize_host_message() -> HostToContainer {
+fn oversize_host_message(job_id: &str) -> HostToContainer {
     let large_text = "🦀".repeat(32 * 1024);
     let large_text = large_text.parse().expect("valid max-char text");
     let template = HistoricalMessage {
@@ -92,11 +93,28 @@ fn oversize_host_message() -> HostToContainer {
     };
 
     HostToContainer::Messages(MessagesPayload {
-        job_id: JobId::new("job-oversize-1").expect("valid job id"),
+        job_id: JobId::new(job_id).expect("valid job id"),
         messages: std::iter::repeat_n(template, 90)
             .collect::<Vec<_>>()
             .try_into()
             .expect("messages within bound"),
+    })
+}
+
+fn minimal_host_messages(job_id: &str) -> HostToContainer {
+    HostToContainer::Messages(MessagesPayload {
+        job_id: JobId::new(job_id).expect("valid job id"),
+        messages: HistoricalMessages::default(),
+    })
+}
+
+fn output_complete(job_id: &str) -> ContainerToHost {
+    ContainerToHost::OutputComplete(OutputCompletePayload {
+        job_id: JobId::new(job_id).expect("valid job id"),
+        result: Some("done".parse().expect("valid result")),
+        session_id: None,
+        token_usage: None,
+        stop_reason: StopReason::EndTurn,
     })
 }
 
@@ -112,10 +130,13 @@ async fn client_unsplit_extensions_oversize_is_rejected_and_connection_remains_u
             .handshake(sample_init(), HS_TIMEOUT)
             .await
             .expect("handshake");
-        let event = conn.recv_event().await.expect("recv follow-up heartbeat");
+        let event = conn
+            .recv_event()
+            .await
+            .expect("recv follow-up output_delta");
         assert!(matches!(
             event,
-            IpcInboundEvent::Message(ContainerToHost::Heartbeat(_))
+            IpcInboundEvent::Message(ContainerToHost::OutputDelta(_))
         ));
     });
 
@@ -132,13 +153,14 @@ async fn client_unsplit_extensions_oversize_is_rejected_and_connection_remains_u
     );
 
     client
-        .send(&ContainerToHost::Heartbeat(
-            forgeclaw_ipc::HeartbeatPayload {
-                timestamp: "2026-04-03T10:00:00Z".parse().expect("valid timestamp"),
-            },
-        ))
+        .send(&ContainerToHost::OutputDelta(OutputDeltaPayload {
+            text: "follow-up".parse().expect("valid output"),
+            job_id: JobId::new("job-oversize-1").expect("valid job id"),
+        }))
         .await
-        .expect("client should remain usable after outbound oversize preflight failure");
+        .expect(
+            "client should remain in processing state after outbound oversize preflight failure",
+        );
 
     accept_task.await.expect("join");
 }
@@ -156,10 +178,13 @@ async fn client_split_writer_extensions_oversize_is_rejected_and_connection_rema
             .await
             .expect("handshake");
         let (_writer, mut reader) = conn.into_split();
-        let event = reader.recv_event().await.expect("recv follow-up heartbeat");
+        let event = reader
+            .recv_event()
+            .await
+            .expect("recv follow-up output_delta");
         assert!(matches!(
             event,
-            IpcInboundEvent::Message(ContainerToHost::Heartbeat(_))
+            IpcInboundEvent::Message(ContainerToHost::OutputDelta(_))
         ));
     });
 
@@ -177,13 +202,12 @@ async fn client_split_writer_extensions_oversize_is_rejected_and_connection_rema
     ));
 
     writer
-        .send(&ContainerToHost::Heartbeat(
-            forgeclaw_ipc::HeartbeatPayload {
-                timestamp: "2026-04-03T10:00:00Z".parse().expect("valid timestamp"),
-            },
-        ))
+        .send(&ContainerToHost::OutputDelta(OutputDeltaPayload {
+            text: "follow-up".parse().expect("valid output"),
+            job_id: JobId::new("job-oversize-1").expect("valid job id"),
+        }))
         .await
-        .expect("split writer should remain usable after outbound oversize preflight failure");
+        .expect("split writer should remain in processing state after outbound oversize preflight failure");
 
     accept_task.await.expect("join");
 }
@@ -202,7 +226,7 @@ async fn server_unsplit_send_oversize_is_rejected_but_connection_remains_usable(
             .expect("handshake");
 
         let err = conn
-            .send_host(&oversize_host_message())
+            .send_host(&oversize_host_message("job-oversize-1"))
             .await
             .expect_err("oversize send must fail");
         assert!(matches!(
@@ -249,7 +273,7 @@ async fn server_split_writer_send_oversize_is_rejected_but_connection_remains_us
         let (mut writer, _reader) = conn.into_split();
 
         let err = writer
-            .send_host(&oversize_host_message())
+            .send_host(&oversize_host_message("job-oversize-1"))
             .await
             .expect_err("oversize send must fail");
         assert!(matches!(
@@ -276,6 +300,141 @@ async fn server_split_writer_send_oversize_is_rejected_but_connection_remains_us
         .handshake(sample_ready(), HS_TIMEOUT)
         .await
         .expect("handshake");
+    let shutdown = client.recv().await.expect("recv shutdown");
+    assert!(matches!(shutdown, HostToContainer::Shutdown(_)));
+
+    accept_task.await.expect("join");
+}
+
+#[tokio::test]
+async fn server_unsplit_idle_rebind_retry_after_oversize_is_consistent() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "oversize-server-idle-retry-unsplit.sock");
+    let server = IpcServer::bind(&path).expect("bind");
+
+    let accept_task = tokio::spawn(async move {
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (mut conn, _ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
+            .await
+            .expect("handshake");
+
+        let event = conn.recv_event().await.expect("recv output_complete");
+        assert!(matches!(
+            event,
+            IpcInboundEvent::Message(ContainerToHost::OutputComplete(_))
+        ));
+
+        let err = conn
+            .send_host(&oversize_host_message("job-oversize-2"))
+            .await
+            .expect_err("oversize send must fail");
+        assert!(matches!(
+            err,
+            IpcError::Protocol(ProtocolError::OutboundValidation {
+                message_type: "messages",
+                field_path,
+                reason,
+                ..
+            }) if field_path == "$frame_bytes" && reason.contains("encoded frame size")
+        ));
+
+        conn.send_host(&minimal_host_messages("job-oversize-2"))
+            .await
+            .expect("retry should succeed with same idle rebind job");
+        conn.send_host(&HostToContainer::Shutdown(ShutdownPayload {
+            reason: ShutdownReason::HostShutdown,
+            deadline_ms: 1_000,
+        }))
+        .await
+        .expect("shutdown should remain sendable");
+    });
+
+    let pending = IpcClient::connect(&path).await.expect("connect");
+    let (mut client, _init) = pending
+        .handshake(sample_ready(), HS_TIMEOUT)
+        .await
+        .expect("handshake");
+
+    client
+        .send(&output_complete("job-oversize-1"))
+        .await
+        .expect("send output_complete");
+    let messages = client.recv().await.expect("recv retry messages");
+    assert!(matches!(
+        messages,
+        HostToContainer::Messages(MessagesPayload { ref job_id, .. })
+            if job_id.as_ref() == "job-oversize-2"
+    ));
+    let shutdown = client.recv().await.expect("recv shutdown");
+    assert!(matches!(shutdown, HostToContainer::Shutdown(_)));
+
+    accept_task.await.expect("join");
+}
+
+#[tokio::test]
+async fn server_split_idle_rebind_retry_after_oversize_is_consistent() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "oversize-server-idle-retry-split.sock");
+    let server = IpcServer::bind(&path).expect("bind");
+
+    let accept_task = tokio::spawn(async move {
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (conn, _ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
+            .await
+            .expect("handshake");
+        let (mut writer, mut reader) = conn.into_split();
+
+        let event = reader.recv_event().await.expect("recv output_complete");
+        assert!(matches!(
+            event,
+            IpcInboundEvent::Message(ContainerToHost::OutputComplete(_))
+        ));
+
+        let err = writer
+            .send_host(&oversize_host_message("job-oversize-2"))
+            .await
+            .expect_err("oversize send must fail");
+        assert!(matches!(
+            err,
+            IpcError::Protocol(ProtocolError::OutboundValidation {
+                message_type: "messages",
+                field_path,
+                reason,
+                ..
+            }) if field_path == "$frame_bytes" && reason.contains("encoded frame size")
+        ));
+
+        writer
+            .send_host(&minimal_host_messages("job-oversize-2"))
+            .await
+            .expect("retry should succeed with same idle rebind job");
+        writer
+            .send_host(&HostToContainer::Shutdown(ShutdownPayload {
+                reason: ShutdownReason::HostShutdown,
+                deadline_ms: 1_000,
+            }))
+            .await
+            .expect("shutdown should remain sendable");
+    });
+
+    let pending = IpcClient::connect(&path).await.expect("connect");
+    let (mut client, _init) = pending
+        .handshake(sample_ready(), HS_TIMEOUT)
+        .await
+        .expect("handshake");
+
+    client
+        .send(&output_complete("job-oversize-1"))
+        .await
+        .expect("send output_complete");
+    let messages = client.recv().await.expect("recv retry messages");
+    assert!(matches!(
+        messages,
+        HostToContainer::Messages(MessagesPayload { ref job_id, .. })
+            if job_id.as_ref() == "job-oversize-2"
+    ));
     let shutdown = client.recv().await.expect("recv shutdown");
     assert!(matches!(shutdown, HostToContainer::Shutdown(_)));
 

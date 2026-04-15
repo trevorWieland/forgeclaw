@@ -25,6 +25,7 @@ fn state_with_job(now: Instant, job_id: &str) -> ConnectionState {
         parse_job_id(job_id),
         negotiate(PROTOCOL_VERSION).expect("local version must negotiate"),
         UnauthorizedCommandLimitConfig::default(),
+        Some(std::time::Duration::from_secs(60)),
     )
 }
 
@@ -173,5 +174,35 @@ fn fatal_logging_truncates_peer_controlled_protocol_version() {
     assert!(
         !output.contains(&long_peer),
         "full peer value leaked to logs"
+    );
+}
+
+#[test]
+fn fatal_logging_maps_idle_read_timeout_error_class() {
+    let capture = CaptureWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(capture.clone())
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let identity = sample_identity();
+
+    tracing::dispatcher::with_default(&dispatch, || {
+        log_fatal_protocol_error(
+            &identity,
+            "idle",
+            &IpcError::Protocol(ProtocolError::IdleReadTimeout {
+                phase: "idle",
+                timeout_secs: 60,
+            }),
+        );
+    });
+
+    let output = capture.output();
+    assert!(
+        output.contains("\"error_class\":\"idle_read_timeout\""),
+        "{output}"
     );
 }

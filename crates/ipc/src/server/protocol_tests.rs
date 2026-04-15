@@ -32,6 +32,7 @@ fn state_with_job(now: Instant, job_id: &str) -> ConnectionState {
         parse_job_id(job_id),
         negotiate(PROTOCOL_VERSION).expect("local version must negotiate"),
         UnauthorizedCommandLimitConfig::default(),
+        Some(Duration::from_secs(60)),
     )
 }
 
@@ -420,6 +421,7 @@ fn unauthorized_limiter_applies_backoff_then_disconnects() {
             backoff: Duration::from_millis(200),
             disconnect_after_strikes: 2,
         },
+        Some(Duration::from_secs(60)),
     );
 
     let first = record_unauthorized_rejection_at(&mut state, now);

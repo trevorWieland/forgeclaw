@@ -238,6 +238,7 @@ pub struct IpcServerOptions {
     pub unknown_traffic_limit: UnknownTrafficLimitConfig,
     pub peer_credential_policy: PeerCredentialPolicy,
     pub write_timeout: Duration,
+    pub idle_read_timeout: Option<Duration>, // default Some(60s), None disables
 }
 
 pub enum PeerCredentialPolicy {
@@ -294,6 +295,7 @@ pub struct IpcConnectionReader { ... }
 // Client (container side)
 pub struct IpcClientOptions {
     pub write_timeout: Duration,
+    pub unknown_traffic_limit: UnknownTrafficLimitConfig,
 }
 
 pub struct IpcClient { ... }

@@ -33,7 +33,6 @@ use crate::outbound_validation::{
     validate_outbound_container_to_host, validate_outbound_host_to_container,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use serde::Deserialize;
 use serde::Serialize;
 use std::io::Write;
 use tokio_util::codec::{Decoder, Encoder};
@@ -182,35 +181,36 @@ impl Decoder for FrameCodec {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct MessageTypeProbe<'a> {
-    #[serde(borrow, default)]
-    r#type: Option<std::borrow::Cow<'a, str>>,
-}
-
-fn probe_message_type(bytes: &[u8]) -> Result<Option<String>, IpcError> {
-    let probe: MessageTypeProbe<'_> = serde_json::from_slice(bytes)
-        .map_err(|e| IpcError::Frame(FrameError::MalformedJson(e.to_string())))?;
-    Ok(probe.r#type.map(std::borrow::Cow::into_owned))
-}
-
 /// Decode a frame payload into a typed protocol message.
 ///
 /// Performs:
-/// - a cheap discriminator probe (`type`) to classify unknown types,
-/// - one typed deserialize into `T` from the original bytes.
+/// - one JSON parse on the success path (`serde_json::from_slice::<T>`),
+/// - fallback discriminator classification (`type`) only when typed
+///   decoding fails, to preserve unknown-vs-malformed semantics.
 pub(crate) fn decode_typed_message<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
     known_types: &[&str],
 ) -> Result<T, IpcError> {
     std::str::from_utf8(bytes).map_err(|_| IpcError::Frame(FrameError::InvalidUtf8))?;
-    if let Some(ty) = probe_message_type(bytes)? {
-        if !known_types.contains(&ty.as_str()) {
-            return Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty)));
+    match serde_json::from_slice::<T>(bytes) {
+        Ok(message) => Ok(message),
+        Err(typed_err) => {
+            let value: serde_json::Value = serde_json::from_slice(bytes)
+                .map_err(|e| IpcError::Frame(FrameError::MalformedJson(e.to_string())))?;
+            if let Some(ty) = value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+            {
+                if !known_types.contains(&ty.as_str()) {
+                    return Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty)));
+                }
+            }
+            Err(IpcError::Frame(FrameError::MalformedJson(
+                typed_err.to_string(),
+            )))
         }
     }
-    serde_json::from_slice::<T>(bytes)
-        .map_err(|e| IpcError::Frame(FrameError::MalformedJson(e.to_string())))
 }
 
 /// Serialize a protocol message directly into a framed write buffer.

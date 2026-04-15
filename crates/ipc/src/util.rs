@@ -7,21 +7,19 @@ use std::task::{Context, Poll};
 
 use tokio::io::AsyncWrite;
 
-/// Maximum characters for any peer-controlled string emitted to logs.
-const MAX_LOG_FIELD_LEN: usize = 256;
+/// Maximum bytes for any peer-controlled string emitted to logs.
+const MAX_LOG_FIELD_BYTES: usize = 256;
 
 /// Truncate a peer-controlled string for safe inclusion in structured
 /// log fields.
 pub(crate) fn truncate_for_log(s: &str) -> String {
-    if s.len() <= MAX_LOG_FIELD_LEN {
+    if s.len() <= MAX_LOG_FIELD_BYTES {
         return s.to_owned();
     }
-    let end = s
-        .char_indices()
-        .map(|(i, _)| i)
-        .take_while(|&i| i <= MAX_LOG_FIELD_LEN)
-        .last()
-        .unwrap_or(0);
+    let mut end = MAX_LOG_FIELD_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
     format!("{}...<truncated, {} bytes total>", &s[..end], s.len())
 }
 
@@ -147,7 +145,7 @@ impl<T> std::fmt::Debug for ShutdownHandle<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_LOG_FIELD_LEN, truncate_for_log};
+    use super::{MAX_LOG_FIELD_BYTES, truncate_for_log};
 
     #[test]
     fn short_string_unchanged() {
@@ -157,13 +155,13 @@ mod tests {
 
     #[test]
     fn exactly_max_len_unchanged() {
-        let s = "x".repeat(MAX_LOG_FIELD_LEN);
+        let s = "x".repeat(MAX_LOG_FIELD_BYTES);
         assert_eq!(truncate_for_log(&s), s);
     }
 
     #[test]
     fn over_max_is_truncated_with_suffix() {
-        let s = "y".repeat(MAX_LOG_FIELD_LEN + 100);
+        let s = "y".repeat(MAX_LOG_FIELD_BYTES + 100);
         let result = truncate_for_log(&s);
         assert!(result.len() < s.len());
         assert!(result.contains("...<truncated,"));
@@ -172,8 +170,14 @@ mod tests {
 
     #[test]
     fn multibyte_chars_not_split() {
-        let s = "🔥".repeat(MAX_LOG_FIELD_LEN);
+        let s = "🔥".repeat(MAX_LOG_FIELD_BYTES);
         let result = truncate_for_log(&s);
+        let prefix_bytes = result
+            .split("...<truncated,")
+            .next()
+            .expect("prefix before suffix")
+            .len();
+        assert!(prefix_bytes <= MAX_LOG_FIELD_BYTES);
         assert!(result.contains("...<truncated,"));
     }
 }

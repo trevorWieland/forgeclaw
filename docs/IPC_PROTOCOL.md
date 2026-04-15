@@ -422,6 +422,7 @@ minor-aware behavior gates can remain explicit and centralized.
 - **Job ID mismatch** (job-scoped message whose `job_id` does not match the active job): Treated as protocol violation. Socket closed.
 - **Socket disconnect without `output_complete`**: Host treats the in-progress job as failed. Container transitioned to `Exited` with error status.
 - **Heartbeat timeout** (no heartbeat for 60 seconds during `Processing`): Host sends `shutdown` with a short deadline, then kills the container if it doesn't respond.
+- **Idle read timeout** (no complete inbound frame for 60 seconds during `Idle`): Host closes the connection with an `idle_read_timeout` protocol error. This guard also applies to trickled partial frames that never complete.
 - **Blocked post-handshake write** (peer not reading): sender applies a
   per-connection write deadline (default 5 seconds). Timeout is fatal:
   connection is poisoned and closed.

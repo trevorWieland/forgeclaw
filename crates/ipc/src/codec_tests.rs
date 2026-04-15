@@ -257,9 +257,9 @@ fn encode_message_rejects_oversize_before_full_buffer_materialization() {
 }
 
 #[test]
-fn two_pass_uses_known_types_not_serde_wording() {
+fn single_pass_classification_keeps_known_type_payload_malformed() {
     // Verify structural detection: type "ready" is known, so a
-    // missing field classifies as MalformedJson not UnknownMessageType,
+    // missing field classifies as MalformedJson (not UnknownMessageType),
     // regardless of serde's error message wording.
     let bytes = br#"{"type":"ready"}"#;
     let err = decode_typed_message::<ContainerToHost>(bytes, ContainerToHost::KNOWN_TYPES)

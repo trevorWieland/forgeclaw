@@ -281,6 +281,18 @@ pub enum ProtocolError {
         got: forgeclaw_core::JobId,
     },
 
+    /// No inbound frame completed before the idle receive deadline.
+    ///
+    /// This is fatal because an idle peer can otherwise hold
+    /// connection resources indefinitely by stalling partial frames.
+    #[error("idle read timeout: no full frame for {timeout_secs}s while in phase {phase}")]
+    IdleReadTimeout {
+        /// Current server-side lifecycle phase (`idle`).
+        phase: &'static str,
+        /// Configured idle read timeout in seconds.
+        timeout_secs: u64,
+    },
+
     /// No heartbeat was observed before the processing deadline.
     ///
     /// This is non-fatal at the IPC layer so the caller can execute
@@ -333,6 +345,21 @@ pub enum ProtocolError {
         /// Dot-path to the failing field.
         field_path: String,
         /// Human-readable validation failure.
+        reason: String,
+    },
+
+    /// Outbound state changed between pre-write validation and post-write
+    /// lifecycle commit.
+    #[error(
+        "outbound state divergence: {direction} message `{message_type}` could not commit — {reason}"
+    )]
+    OutboundStateDivergence {
+        /// Message direction (`host_to_container` or
+        /// `container_to_host`).
+        direction: &'static str,
+        /// Wire `type` discriminator.
+        message_type: &'static str,
+        /// Why commit failed.
         reason: String,
     },
 }

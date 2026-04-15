@@ -23,58 +23,22 @@ use super::protocol::{
     log_outbound_validation_rejection, log_unauthorized_command, record_unauthorized_rejection,
     recv_deadline, recv_timeout_error,
 };
-use super::transport_core::{decode_and_enforce_inbound, preflight_and_enforce_outbound};
+use super::transport_core::{commit_outbound, decode_and_enforce_inbound, prepare_outbound};
 use super::{
-    CommandReceiveBehavior, IpcConnection, IpcInboundEvent, auth, authorized_result_to_event,
+    CommandReceiveBehavior, IpcInboundEvent, auth, authorized_result_to_event,
     classify_command_message, handle_unknown_inbound,
 };
 
-impl IpcConnection {
-    /// Split into independent read/write halves for full-duplex.
-    ///
-    /// Preserves buffered bytes and the session identity. A fatal
-    /// error on either half poisons both.
-    pub fn into_split(self) -> (IpcConnectionWriter, IpcConnectionReader) {
-        let poisoned = Arc::new(AtomicBool::new(self.poisoned));
-        let negotiated_version = self.state.negotiated_version();
-        let state = Arc::new(AsyncMutex::new(self.state));
-        let writer = self.writer;
-        let reader = self.reader;
-        let shutdown_handle = self.shutdown_handle;
-        (
-            IpcConnectionWriter {
-                writer,
-                poisoned: Arc::clone(&poisoned),
-                identity: Arc::clone(&self.identity),
-                state: Arc::clone(&state),
-                negotiated_version,
-                write_timeout: self.write_timeout,
-                shutdown_handle: shutdown_handle.clone(),
-            },
-            IpcConnectionReader {
-                reader,
-                poisoned,
-                unknown_budget: self.unknown_budget,
-                last_frame_len: 0,
-                state,
-                identity: self.identity,
-                negotiated_version,
-                shutdown_handle,
-            },
-        )
-    }
-}
-
-/// Write half of a split [`IpcConnection`].
+/// Write half of a split [`super::IpcConnection`].
 #[derive(Debug)]
 pub struct IpcConnectionWriter {
-    writer: FrameWriter<crate::util::SharedWriteHalf<tokio::net::unix::OwnedWriteHalf>>,
-    poisoned: Arc<AtomicBool>,
-    identity: Arc<SessionIdentity>,
-    state: Arc<AsyncMutex<ConnectionState>>,
-    negotiated_version: NegotiatedProtocolVersion,
-    write_timeout: Duration,
-    shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
+    pub(super) writer: FrameWriter<crate::util::SharedWriteHalf<tokio::net::unix::OwnedWriteHalf>>,
+    pub(super) poisoned: Arc<AtomicBool>,
+    pub(super) identity: Arc<SessionIdentity>,
+    pub(super) state: Arc<AsyncMutex<ConnectionState>>,
+    pub(super) negotiated_version: NegotiatedProtocolVersion,
+    pub(super) write_timeout: Duration,
+    pub(super) shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
 }
 
 impl IpcConnectionWriter {
@@ -99,8 +63,8 @@ impl IpcConnectionWriter {
             state.phase_name()
         };
         {
-            let mut state = self.state.lock().await;
-            if let Err(e) = preflight_and_enforce_outbound(&mut state, msg, Instant::now()) {
+            let state = self.state.lock().await;
+            if let Err(e) = prepare_outbound(&state, msg) {
                 if matches!(
                     e,
                     IpcError::Protocol(ProtocolError::OutboundValidation { .. })
@@ -139,21 +103,59 @@ impl IpcConnectionWriter {
                 self.shutdown_handle.trigger().await;
             }
         }
-        result
+        result?;
+
+        let lifecycle_action = {
+            let mut state = self.state.lock().await;
+            commit_outbound(&mut state, msg, Instant::now())
+        };
+        let lifecycle_action = match lifecycle_action {
+            Ok(action) => action,
+            Err(err) => return Err(self.outbound_state_divergence(msg, err).await),
+        };
+        if lifecycle_action.should_close_after_frame() {
+            self.poisoned.store(true, Ordering::Release);
+            self.shutdown_handle.trigger().await;
+        }
+        Ok(())
+    }
+
+    async fn outbound_state_divergence(
+        &mut self,
+        msg: &HostToContainer,
+        err: IpcError,
+    ) -> IpcError {
+        let divergence = IpcError::Protocol(ProtocolError::OutboundStateDivergence {
+            direction: "host_to_container",
+            message_type: msg.type_name(),
+            reason: err.to_string(),
+        });
+        self.poisoned.store(true, Ordering::Release);
+        let phase = {
+            let state = self.state.lock().await;
+            state.phase_name()
+        };
+        log_fatal_protocol_error(&self.identity, phase, &divergence);
+        self.shutdown_handle.trigger().await;
+        divergence
+    }
+
+    pub(crate) async fn close(mut self) -> Result<(), IpcError> {
+        self.writer.shutdown().await
     }
 }
 
-/// Read half of a split [`IpcConnection`].
+/// Read half of a split [`super::IpcConnection`].
 #[derive(Debug)]
 pub struct IpcConnectionReader {
-    reader: FrameReader<tokio::net::unix::OwnedReadHalf>,
-    poisoned: Arc<AtomicBool>,
-    unknown_budget: UnknownTrafficBudget,
-    last_frame_len: usize,
-    state: Arc<AsyncMutex<ConnectionState>>,
-    identity: Arc<SessionIdentity>,
-    negotiated_version: NegotiatedProtocolVersion,
-    shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
+    pub(super) reader: FrameReader<tokio::net::unix::OwnedReadHalf>,
+    pub(super) poisoned: Arc<AtomicBool>,
+    pub(super) unknown_budget: UnknownTrafficBudget,
+    pub(super) last_frame_len: usize,
+    pub(super) state: Arc<AsyncMutex<ConnectionState>>,
+    pub(super) identity: Arc<SessionIdentity>,
+    pub(super) negotiated_version: NegotiatedProtocolVersion,
+    pub(super) shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
 }
 
 impl IpcConnectionReader {
@@ -283,7 +285,7 @@ impl IpcConnectionReader {
 
     async fn current_recv_deadline(&self) -> Option<Instant> {
         let state = self.state.lock().await;
-        recv_deadline(&state)
+        recv_deadline(&state, Instant::now())
     }
 
     async fn recv_timeout_error(&self) -> Result<ContainerToHost, IpcError> {
