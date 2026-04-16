@@ -1,80 +1,16 @@
 //! End-to-end lifecycle tests over real Unix sockets.
 
-use std::path::PathBuf;
-use std::time::Duration;
-
 use forgeclaw_core::{GroupId, JobId};
 use forgeclaw_ipc::{
     ContainerToHost, GroupCapabilities, GroupInfo, HeartbeatPayload, HistoricalMessage,
-    HistoricalMessages, HostToContainer, InitConfig, InitContext, InitPayload, IpcClient, IpcError,
-    IpcInboundEvent, IpcServer, MessagesPayload, OutputCompletePayload, ProtocolError,
-    ReadyPayload, ShutdownPayload, ShutdownReason, StopReason,
+    HostToContainer, IpcClient, IpcError, IpcInboundEvent, IpcServer, MessagesPayload,
+    OutputCompletePayload, ProtocolError, ShutdownPayload, ShutdownReason, StopReason,
 };
 use tempfile::tempdir;
 
-fn socket_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let socket_dir = dir.path().join("s");
-        std::fs::create_dir_all(&socket_dir).expect("mkdir s");
-        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700))
-            .expect("chmod s");
-        {
-            let short_name = if name.len() > 32 { &name[..32] } else { name };
-            socket_dir.join(short_name)
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        dir.path().join(name)
-    }
-}
-
-fn sample_ready(version: &str) -> ReadyPayload {
-    ReadyPayload {
-        adapter: "test-adapter".parse().expect("valid adapter"),
-        adapter_version: "0.1.0".parse().expect("valid adapter version"),
-        protocol_version: version.parse().expect("valid protocol version"),
-    }
-}
-
-const HS_TIMEOUT: Duration = Duration::from_secs(5);
-
-fn sample_group() -> GroupInfo {
-    GroupInfo {
-        id: GroupId::new("group-main").expect("valid group id"),
-        name: "Main".parse().expect("valid name"),
-        is_main: true,
-        capabilities: GroupCapabilities::default(),
-    }
-}
-
-fn sample_init() -> InitPayload {
-    InitPayload {
-        job_id: JobId::new("job-integration-1").expect("valid job id"),
-        context: InitContext {
-            messages: HistoricalMessages::default(),
-            group: GroupInfo {
-                id: GroupId::new("group-main").expect("valid group id"),
-                name: "Main".parse().expect("valid name"),
-                is_main: true,
-                capabilities: GroupCapabilities::default(),
-            },
-            timezone: "UTC".parse().expect("valid timezone"),
-        },
-        config: InitConfig {
-            provider_proxy_url: "http://proxy.local".parse().expect("valid proxy url"),
-            provider_proxy_token: "token".parse().expect("valid proxy token"),
-            model: "claude-sonnet-4-6".parse().expect("valid model"),
-            max_tokens: 1000,
-            session_id: None,
-            tools_enabled: true,
-            timeout_seconds: 600,
-        },
-    }
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::{HS_TIMEOUT, sample_group, sample_init, sample_ready, socket_path};
 
 async fn recv_message(
     conn: &mut forgeclaw_ipc::IpcConnection,

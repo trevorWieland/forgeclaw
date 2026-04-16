@@ -234,6 +234,13 @@ pub struct CommandPayload {
     pub body: CommandBody,
 }
 
+impl crate::forward_compat::KnownMessage for CommandPayload {
+    // Commands carry nested payloads that may grow additive fields on
+    // minor bumps; baseline budget matches other low-frequency types.
+    const FORWARD_COMPAT: crate::forward_compat::ForwardCompatPolicy =
+        crate::forward_compat::ForwardCompatPolicy::DEFAULT_BUDGET;
+}
+
 #[cfg(test)]
 #[path = "../command_tests.rs"]
 mod tests;

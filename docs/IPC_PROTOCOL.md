@@ -102,7 +102,7 @@ Sent immediately after the container connects. Signals that the agent adapter ha
   "type": "ready",
   "adapter": "claude-code",
   "adapter_version": "1.0.0",
-  "protocol_version": "1.0"
+  "protocol_version": "1.1"
 }
 ```
 
@@ -413,6 +413,12 @@ unsupported major version. After handshake, the host persists a
 behavior gates branch on this negotiated minor and remain explicit and
 centralized in [`crates/ipc/src/semantics.rs`](../crates/ipc/src/semantics.rs).
 
+This crate ships **protocol 1.1** as its local version. Connections
+from 1.0 adapters still succeed — `negotiate` downgrades to 1.0
+baseline semantics — so existing adapters keep working while newer
+adapters opt into the stricter 1.1 gates below by advertising `"1.1"`
+in their `ready` message.
+
 ### Versioned Behavior Matrix
 
 The following table is **normative**: every gate is enforced by the
@@ -430,6 +436,8 @@ test.
 | ≥1.1 | host→container | `shutdown` | `deadline_ms` MUST be `> 0`. | `LifecycleViolation { reason: "protocol >=1.1 requires shutdown.deadline_ms > 0" }` |
 | ≥1.1 | container→host | `error` | `fatal=true` MUST include a `job_id`. | `LifecycleViolation { reason: "protocol >=1.1 requires fatal errors to include job_id" }` |
 | ≥1.1 | container→host | `command:register_group` | `payload.extensions` is REQUIRED. | `InvalidCommandPayload { reason: "protocol >=1.1 requires payload.extensions" }` |
+| ≥1.1 | container→host | `heartbeat` | Unknown fields are FORBIDDEN (baseline already rejects; 1.1 locks this in against any future relaxation). | `UnknownFieldsRejected { message_type: "heartbeat" }` |
+| ≥1.1 | container→host | `output_delta` | Unknown fields are FORBIDDEN (baseline already rejects; 1.1 locks this in). | `UnknownFieldsRejected { message_type: "output_delta" }` |
 
 Existing fields are never removed or retyped within a major version
 (additive-only). New gates may tighten existing fields starting at a
@@ -448,6 +456,30 @@ specific minor, in which case they MUST appear in this matrix and in
   - total unknown-byte cap per connection lifetime, and
   - unknown-frame token-bucket rate limiting.
   These controls are configurable and can be explicitly disabled for testing.
+- **Unknown fields on a known message type**: Per-message-type
+  forward-compat policy, declared on each payload struct via the
+  `crate::forward_compat::KnownMessage` trait:
+  - High-frequency narrow-shape types (`heartbeat`, `output_delta`) use
+    `ForwardCompatPolicy::Reject` — any unknown field closes the
+    connection immediately with `UnknownFieldsRejected`.
+  - All other types use `ForwardCompatPolicy::Budget` — per-frame caps
+    on unknown-field key count (default 16) and byte count (default
+    4 KiB). Exceeding either cap fires `IgnoredFieldBudgetExceeded`.
+  - A per-connection **lifetime** budget (default: 1 024 keys, 1 MiB)
+    aggregates ignored-field counts across all known-type messages.
+    Lifetime exhaustion also closes the connection with
+    `IgnoredFieldBudgetExceeded`.
+  All limits are configurable on `UnknownTrafficLimitConfig`; set to
+  `0` to disable a specific limit.
+- **Socket parent-directory ownership**: At bind and post-bind
+  attestation time, the host compares the parent directory UID against
+  the configured `ParentOwnerPolicy`. The hardened default
+  (`MatchEffectiveUid`) requires the parent UID to match the running
+  process's effective UID — a foreign owner fails closed with
+  `SocketParentOwnership`. `RequireUid(u32)` pins a specific UID.
+  `Disabled` is audit-visible (emits a one-shot `tracing::warn` per
+  process) and is reserved for the named `insecure_capture_only()`
+  preset.
 - **Missing required field**: Treated as malformed. Socket closed.
 - **Job ID mismatch** (job-scoped message whose `job_id` does not match the active job): Treated as protocol violation. Socket closed.
 - **Socket disconnect without `output_complete`**: Host treats the in-progress job as failed. Container transitioned to `Exited` with error status.

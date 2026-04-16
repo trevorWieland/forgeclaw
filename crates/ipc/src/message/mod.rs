@@ -14,11 +14,15 @@
 //! [`docs/IPC_PROTOCOL.md`](../../../../docs/IPC_PROTOCOL.md) exactly
 //! (e.g. `{"type": "ready", ...}`).
 //!
-//! Unknown fields inside a payload are tolerated (forward-compatible)
-//! but unknown message *types* deserialize as
-//! [`crate::error::ProtocolError::UnknownMessageType`] inside the
-//! codec — policy (log-and-continue vs tear-down) is left to the
-//! caller, per `docs/IPC_PROTOCOL.md` §Error Handling.
+//! Unknown fields inside a payload are budgeted per
+//! [`crate::forward_compat::KnownMessage::FORWARD_COMPAT`] — high-frequency
+//! narrow-shape types (`heartbeat`, `output_delta`) reject any unknown
+//! fields; all others apply a per-frame cap plus a per-connection
+//! lifetime budget tracked inside the crate-internal unknown-traffic
+//! accounting (see `crate::policy`). Unknown message *types* remain
+//! handled by the codec as
+//! [`crate::error::ProtocolError::UnknownMessageType`] with separate
+//! abuse controls (`docs/IPC_PROTOCOL.md` §Error Handling).
 
 pub mod authorized;
 mod collections;
@@ -116,6 +120,27 @@ impl ContainerToHost {
             Self::Heartbeat(_) => "heartbeat",
         }
     }
+
+    /// Baseline forward-compatibility policy for this message variant,
+    /// sourced from the payload's [`crate::forward_compat::KnownMessage`]
+    /// impl. Promotion under negotiated ≥1.1 lives in
+    /// [`crate::forward_compat::promote_for_container`].
+    ///
+    /// Mirrors [`Self::type_name`] one-for-one so that adding a new
+    /// variant is a compile error in **both** methods.
+    #[must_use]
+    pub const fn forward_compat_base(&self) -> crate::forward_compat::ForwardCompatPolicy {
+        use crate::forward_compat::KnownMessage;
+        match self {
+            Self::Ready(_) => ReadyPayload::FORWARD_COMPAT,
+            Self::OutputDelta(_) => OutputDeltaPayload::FORWARD_COMPAT,
+            Self::OutputComplete(_) => OutputCompletePayload::FORWARD_COMPAT,
+            Self::Progress(_) => ProgressPayload::FORWARD_COMPAT,
+            Self::Command(_) => CommandPayload::FORWARD_COMPAT,
+            Self::Error(_) => ErrorPayload::FORWARD_COMPAT,
+            Self::Heartbeat(_) => HeartbeatPayload::FORWARD_COMPAT,
+        }
+    }
 }
 
 /// A message sent from the host to an agent container.
@@ -148,6 +173,20 @@ impl HostToContainer {
             Self::Init(_) => "init",
             Self::Messages(_) => "messages",
             Self::Shutdown(_) => "shutdown",
+        }
+    }
+
+    /// Baseline forward-compatibility policy for this message variant.
+    /// Promotion under negotiated ≥1.1 lives in
+    /// [`crate::forward_compat::promote_for_host`]. Mirrors
+    /// [`Self::type_name`] so new variants are caught at compile time.
+    #[must_use]
+    pub const fn forward_compat_base(&self) -> crate::forward_compat::ForwardCompatPolicy {
+        use crate::forward_compat::KnownMessage;
+        match self {
+            Self::Init(_) => InitPayload::FORWARD_COMPAT,
+            Self::Messages(_) => MessagesPayload::FORWARD_COMPAT,
+            Self::Shutdown(_) => ShutdownPayload::FORWARD_COMPAT,
         }
     }
 }
@@ -202,9 +241,12 @@ mod tests {
     }
 
     #[test]
-    fn container_to_host_unknown_fields_tolerated() {
+    fn container_to_host_ready_tolerates_extra_additive_field() {
         // A future minor version may add fields to `ready`; older
-        // decoders must still accept them.
+        // decoders must still deserialize the typed shape. The
+        // forward-compat budget is a **runtime** concern enforced by
+        // the codec's `_with_tally` variant and
+        // [`crate::policy::UnknownTrafficBudget`], not serde.
         let fwd = json!({
             "type": "ready",
             "adapter": "claude-code",
@@ -214,6 +256,42 @@ mod tests {
         });
         let parsed: ContainerToHost = serde_json::from_value(fwd).expect("deserialize");
         assert!(matches!(parsed, ContainerToHost::Ready(_)));
+    }
+
+    #[test]
+    fn container_to_host_heartbeat_policy_is_reject() {
+        let hb = ContainerToHost::Heartbeat(HeartbeatPayload {
+            timestamp: "2026-04-16T00:00:00Z".parse().expect("valid timestamp"),
+        });
+        assert_eq!(
+            hb.forward_compat_base(),
+            crate::forward_compat::ForwardCompatPolicy::Reject
+        );
+    }
+
+    #[test]
+    fn container_to_host_output_delta_policy_is_reject() {
+        let msg = ContainerToHost::OutputDelta(OutputDeltaPayload {
+            text: "x".parse().expect("valid text"),
+            job_id: JobId::new("job-1").expect("valid job id"),
+        });
+        assert_eq!(
+            msg.forward_compat_base(),
+            crate::forward_compat::ForwardCompatPolicy::Reject
+        );
+    }
+
+    #[test]
+    fn container_to_host_ready_policy_is_budget() {
+        let msg = ContainerToHost::Ready(ReadyPayload {
+            adapter: "a".parse().expect("valid adapter"),
+            adapter_version: "v".parse().expect("valid adapter version"),
+            protocol_version: "1.0".parse().expect("valid protocol version"),
+        });
+        assert!(matches!(
+            msg.forward_compat_base(),
+            crate::forward_compat::ForwardCompatPolicy::Budget { .. }
+        ));
     }
 
     #[test]

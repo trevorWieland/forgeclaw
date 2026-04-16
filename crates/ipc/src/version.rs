@@ -18,8 +18,10 @@
 ///
 /// This is the value the host declares it implements and the value every
 /// container-side adapter built against this crate will advertise in its
-/// `Ready` message.
-pub const PROTOCOL_VERSION: &str = "1.0";
+/// `Ready` message. Connections with 1.0 peers still succeed because
+/// [`negotiate`] takes the minimum of both minors — 1.1↔1.0 ends up
+/// negotiated at 1.0 baseline semantics.
+pub const PROTOCOL_VERSION: &str = "1.1";
 
 /// Negotiated protocol version for a live connection.
 ///
@@ -112,8 +114,8 @@ mod tests {
     use super::{PROTOCOL_VERSION, is_compatible, negotiate, parse_version};
 
     #[test]
-    fn local_version_is_one_zero() {
-        assert_eq!(PROTOCOL_VERSION, "1.0");
+    fn local_version_is_one_one() {
+        assert_eq!(PROTOCOL_VERSION, "1.1");
     }
 
     #[test]
@@ -181,13 +183,21 @@ mod tests {
 
     #[test]
     fn negotiate_uses_shared_major_and_lower_minor() {
+        // Local is 1.1; peer 1.0 negotiates down to 1.0 baseline
+        // semantics.
         let v = negotiate("1.0").expect("compatible");
         assert_eq!(v.major(), 1);
         assert_eq!(v.minor(), 0);
 
+        // Peer ahead of local: negotiation clamps to local minor.
         let v = negotiate("1.9").expect("compatible");
         assert_eq!(v.major(), 1);
-        assert_eq!(v.minor(), 0);
+        assert_eq!(v.minor(), 1);
+
+        // Exact match promotes to 1.1 semantics.
+        let v = negotiate("1.1").expect("compatible");
+        assert_eq!(v.major(), 1);
+        assert_eq!(v.minor(), 1);
     }
 
     #[test]

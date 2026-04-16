@@ -1,5 +1,6 @@
-use crate::codec::decode_host_to_container;
+use crate::codec::decode_host_to_container_with_tally;
 use crate::error::IpcError;
+use crate::forward_compat::IgnoredFieldTally;
 use crate::lifecycle::LifecycleAction;
 use crate::message::{ContainerToHost, HostToContainer};
 
@@ -24,8 +25,8 @@ pub(super) fn commit_outbound(
 pub(super) fn decode_and_enforce_inbound(
     state: &mut ClientConnectionState,
     frame: &[u8],
-) -> Result<(HostToContainer, LifecycleAction), IpcError> {
-    let msg = decode_host_to_container(frame)?;
+) -> Result<(HostToContainer, IgnoredFieldTally, LifecycleAction), IpcError> {
+    let (msg, tally) = decode_host_to_container_with_tally(frame)?;
     let action = enforce_inbound_state(state, &msg)?;
-    Ok((msg, action))
+    Ok((msg, tally, action))
 }

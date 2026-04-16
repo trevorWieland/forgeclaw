@@ -1,7 +1,8 @@
 use tokio::time::Instant;
 
-use crate::codec::decode_container_to_host;
+use crate::codec::decode_container_to_host_with_tally;
 use crate::error::IpcError;
+use crate::forward_compat::IgnoredFieldTally;
 use crate::lifecycle::LifecycleAction;
 use crate::message::{ContainerToHost, HostToContainer};
 
@@ -29,8 +30,8 @@ pub(super) fn decode_and_enforce_inbound(
     state: &mut ConnectionState,
     frame: &[u8],
     now: Instant,
-) -> Result<(ContainerToHost, LifecycleAction), IpcError> {
-    let msg = decode_container_to_host(frame)?;
+) -> Result<(ContainerToHost, IgnoredFieldTally, LifecycleAction), IpcError> {
+    let (msg, tally) = decode_container_to_host_with_tally(frame)?;
     let action = enforce_inbound_state(state, &msg, now)?;
-    Ok((msg, action))
+    Ok((msg, tally, action))
 }

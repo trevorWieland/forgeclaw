@@ -4,6 +4,12 @@ use std::time::Duration;
 
 use crate::codec::DEFAULT_MAX_UNKNOWN_SKIPS;
 use crate::error::{IpcError, ProtocolError};
+use crate::forward_compat::{
+    ForwardCompatPolicy, IgnoredFieldTally, enforce as enforce_forward_compat,
+    promote_for_container, promote_for_host,
+};
+use crate::message::{ContainerToHost, HostToContainer};
+use crate::semantics::ProtocolSemantics;
 use tokio::time::Instant;
 
 /// Cumulative byte budget for consecutive unknown-type frames.
@@ -16,6 +22,13 @@ pub(crate) const DEFAULT_MAX_UNKNOWN_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const DEFAULT_UNKNOWN_RATE_BURST_CAPACITY: u32 = 64;
 /// Unknown-message token-bucket refill rate per second.
 pub(crate) const DEFAULT_UNKNOWN_RATE_REFILL_PER_SECOND: u32 = 16;
+
+/// Default per-connection lifetime cap on ignored-field leaf count
+/// across **all** known-type messages.
+pub(crate) const DEFAULT_IGNORED_FIELD_LIFETIME_KEYS: u32 = 1024;
+/// Default per-connection lifetime cap on ignored-field byte volume
+/// across **all** known-type messages.
+pub(crate) const DEFAULT_IGNORED_FIELD_LIFETIME_BYTES: u32 = 1024 * 1024;
 
 /// Processing-phase heartbeat timeout per protocol spec.
 pub(crate) const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -86,6 +99,12 @@ pub struct UnknownTrafficLimitConfig {
     pub rate_limit_burst_capacity: u32,
     /// Token refill rate (per second) for unknown frame rate (`0` disables).
     pub rate_limit_refill_per_second: u32,
+    /// Max ignored-field leaves across **all** known-type messages in
+    /// the connection's lifetime (`0` disables).
+    pub ignored_field_lifetime_keys: u32,
+    /// Max ignored-field bytes across **all** known-type messages in
+    /// the connection's lifetime (`0` disables).
+    pub ignored_field_lifetime_bytes: u32,
 }
 
 impl Default for UnknownTrafficLimitConfig {
@@ -95,6 +114,8 @@ impl Default for UnknownTrafficLimitConfig {
             lifetime_byte_limit: DEFAULT_MAX_UNKNOWN_TOTAL_BYTES,
             rate_limit_burst_capacity: DEFAULT_UNKNOWN_RATE_BURST_CAPACITY,
             rate_limit_refill_per_second: DEFAULT_UNKNOWN_RATE_REFILL_PER_SECOND,
+            ignored_field_lifetime_keys: DEFAULT_IGNORED_FIELD_LIFETIME_KEYS,
+            ignored_field_lifetime_bytes: DEFAULT_IGNORED_FIELD_LIFETIME_BYTES,
         }
     }
 }
@@ -118,12 +139,15 @@ impl UnknownTrafficLimitConfig {
 }
 
 /// Server-side unknown-frame tracker with both consecutive and
-/// independent lifetime/rate protections.
+/// independent lifetime/rate protections. Also accumulates lifetime
+/// ignored-field totals across all known-type messages.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UnknownTrafficBudget {
     consecutive: UnknownFrameBudget,
     total_count: usize,
     total_bytes: usize,
+    ignored_field_total_keys: u32,
+    ignored_field_total_bytes: u32,
     limits: UnknownTrafficLimitConfig,
     rate_tokens: f64,
     rate_last_refill: Instant,
@@ -137,6 +161,8 @@ impl UnknownTrafficBudget {
             consecutive: UnknownFrameBudget::default(),
             total_count: 0,
             total_bytes: 0,
+            ignored_field_total_keys: 0,
+            ignored_field_total_bytes: 0,
             rate_tokens: f64::from(limits.rate_limit_burst_capacity),
             rate_last_refill: now,
             limits,
@@ -226,6 +252,71 @@ impl UnknownTrafficBudget {
     pub(crate) fn limits(&self) -> UnknownTrafficLimitConfig {
         self.limits
     }
+
+    /// Apply per-frame forward-compat policy plus lifetime
+    /// ignored-field budget for an inbound container→host message.
+    pub(crate) fn on_ignored_container(
+        &mut self,
+        msg: &ContainerToHost,
+        tally: IgnoredFieldTally,
+        semantics: ProtocolSemantics,
+    ) -> Result<(), IpcError> {
+        let policy = promote_for_container(msg.forward_compat_base(), msg, semantics);
+        self.apply_tally(policy, tally, msg.type_name())
+    }
+
+    /// Apply per-frame forward-compat policy plus lifetime
+    /// ignored-field budget for an inbound host→container message.
+    pub(crate) fn on_ignored_host(
+        &mut self,
+        msg: &HostToContainer,
+        tally: IgnoredFieldTally,
+        semantics: ProtocolSemantics,
+    ) -> Result<(), IpcError> {
+        let policy = promote_for_host(msg.forward_compat_base(), msg, semantics);
+        self.apply_tally(policy, tally, msg.type_name())
+    }
+
+    fn apply_tally(
+        &mut self,
+        policy: ForwardCompatPolicy,
+        tally: IgnoredFieldTally,
+        message_type: &'static str,
+    ) -> Result<(), IpcError> {
+        enforce_forward_compat(policy, tally, message_type)?;
+        if tally.is_empty() {
+            return Ok(());
+        }
+        self.ignored_field_total_keys = self.ignored_field_total_keys.saturating_add(tally.keys);
+        self.ignored_field_total_bytes = self.ignored_field_total_bytes.saturating_add(tally.bytes);
+        if self.limits.ignored_field_lifetime_keys > 0
+            && self.ignored_field_total_keys > self.limits.ignored_field_lifetime_keys
+        {
+            return Err(IpcError::Protocol(
+                ProtocolError::IgnoredFieldBudgetExceeded {
+                    message_type,
+                    scope: "lifetime",
+                    dimension: "keys",
+                    observed: self.ignored_field_total_keys,
+                    limit: self.limits.ignored_field_lifetime_keys,
+                },
+            ));
+        }
+        if self.limits.ignored_field_lifetime_bytes > 0
+            && self.ignored_field_total_bytes > self.limits.ignored_field_lifetime_bytes
+        {
+            return Err(IpcError::Protocol(
+                ProtocolError::IgnoredFieldBudgetExceeded {
+                    message_type,
+                    scope: "lifetime",
+                    dimension: "bytes",
+                    observed: self.ignored_field_total_bytes,
+                    limit: self.limits.ignored_field_lifetime_bytes,
+                },
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -242,6 +333,8 @@ mod tests {
                 lifetime_byte_limit: 0,
                 rate_limit_burst_capacity: 0,
                 rate_limit_refill_per_second: 0,
+                ignored_field_lifetime_keys: 0,
+                ignored_field_lifetime_bytes: 0,
             },
         );
         budget.on_unknown(10, now).expect("first unknown");
@@ -271,6 +364,8 @@ mod tests {
                 lifetime_byte_limit: 100,
                 rate_limit_burst_capacity: 0,
                 rate_limit_refill_per_second: 0,
+                ignored_field_lifetime_keys: 0,
+                ignored_field_lifetime_bytes: 0,
             },
         );
         budget.on_unknown(60, now).expect("first unknown");
@@ -296,6 +391,8 @@ mod tests {
                 lifetime_byte_limit: 0,
                 rate_limit_burst_capacity: 2,
                 rate_limit_refill_per_second: 1,
+                ignored_field_lifetime_keys: 0,
+                ignored_field_lifetime_bytes: 0,
             },
         );
         budget.on_unknown(1, now).expect("token 1");

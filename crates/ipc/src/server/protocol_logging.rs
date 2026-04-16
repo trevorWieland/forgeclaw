@@ -312,6 +312,7 @@ fn error_class(err: &IpcError) -> &'static str {
     match err {
         IpcError::Io(_) => "io",
         IpcError::BindRace(_) => "bind_race",
+        IpcError::SocketParentOwnership { .. } => "socket_parent_ownership",
         IpcError::Frame(FrameError::Oversize { .. }) => "frame_oversize",
         IpcError::Frame(FrameError::EmptyFrame) => "frame_empty",
         IpcError::Frame(FrameError::Truncated { .. }) => "frame_truncated",
@@ -334,6 +335,12 @@ fn error_class(err: &IpcError) -> &'static str {
         }
         IpcError::Protocol(ProtocolError::UnknownMessageRateLimitExceeded { .. }) => {
             "unknown_message_rate_limited"
+        }
+        IpcError::Protocol(ProtocolError::UnknownFieldsRejected { .. }) => {
+            "unknown_fields_rejected"
+        }
+        IpcError::Protocol(ProtocolError::IgnoredFieldBudgetExceeded { .. }) => {
+            "ignored_field_budget_exceeded"
         }
         IpcError::Protocol(ProtocolError::Unauthorized { .. }) => "unauthorized",
         IpcError::Protocol(ProtocolError::UnauthorizedCommandAbuse { .. }) => {

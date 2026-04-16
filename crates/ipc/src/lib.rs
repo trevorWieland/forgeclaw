@@ -76,6 +76,7 @@
 pub mod client;
 pub mod codec;
 pub mod error;
+pub mod forward_compat;
 pub(crate) mod lifecycle;
 pub mod message;
 pub(crate) mod outbound_validation;
@@ -83,7 +84,7 @@ pub(crate) mod path_policy;
 pub mod peer_cred;
 pub(crate) mod policy;
 pub mod recv_policy;
-pub(crate) mod semantics;
+pub mod semantics;
 pub mod server;
 pub(crate) mod transport;
 pub(crate) mod util;
@@ -92,9 +93,11 @@ pub mod version;
 pub use client::{IpcClient, IpcClientOptions, IpcClientReader, IpcClientWriter, PendingClient};
 pub use codec::{
     FrameCodec, LENGTH_PREFIX_BYTES, MAX_FRAME_BYTES, decode_container_to_host,
-    decode_host_to_container,
+    decode_container_to_host_with_tally, decode_host_to_container,
+    decode_host_to_container_with_tally,
 };
 pub use error::{FrameError, IpcError, ProtocolError};
+pub use forward_compat::{ForwardCompatPolicy, IgnoredFieldTally, KnownMessage};
 pub use message::{
     AdapterName, AdapterVersion, AuthorizedCommand, BoundedCollectionError, BranchName,
     BranchPolicy, CancelTaskPayload, CommandBody, CommandPayload, ContainerToHost, ContextModeText,
@@ -109,8 +112,11 @@ pub use message::{
     SelfImprovementListItems, SendMessagePayload, SenderName, ShutdownPayload, ShutdownReason,
     StageName, StopReason, TanrenPhase, TimestampError, TimezoneError, TokenUsage,
 };
+#[cfg(unix)]
+pub use peer_cred::ParentOwnerPolicy;
 pub use peer_cred::{PeerCredentials, SessionIdentity};
 pub use recv_policy::UnknownTypePolicy;
+pub use semantics::ProtocolSemantics;
 pub use server::{
     IpcConnection, IpcConnectionReader, IpcConnectionWriter, IpcInboundEvent, IpcServer,
     IpcServerOptions, PeerCredentialPolicy, PeerCredentialPolicyError, PendingConnection,

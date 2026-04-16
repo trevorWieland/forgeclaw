@@ -33,9 +33,11 @@ use crate::policy::{
     UnknownTrafficLimitConfig,
 };
 use crate::recv_policy::UnknownTypePolicy;
+use crate::semantics::ProtocolSemantics;
 use crate::transport::{FrameReader, FrameWriter};
 use crate::util::sampler::SampledCounter;
 use crate::util::{SharedWriteHalf, ShutdownHandle, truncate_for_log};
+use crate::version::NegotiatedProtocolVersion;
 
 use self::protocol::ClientConnectionState;
 use self::transport_core::{commit_outbound, decode_and_enforce_inbound, prepare_outbound};
@@ -138,10 +140,12 @@ impl IpcClient {
         writer: FrameWriter<SharedWriteHalf<tokio::net::unix::OwnedWriteHalf>>,
         shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
         active_job_id: JobId,
+        negotiated_version: NegotiatedProtocolVersion,
         options: IpcClientOptions,
     ) -> Self {
         let poisoned = Arc::new(AtomicBool::new(false));
         let state = Arc::new(AsyncMutex::new(ClientConnectionState::new(active_job_id)));
+        let semantics = ProtocolSemantics::from_negotiated(negotiated_version);
         let writer = IpcClientWriter {
             writer,
             poisoned: Arc::clone(&poisoned),
@@ -160,6 +164,8 @@ impl IpcClient {
             unknown_log_sampler: SampledCounter::new(UNKNOWN_LOG_BURST, UNKNOWN_LOG_EVERY),
             last_frame_len: 0,
             state,
+            semantics,
+            negotiated_version,
         };
         Self { writer, reader }
     }
@@ -324,9 +330,17 @@ pub struct IpcClientReader {
     unknown_log_sampler: SampledCounter,
     last_frame_len: usize,
     state: Arc<AsyncMutex<ClientConnectionState>>,
+    semantics: ProtocolSemantics,
+    negotiated_version: NegotiatedProtocolVersion,
 }
 
 impl IpcClientReader {
+    /// Negotiated protocol version established at handshake time.
+    #[must_use]
+    pub fn negotiated_protocol_version(&self) -> NegotiatedProtocolVersion {
+        self.negotiated_version
+    }
+
     async fn with_state_mut<T>(
         &self,
         f: impl FnOnce(&mut ClientConnectionState) -> Result<T, IpcError>,
@@ -354,7 +368,7 @@ impl IpcClientReader {
             }
         };
         self.last_frame_len = frame.len();
-        let (msg, close_after_recv) = match self
+        let (msg, tally, close_after_recv) = match self
             .with_state_mut(|state| decode_and_enforce_inbound(state, &frame))
             .await
         {
@@ -366,6 +380,13 @@ impl IpcClientReader {
                 return Err(e);
             }
         };
+        if let Err(e) = self
+            .unknown_budget
+            .on_ignored_host(&msg, tally, self.semantics)
+        {
+            self.poison().await;
+            return Err(e);
+        }
         if close_after_recv.should_close_after_frame() {
             self.poison().await;
         }

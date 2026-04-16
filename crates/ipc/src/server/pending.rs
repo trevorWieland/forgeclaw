@@ -11,11 +11,12 @@ use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::time::Instant;
 
-use crate::codec::{decode_container_to_host, encode_host_to_container_frame};
+use crate::codec::{decode_container_to_host_with_tally, encode_host_to_container_frame};
 use crate::error::{IpcError, ProtocolError};
 use crate::message::{ContainerToHost, GroupInfo, HostToContainer, InitPayload, ReadyPayload};
 use crate::peer_cred::SessionIdentity;
 use crate::policy::UnknownTrafficBudget;
+use crate::semantics::ProtocolSemantics;
 use crate::transport::{FrameReader, FrameWriter};
 use crate::util::truncate_for_log;
 use crate::util::{SharedWriteHalf, ShutdownHandle};
@@ -259,14 +260,28 @@ impl PendingConnection {
             }
         };
         self.last_frame_len = frame.len();
-        let result = decode_container_to_host(&frame);
-        if let Err(ref e) = result {
-            if e.is_fatal() {
-                log_fatal_protocol_error(&self.identity, "handshake", e);
-                self.poison().await;
+        let result = decode_container_to_host_with_tally(&frame);
+        let (msg, tally) = match result {
+            Ok((msg, tally)) => (msg, tally),
+            Err(e) => {
+                if e.is_fatal() {
+                    log_fatal_protocol_error(&self.identity, "handshake", &e);
+                    self.poison().await;
+                }
+                return Err(e);
             }
+        };
+        // Pre-handshake: no negotiated version yet, so apply baseline
+        // (V1_0) semantics for the ignored-field budget.
+        if let Err(e) =
+            self.unknown_budget
+                .on_ignored_container(&msg, tally, ProtocolSemantics::V1_0)
+        {
+            log_fatal_protocol_error(&self.identity, "handshake", &e);
+            self.poison().await;
+            return Err(e);
         }
-        result
+        Ok(msg)
     }
 
     async fn recv_container(&mut self) -> Result<ContainerToHost, IpcError> {

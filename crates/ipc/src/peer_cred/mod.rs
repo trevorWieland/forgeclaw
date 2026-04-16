@@ -9,6 +9,7 @@ use std::io;
 
 use tokio::net::UnixStream;
 
+use crate::error::IpcError;
 use crate::message::shared::GroupInfo;
 
 #[cfg(unix)]
@@ -21,6 +22,8 @@ pub(crate) use bind_attestation::{
     attest_post_bind, capture_bind_attestation, listener_matches_socket_definitive,
     socket_path_fingerprint,
 };
+#[cfg(unix)]
+pub use socket_dir::ParentOwnerPolicy;
 #[cfg(unix)]
 pub(crate) use socket_dir::validate_socket_dir;
 
@@ -99,4 +102,19 @@ fn peer_credentials_impl(stream: &UnixStream) -> io::Result<Option<PeerCredentia
 #[cfg(not(unix))]
 fn peer_credentials_impl(_stream: &UnixStream) -> io::Result<Option<PeerCredentials>> {
     Ok(None)
+}
+
+/// Look up the effective UID of the calling process without any
+/// `libc`/`unsafe` dependency.
+///
+/// Implementation detail: opens a transient tokio `UnixStream::pair()`
+/// and asks the kernel for our own peer credentials; both halves are
+/// dropped immediately so no fds or tasks leak. `peer_cred` on a tokio
+/// `UnixStream` is synchronous and does not require the reactor to be
+/// active — registration is deferred until the first poll.
+#[cfg(unix)]
+pub(crate) fn effective_uid() -> Result<u32, IpcError> {
+    let (a, _b) = UnixStream::pair().map_err(IpcError::Io)?;
+    let ucred = a.peer_cred().map_err(IpcError::Io)?;
+    Ok(ucred.uid())
 }

@@ -333,6 +333,15 @@ bench:
 bench-compile:
     @{{ cargo }} bench --workspace --no-run --quiet
 
+# Run the deterministic perf regression gate (functional invariants +
+# CI-noise-aware wall-clock ceilings). The wall-clock ceilings tighten
+# when $CI is set. This recipe is a convenience for local before/after
+# comparisons; the committed CI gate is `just ci`'s `test` step, which
+# picks up `crates/ipc/tests/perf_regression.rs` via nextest.
+bench-gate:
+    @{{ cargo }} nextest run -p forgeclaw-ipc --test perf_regression --no-tests=pass
+    @{{ cargo }} bench --workspace --no-run --quiet
+
 # ============================================================================
 # Maintenance
 # ============================================================================

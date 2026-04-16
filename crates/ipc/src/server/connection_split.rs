@@ -202,10 +202,15 @@ impl IpcConnectionReader {
         };
         self.last_frame_len = frame.len();
         let phase_name = self.current_phase_name().await;
-        let (msg, lifecycle_action) = match self
-            .with_state_mut(|state| decode_and_enforce_inbound(state, &frame, Instant::now()))
-            .await
-        {
+        let decoded = self
+            .with_state_mut(|state| {
+                let (msg, tally, action) =
+                    decode_and_enforce_inbound(state, &frame, Instant::now())?;
+                let semantics = state.semantics();
+                Ok::<_, IpcError>((msg, tally, action, semantics))
+            })
+            .await;
+        let (msg, tally, lifecycle_action, semantics) = match decoded {
             Ok(result) => result,
             Err(e) => {
                 if e.is_fatal() {
@@ -215,6 +220,14 @@ impl IpcConnectionReader {
                 return Err(e);
             }
         };
+        if let Err(e) = self
+            .unknown_budget
+            .on_ignored_container(&msg, tally, semantics)
+        {
+            log_fatal_protocol_error(&self.identity, phase_name, &e);
+            self.poison().await;
+            return Err(e);
+        }
         if lifecycle_action.should_close_after_frame() {
             self.poison().await;
         }

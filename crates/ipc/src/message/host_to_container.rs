@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::collections::HistoricalMessages;
 use super::semantic::{AbsoluteHttpUrl, IanaTimezone, ModelText, SessionIdText, TokenText};
 use super::shared::{GroupInfo, ShutdownReason};
+use crate::forward_compat::{ForwardCompatPolicy, KnownMessage};
 
 /// Context bundle carried inside an `init` message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +78,18 @@ pub struct ShutdownPayload {
     /// Deadline in milliseconds. After this deadline the host will
     /// forcibly terminate the container.
     pub deadline_ms: u64,
+}
+
+impl KnownMessage for InitPayload {
+    const FORWARD_COMPAT: ForwardCompatPolicy = ForwardCompatPolicy::DEFAULT_BUDGET;
+}
+
+impl KnownMessage for MessagesPayload {
+    const FORWARD_COMPAT: ForwardCompatPolicy = ForwardCompatPolicy::DEFAULT_BUDGET;
+}
+
+impl KnownMessage for ShutdownPayload {
+    const FORWARD_COMPAT: ForwardCompatPolicy = ForwardCompatPolicy::DEFAULT_BUDGET;
 }
 
 #[cfg(test)]

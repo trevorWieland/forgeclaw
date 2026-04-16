@@ -362,6 +362,40 @@ pub enum ProtocolError {
         /// Why commit failed.
         reason: String,
     },
+
+    /// A known message type carried unknown fields but its configured
+    /// [`crate::forward_compat::ForwardCompatPolicy`] is
+    /// [`crate::forward_compat::ForwardCompatPolicy::Reject`].
+    ///
+    /// Fatal — the peer is either miscoded or adversarial.
+    #[error("unknown fields rejected: {message_type} carried {key_count} unknown key(s)")]
+    UnknownFieldsRejected {
+        /// Wire `type` discriminator.
+        message_type: &'static str,
+        /// How many ignored-field leaves were observed in the frame.
+        key_count: u32,
+    },
+
+    /// The per-frame or per-connection-lifetime ignored-field budget
+    /// was exceeded for a known message type.
+    ///
+    /// Fatal.
+    #[error(
+        "ignored field budget exceeded: {message_type} {scope}/{dimension} — \
+         observed {observed} exceeds limit {limit}"
+    )]
+    IgnoredFieldBudgetExceeded {
+        /// Wire `type` discriminator.
+        message_type: &'static str,
+        /// Budget scope (`"per_frame"` or `"lifetime"`).
+        scope: &'static str,
+        /// Budget dimension (`"keys"` or `"bytes"`).
+        dimension: &'static str,
+        /// Observed value that tripped the limit.
+        observed: u32,
+        /// Configured limit.
+        limit: u32,
+    },
 }
 
 /// Top-level IPC crate error.
@@ -374,6 +408,22 @@ pub enum IpcError {
     /// Socket bind attestation detected a path race.
     #[error("socket bind race detected: {0}")]
     BindRace(String),
+
+    /// Socket parent directory ownership does not satisfy the
+    /// configured [`crate::peer_cred::ParentOwnerPolicy`].
+    ///
+    /// Fatal — fail-closed at bind and post-bind attestation time.
+    #[error(
+        "socket parent ownership rejected: {path} (expected uid={expected_uid}, actual uid={actual_uid})"
+    )]
+    SocketParentOwnership {
+        /// Parent directory path that failed the check.
+        path: String,
+        /// Expected UID per configured policy.
+        expected_uid: u32,
+        /// Observed UID on disk.
+        actual_uid: u32,
+    },
 
     /// Framing-layer error.
     #[error("frame error: {0}")]
@@ -424,7 +474,11 @@ impl IpcError {
     #[must_use]
     pub fn is_fatal(&self) -> bool {
         match self {
-            Self::Io(_) | Self::BindRace(_) | Self::Frame(_) | Self::Timeout(_) => true,
+            Self::Io(_)
+            | Self::BindRace(_)
+            | Self::SocketParentOwnership { .. }
+            | Self::Frame(_)
+            | Self::Timeout(_) => true,
             Self::Protocol(p) => !matches!(
                 p,
                 ProtocolError::UnknownMessageType(_)

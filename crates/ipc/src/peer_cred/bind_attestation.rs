@@ -5,7 +5,7 @@ use tokio::net::UnixListener;
 
 use crate::error::IpcError;
 
-use super::validate_socket_dir;
+use super::{ParentOwnerPolicy, validate_socket_dir};
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -75,6 +75,7 @@ pub(crate) fn attest_post_bind(
     socket_path: &Path,
     listener: &UnixListener,
     attestation: &BindAttestation,
+    owner_policy: ParentOwnerPolicy,
 ) -> Result<(), IpcError> {
     let current_parent = parent_fingerprint(&attestation.parent)?;
     if current_parent != attestation.parent_fingerprint {
@@ -84,7 +85,7 @@ pub(crate) fn attest_post_bind(
         )));
     }
 
-    validate_socket_dir(socket_path)?;
+    validate_socket_dir(socket_path, owner_policy)?;
 
     let path_fingerprint = socket_fingerprint(socket_path)?;
     map_attestation_verdict(
@@ -302,6 +303,7 @@ mod tests {
         map_attestation_verdict, merge_evidence,
     };
     use crate::error::IpcError;
+    use crate::peer_cred::socket_dir::ParentOwnerPolicy;
     use crate::peer_cred::validate_socket_dir;
 
     #[test]
@@ -356,11 +358,17 @@ mod tests {
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).expect("chmod");
 
         let path = parent.join("ipc.sock");
-        validate_socket_dir(&path).expect("validate");
+        validate_socket_dir(&path, ParentOwnerPolicy::MatchEffectiveUid).expect("validate");
         let attestation = capture_bind_attestation(&path).expect("capture");
         let listener = UnixListener::bind(&path).expect("bind");
 
-        attest_post_bind(&path, &listener, &attestation).expect("matching listener/path succeeds");
+        attest_post_bind(
+            &path,
+            &listener,
+            &attestation,
+            ParentOwnerPolicy::MatchEffectiveUid,
+        )
+        .expect("matching listener/path succeeds");
     }
 
     #[cfg(unix)]
@@ -374,13 +382,18 @@ mod tests {
         let path_a = parent.join("a.sock");
         let path_b = parent.join("b.sock");
 
-        validate_socket_dir(&path_a).expect("validate");
+        validate_socket_dir(&path_a, ParentOwnerPolicy::MatchEffectiveUid).expect("validate");
         let attestation = capture_bind_attestation(&path_a).expect("capture");
         let listener_a = UnixListener::bind(&path_a).expect("bind a");
         let listener_b = UnixListener::bind(&path_b).expect("bind b");
 
-        let err = attest_post_bind(&path_a, &listener_b, &attestation)
-            .expect_err("mismatched listener/path should fail");
+        let err = attest_post_bind(
+            &path_a,
+            &listener_b,
+            &attestation,
+            ParentOwnerPolicy::MatchEffectiveUid,
+        )
+        .expect_err("mismatched listener/path should fail");
         assert!(matches!(err, IpcError::BindRace(_)));
 
         drop(listener_a);
@@ -396,15 +409,20 @@ mod tests {
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).expect("chmod");
 
         let path = parent.join("ipc.sock");
-        validate_socket_dir(&path).expect("validate");
+        validate_socket_dir(&path, ParentOwnerPolicy::MatchEffectiveUid).expect("validate");
         let attestation = capture_bind_attestation(&path).expect("capture");
         let listener = UnixListener::bind(&path).expect("bind");
 
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755))
             .expect("chmod mutate");
 
-        let err =
-            attest_post_bind(&path, &listener, &attestation).expect_err("fingerprint drift fails");
+        let err = attest_post_bind(
+            &path,
+            &listener,
+            &attestation,
+            ParentOwnerPolicy::MatchEffectiveUid,
+        )
+        .expect_err("fingerprint drift fails");
         assert!(matches!(err, IpcError::BindRace(_)));
     }
 }

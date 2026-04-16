@@ -1,73 +1,17 @@
 //! Adversarial tests for independent unknown-traffic hardening.
 
-use std::path::PathBuf;
-use std::time::Duration;
+use std::fmt::Write as _;
 
-use forgeclaw_core::{GroupId, JobId};
 use forgeclaw_ipc::{
-    ContainerToHost, GroupCapabilities, GroupInfo, HistoricalMessages, InitConfig, InitContext,
-    InitPayload, IpcError, IpcInboundEvent, IpcServer, IpcServerOptions, ProtocolError,
-    ReadyPayload, UnknownTrafficLimitConfig,
+    ContainerToHost, IpcError, IpcInboundEvent, IpcServer, IpcServerOptions, ProtocolError,
+    UnknownTrafficLimitConfig,
 };
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const HS_TIMEOUT: Duration = Duration::from_secs(5);
-
-fn socket_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let socket_dir = dir.path().join("s");
-        std::fs::create_dir_all(&socket_dir).expect("mkdir s");
-        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700))
-            .expect("chmod s");
-        let short_name = if name.len() > 32 { &name[..32] } else { name };
-        socket_dir.join(short_name)
-    }
-    #[cfg(not(unix))]
-    {
-        dir.path().join(name)
-    }
-}
-
-fn sample_ready(version: &str) -> ReadyPayload {
-    ReadyPayload {
-        adapter: "test-adapter".parse().expect("valid adapter"),
-        adapter_version: "0.1.0".parse().expect("valid adapter version"),
-        protocol_version: version.parse().expect("valid protocol version"),
-    }
-}
-
-fn sample_group() -> GroupInfo {
-    GroupInfo {
-        id: GroupId::new("group-main").expect("valid group id"),
-        name: "Main".parse().expect("valid name"),
-        is_main: true,
-        capabilities: GroupCapabilities::default(),
-    }
-}
-
-fn sample_init() -> InitPayload {
-    InitPayload {
-        job_id: JobId::new("job-integration-1").expect("valid job id"),
-        context: InitContext {
-            messages: HistoricalMessages::default(),
-            group: sample_group(),
-            timezone: "UTC".parse().expect("valid timezone"),
-        },
-        config: InitConfig {
-            provider_proxy_url: "http://proxy.local".parse().expect("valid proxy url"),
-            provider_proxy_token: "token".parse().expect("valid proxy token"),
-            model: "claude-sonnet-4-6".parse().expect("valid model"),
-            max_tokens: 1000,
-            session_id: None,
-            tools_enabled: true,
-            timeout_seconds: 600,
-        },
-    }
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::{HS_TIMEOUT, sample_group, sample_init, sample_ready, socket_path};
 
 fn server_options(unknown: UnknownTrafficLimitConfig) -> IpcServerOptions {
     IpcServerOptions {
@@ -119,6 +63,8 @@ async fn handshake_rejects_unknown_lifetime_cap_breach() {
             lifetime_byte_limit: 0,
             rate_limit_burst_capacity: 0,
             rate_limit_refill_per_second: 0,
+            ignored_field_lifetime_keys: 0,
+            ignored_field_lifetime_bytes: 0,
         }),
     )
     .expect("bind");
@@ -157,6 +103,8 @@ async fn unsplit_rejects_alternating_unknown_and_heartbeat_via_lifetime_cap() {
             lifetime_byte_limit: 0,
             rate_limit_burst_capacity: 0,
             rate_limit_refill_per_second: 0,
+            ignored_field_lifetime_keys: 0,
+            ignored_field_lifetime_bytes: 0,
         }),
     )
     .expect("bind");
@@ -217,6 +165,8 @@ async fn split_reader_rejects_alternating_unknown_and_heartbeat_via_rate_limit()
             lifetime_byte_limit: 0,
             rate_limit_burst_capacity: 2,
             rate_limit_refill_per_second: 1,
+            ignored_field_lifetime_keys: 0,
+            ignored_field_lifetime_bytes: 0,
         }),
     )
     .expect("bind");
@@ -270,4 +220,243 @@ async fn split_reader_rejects_alternating_unknown_and_heartbeat_via_rate_limit()
             refill_per_second: 1
         })
     ));
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Forward-compat abuse shaping (finding #1)
+// ─────────────────────────────────────────────────────────────────────
+
+/// A heartbeat with *any* extra field must be rejected immediately —
+/// payload policy is `Reject`, there is no per-frame budget to consume.
+#[tokio::test]
+async fn heartbeat_with_any_extra_field_is_rejected_immediately() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ignored-heartbeat-reject.sock");
+    let server = IpcServer::bind_with_options(&path, IpcServerOptions::insecure_capture_only())
+        .expect("bind");
+
+    let accept_task = tokio::spawn(async move {
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (mut conn, _ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
+            .await
+            .expect("handshake");
+        conn.recv_event().await
+    });
+
+    let mut raw = tokio::net::UnixStream::connect(&path)
+        .await
+        .expect("raw connect");
+    write_frame(
+        &mut raw,
+        &serde_json::to_vec(&ContainerToHost::Ready(sample_ready("1.0"))).expect("serialize ready"),
+    )
+    .await;
+    raw.flush().await.expect("flush");
+    read_init_frame(&mut raw).await;
+
+    let payload = br#"{"type":"heartbeat","timestamp":"2026-04-16T00:00:00Z","junk":"x"}"#;
+    write_frame(&mut raw, payload).await;
+    raw.flush().await.expect("flush hb");
+
+    let err = accept_task.await.expect("join").expect_err("reject");
+    assert!(matches!(
+        err,
+        IpcError::Protocol(ProtocolError::UnknownFieldsRejected {
+            message_type: "heartbeat",
+            ..
+        })
+    ));
+    drop(raw);
+}
+
+/// An `output_delta` with *any* extra field must also be rejected
+/// (same policy class as `heartbeat`).
+#[tokio::test]
+async fn output_delta_with_any_extra_field_is_rejected_immediately() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ignored-delta-reject.sock");
+    let server = IpcServer::bind_with_options(&path, IpcServerOptions::insecure_capture_only())
+        .expect("bind");
+
+    let accept_task = tokio::spawn(async move {
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (mut conn, _ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
+            .await
+            .expect("handshake");
+        conn.recv_event().await
+    });
+
+    let mut raw = tokio::net::UnixStream::connect(&path)
+        .await
+        .expect("raw connect");
+    write_frame(
+        &mut raw,
+        &serde_json::to_vec(&ContainerToHost::Ready(sample_ready("1.0"))).expect("serialize ready"),
+    )
+    .await;
+    raw.flush().await.expect("flush");
+    read_init_frame(&mut raw).await;
+
+    let payload = br#"{"type":"output_delta","text":"x","job_id":"job-integration-1","junk":"z"}"#;
+    write_frame(&mut raw, payload).await;
+    raw.flush().await.expect("flush delta");
+
+    let err = accept_task.await.expect("join").expect_err("reject");
+    assert!(matches!(
+        err,
+        IpcError::Protocol(ProtocolError::UnknownFieldsRejected {
+            message_type: "output_delta",
+            ..
+        })
+    ));
+    drop(raw);
+}
+
+/// A ready with extra fields whose *bytes* exceed the per-frame budget
+/// trips `IgnoredFieldBudgetExceeded` on the `bytes` dimension.
+#[tokio::test]
+async fn ready_with_large_extra_field_bytes_exceeds_budget() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ignored-ready-bytes.sock");
+    let server = IpcServer::bind_with_options(&path, IpcServerOptions::insecure_capture_only())
+        .expect("bind");
+
+    let accept_task = tokio::spawn(async move {
+        let pending = server.accept(sample_group()).await.expect("accept");
+        pending.handshake(sample_init(), HS_TIMEOUT).await
+    });
+
+    let mut raw = tokio::net::UnixStream::connect(&path)
+        .await
+        .expect("raw connect");
+    let junk = "x".repeat(8192);
+    let ready = format!(
+        r#"{{"type":"ready","adapter":"a","adapter_version":"v","protocol_version":"1.0","junk":"{junk}"}}"#
+    );
+    write_frame(&mut raw, ready.as_bytes()).await;
+    raw.flush().await.expect("flush");
+
+    let err = accept_task.await.expect("join").expect_err("ready abuse");
+    assert!(matches!(
+        err,
+        IpcError::Protocol(ProtocolError::IgnoredFieldBudgetExceeded {
+            message_type: "ready",
+            scope: "per_frame",
+            dimension: "bytes",
+            ..
+        })
+    ));
+    drop(raw);
+}
+
+/// Bounded-Budget payloads carrying many small extra fields trip the
+/// `keys` dimension.
+#[tokio::test]
+async fn ready_with_many_extra_keys_exceeds_budget() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ignored-ready-keys.sock");
+    let server = IpcServer::bind_with_options(&path, IpcServerOptions::insecure_capture_only())
+        .expect("bind");
+
+    let accept_task = tokio::spawn(async move {
+        let pending = server.accept(sample_group()).await.expect("accept");
+        pending.handshake(sample_init(), HS_TIMEOUT).await
+    });
+
+    let mut raw = tokio::net::UnixStream::connect(&path)
+        .await
+        .expect("raw connect");
+    let mut extras = String::new();
+    for i in 0..17 {
+        let _ = write!(extras, r#","ext_{i}":0"#);
+    }
+    let ready = format!(
+        r#"{{"type":"ready","adapter":"a","adapter_version":"v","protocol_version":"1.0"{extras}}}"#
+    );
+    write_frame(&mut raw, ready.as_bytes()).await;
+    raw.flush().await.expect("flush");
+
+    let err = accept_task.await.expect("join").expect_err("ready abuse");
+    assert!(matches!(
+        err,
+        IpcError::Protocol(ProtocolError::IgnoredFieldBudgetExceeded {
+            message_type: "ready",
+            scope: "per_frame",
+            dimension: "keys",
+            ..
+        })
+    ));
+    drop(raw);
+}
+
+/// Lifetime byte cap accumulates across multiple known-type frames
+/// even when no single frame trips the per-frame limit.
+#[tokio::test]
+async fn ignored_field_lifetime_bytes_budget_enforced_across_messages() {
+    let dir = tempdir().expect("tempdir");
+    let path = socket_path(&dir, "ignored-lifetime-bytes.sock");
+    // Tiny lifetime byte cap, per-frame wide open.
+    let server = IpcServer::bind_with_options(
+        &path,
+        server_options(UnknownTrafficLimitConfig {
+            lifetime_message_limit: 0,
+            lifetime_byte_limit: 0,
+            rate_limit_burst_capacity: 0,
+            rate_limit_refill_per_second: 0,
+            ignored_field_lifetime_keys: 0,
+            ignored_field_lifetime_bytes: 128,
+        }),
+    )
+    .expect("bind");
+
+    let accept_task = tokio::spawn(async move {
+        let pending = server.accept(sample_group()).await.expect("accept");
+        let (mut conn, _ready) = pending
+            .handshake(sample_init(), HS_TIMEOUT)
+            .await
+            .expect("handshake");
+        // After handshake, read each progress frame — each carries a
+        // small unknown field (~20 bytes). The 7th frame pushes total
+        // past 128 bytes and trips the lifetime byte cap.
+        for _ in 0..10 {
+            conn.recv_event().await?;
+        }
+        Ok::<_, IpcError>(())
+    });
+
+    let mut raw = tokio::net::UnixStream::connect(&path)
+        .await
+        .expect("raw connect");
+    write_frame(
+        &mut raw,
+        &serde_json::to_vec(&ContainerToHost::Ready(sample_ready("1.0"))).expect("serialize ready"),
+    )
+    .await;
+    raw.flush().await.expect("flush ready");
+    read_init_frame(&mut raw).await;
+
+    // Each progress frame carries a 48-byte unknown value (~50 bytes
+    // measured by the roundtrip diff); after frame 3 the lifetime
+    // byte total crosses the 128-byte cap.
+    for i in 0..10 {
+        let junk = "x".repeat(48);
+        let payload = format!(
+            r#"{{"type":"progress","job_id":"job-integration-1","stage":"s","ext_{i}":"{junk}"}}"#
+        );
+        write_frame(&mut raw, payload.as_bytes()).await;
+    }
+    raw.flush().await.expect("flush progress");
+
+    let err = accept_task.await.expect("join").expect_err("lifetime");
+    assert!(matches!(
+        err,
+        IpcError::Protocol(ProtocolError::IgnoredFieldBudgetExceeded {
+            scope: "lifetime",
+            dimension: "bytes",
+            ..
+        })
+    ));
+    drop(raw);
 }

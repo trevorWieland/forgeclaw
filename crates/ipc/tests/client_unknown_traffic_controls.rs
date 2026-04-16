@@ -128,6 +128,8 @@ async fn client_recv_enforces_unknown_lifetime_cap_with_interleaved_known_frames
                 lifetime_byte_limit: 0,
                 rate_limit_burst_capacity: 0,
                 rate_limit_refill_per_second: 0,
+                ignored_field_lifetime_keys: 0,
+                ignored_field_lifetime_bytes: 0,
             },
         },
     )
@@ -176,6 +178,8 @@ async fn client_split_recv_enforces_unknown_rate_limit_with_interleaved_known_fr
                 lifetime_byte_limit: 0,
                 rate_limit_burst_capacity: 2,
                 rate_limit_refill_per_second: 1,
+                ignored_field_lifetime_keys: 0,
+                ignored_field_lifetime_bytes: 0,
             },
         },
     )

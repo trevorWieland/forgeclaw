@@ -1,11 +1,70 @@
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::IpcError;
 use crate::path_policy::validate_socket_path_shape;
 
+/// Policy governing which UID is allowed to own the socket's parent
+/// directory at bind and post-bind attestation time.
+///
+/// `IpcServer::bind` defaults to [`Self::MatchEffectiveUid`], so a
+/// path whose parent is owned by a different UID fails closed before
+/// `UnixListener::bind` is ever called. Operators who need to bind
+/// under a dedicated service account can name it explicitly via
+/// [`Self::RequireUid`]. [`Self::Disabled`] is audit-visible (logs a
+/// warn on every bind) and intended only for constrained
+/// deployments that cannot guarantee ownership — the matching
+/// [`crate::server::IpcServerOptions::insecure_capture_only`]
+/// constructor selects it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParentOwnerPolicy {
+    /// Parent UID must match the effective UID of the running process,
+    /// sampled at bind time via a crate-internal `peer_cred` helper.
+    MatchEffectiveUid,
+    /// Parent UID must equal the explicitly supplied value.
+    RequireUid(u32),
+    /// Ownership check is disabled. Emits a `tracing::warn` on first
+    /// bind so operators can audit the posture.
+    Disabled,
+}
+
+impl ParentOwnerPolicy {
+    /// Returns the UID this policy expects the parent to have, if the
+    /// policy enforces a specific UID.
+    ///
+    /// For `MatchEffectiveUid`, this samples the running process's
+    /// effective UID via `peer_cred::effective_uid` (a crate-internal
+    /// helper that opens a transient Unix socketpair to read
+    /// `peer_cred` without `libc` FFI).
+    fn expected_uid(self) -> Result<Option<u32>, IpcError> {
+        match self {
+            Self::MatchEffectiveUid => Ok(Some(super::effective_uid()?)),
+            Self::RequireUid(uid) => Ok(Some(uid)),
+            Self::Disabled => Ok(None),
+        }
+    }
+}
+
+static DISABLED_WARN_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn log_disabled_warn_once() {
+    if DISABLED_WARN_LOGGED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        tracing::warn!(
+            target: "forgeclaw_ipc::server",
+            "socket parent ownership check is DISABLED — bind posture is permissive"
+        );
+    }
+}
+
 /// Validate that the socket directory is safe for binding.
-pub(crate) fn validate_socket_dir(socket_path: &Path) -> Result<(), IpcError> {
+pub(crate) fn validate_socket_dir(
+    socket_path: &Path,
+    owner_policy: ParentOwnerPolicy,
+) -> Result<(), IpcError> {
     validate_socket_path_shape(socket_path)?;
     let parent = socket_path.parent().ok_or_else(|| {
         IpcError::Io(io::Error::new(
@@ -21,7 +80,35 @@ pub(crate) fn validate_socket_dir(socket_path: &Path) -> Result<(), IpcError> {
     create_missing_parent_segments(&nearest_existing_canonical, &relative)?;
     validate_parent_directory_shape(&canonical_parent)?;
     validate_parent_directory_mode(&canonical_parent)?;
-    validate_parent_canonical_identity(parent, &canonical_parent)
+    validate_parent_canonical_identity(parent, &canonical_parent)?;
+    validate_parent_directory_owner(&canonical_parent, owner_policy)
+}
+
+pub(crate) fn validate_parent_directory_owner(
+    parent: &Path,
+    policy: ParentOwnerPolicy,
+) -> Result<(), IpcError> {
+    use std::os::unix::fs::MetadataExt;
+
+    match policy.expected_uid()? {
+        None => {
+            log_disabled_warn_once();
+            Ok(())
+        }
+        Some(expected_uid) => {
+            let meta = std::fs::symlink_metadata(parent).map_err(IpcError::Io)?;
+            let actual_uid = meta.uid();
+            if actual_uid == expected_uid {
+                Ok(())
+            } else {
+                Err(IpcError::SocketParentOwnership {
+                    path: parent.display().to_string(),
+                    expected_uid,
+                    actual_uid,
+                })
+            }
+        }
+    }
 }
 
 fn nearest_existing_ancestor(path: &Path) -> Result<(PathBuf, PathBuf), IpcError> {

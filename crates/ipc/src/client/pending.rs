@@ -11,13 +11,15 @@ use tokio::net::UnixStream;
 use tokio::time::Instant;
 
 use crate::codec::{
-    DEFAULT_MAX_UNKNOWN_SKIPS, decode_host_to_container, encode_container_to_host_frame,
+    DEFAULT_MAX_UNKNOWN_SKIPS, decode_host_to_container_with_tally, encode_container_to_host_frame,
 };
 use crate::error::{IpcError, ProtocolError};
 use crate::message::{ContainerToHost, HostToContainer, InitPayload, ReadyPayload};
 use crate::policy::{DEFAULT_MAX_UNKNOWN_BYTES, UnknownTrafficBudget};
+use crate::semantics::ProtocolSemantics;
 use crate::transport::{FrameReader, FrameWriter};
 use crate::util::{SharedWriteHalf, ShutdownHandle, truncate_for_log};
+use crate::version::{PROTOCOL_VERSION, negotiate};
 
 use super::{IpcClient, IpcClientOptions};
 
@@ -88,13 +90,21 @@ impl PendingClient {
         ready: ReadyPayload,
         timeout: Duration,
     ) -> Result<(IpcClient, InitPayload), IpcError> {
+        let peer_version_text = ready.protocol_version.as_ref().to_owned();
         match tokio::time::timeout(timeout, self.handshake_inner(ready)).await {
             Ok(Ok(init)) => {
+                let negotiated = negotiate(&peer_version_text).ok_or_else(|| {
+                    IpcError::Protocol(ProtocolError::UnsupportedVersion {
+                        peer: peer_version_text.clone(),
+                        local: PROTOCOL_VERSION,
+                    })
+                })?;
                 let client = IpcClient::from_parts(
                     self.reader,
                     self.writer,
                     self.shutdown_handle,
                     init.job_id.clone(),
+                    negotiated,
                     self.options,
                 );
                 Ok((client, init))
@@ -180,13 +190,24 @@ impl PendingClient {
             }
         };
         self.last_frame_len = frame.len();
-        let result = decode_host_to_container(&frame);
-        if let Err(ref e) = result {
-            if e.is_fatal() {
-                self.poison().await;
+        let (msg, tally) = match decode_host_to_container_with_tally(&frame) {
+            Ok(pair) => pair,
+            Err(e) => {
+                if e.is_fatal() {
+                    self.poison().await;
+                }
+                return Err(e);
             }
+        };
+        // Pre-handshake: no negotiated version yet → baseline semantics.
+        if let Err(e) = self
+            .unknown_budget
+            .on_ignored_host(&msg, tally, ProtocolSemantics::V1_0)
+        {
+            self.poison().await;
+            return Err(e);
         }
-        result
+        Ok(msg)
     }
 
     async fn recv(&mut self) -> Result<HostToContainer, IpcError> {

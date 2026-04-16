@@ -8,7 +8,7 @@ use tokio::net::UnixListener;
 
 use crate::error::IpcError;
 use crate::message::shared::GroupInfo;
-use crate::peer_cred::{self, SessionIdentity};
+use crate::peer_cred::{self, ParentOwnerPolicy, SessionIdentity};
 use crate::policy::UnknownTrafficLimitConfig;
 
 use super::PendingConnection;
@@ -50,6 +50,9 @@ pub struct IpcServerOptions {
     pub unknown_traffic_limit: UnknownTrafficLimitConfig,
     /// Peer-credential authorization policy at accept time.
     pub peer_credential_policy: PeerCredentialPolicy,
+    /// Socket parent-directory ownership policy enforced at bind and
+    /// post-bind attestation time.
+    pub parent_owner_policy: ParentOwnerPolicy,
     /// Post-handshake write timeout for outbound sends.
     pub write_timeout: Duration,
     /// Idle-phase read timeout for inbound receives (`None` disables).
@@ -71,20 +74,31 @@ impl IpcServerOptions {
             unauthorized_limit: UnauthorizedCommandLimitConfig::default(),
             unknown_traffic_limit: UnknownTrafficLimitConfig::default(),
             peer_credential_policy: PeerCredentialPolicy::match_current_process()?,
+            parent_owner_policy: ParentOwnerPolicy::MatchEffectiveUid,
             write_timeout: Duration::from_secs(5),
             idle_read_timeout: Some(Duration::from_secs(60)),
         })
     }
 
-    /// Hardened option preset with caller-supplied strict UID/GID
+    /// Hardened option preset with caller-supplied strict peer UID/GID
     /// matching. Use this when the peer identity is known ahead of
     /// time and differs from the running process.
+    ///
+    /// The peer-credential UID bound here is independent from the
+    /// parent-directory owner policy — this constructor keeps the
+    /// default [`ParentOwnerPolicy::MatchEffectiveUid`], because the
+    /// running host is the one performing the bind and must therefore
+    /// own its own socket parent even when the expected peer is a
+    /// different identity. Override `parent_owner_policy` on the
+    /// returned struct if the deployment binds the socket under a
+    /// dedicated service account.
     #[must_use]
     pub fn hardened(uid: Option<u32>, gid: Option<u32>) -> Self {
         Self {
             unauthorized_limit: UnauthorizedCommandLimitConfig::default(),
             unknown_traffic_limit: UnknownTrafficLimitConfig::default(),
             peer_credential_policy: PeerCredentialPolicy::RequireExact { uid, gid },
+            parent_owner_policy: ParentOwnerPolicy::MatchEffectiveUid,
             write_timeout: Duration::from_secs(5),
             idle_read_timeout: Some(Duration::from_secs(60)),
         }
@@ -94,12 +108,16 @@ impl IpcServerOptions {
     /// construction path that yields [`PeerCredentialPolicy::CaptureOnly`];
     /// the name is deliberate so a code-search for "insecure" always
     /// surfaces callers that opted out of peer credential enforcement.
+    ///
+    /// Also disables the parent-directory owner policy — the
+    /// `tracing::warn` emitted at bind time provides the audit trail.
     #[must_use]
     pub fn insecure_capture_only() -> Self {
         Self {
             unauthorized_limit: UnauthorizedCommandLimitConfig::default(),
             unknown_traffic_limit: UnknownTrafficLimitConfig::default(),
             peer_credential_policy: PeerCredentialPolicy::CaptureOnly,
+            parent_owner_policy: ParentOwnerPolicy::Disabled,
             write_timeout: Duration::from_secs(5),
             idle_read_timeout: Some(Duration::from_secs(60)),
         }
@@ -177,7 +195,7 @@ impl IpcServer {
         // `bind` is a startup-time operation so the short blocking
         // metadata check + unlink here is fine.
         #[cfg(unix)]
-        peer_cred::validate_socket_dir(&socket_path)?;
+        peer_cred::validate_socket_dir(&socket_path, options.parent_owner_policy)?;
         #[cfg(unix)]
         let bind_attestation = peer_cred::capture_bind_attestation(&socket_path)?;
         clean_stale_socket(&socket_path)?;
@@ -186,8 +204,12 @@ impl IpcServer {
         let socket_fingerprint = {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
-            if let Err(e) = peer_cred::attest_post_bind(&socket_path, &listener, &bind_attestation)
-            {
+            if let Err(e) = peer_cred::attest_post_bind(
+                &socket_path,
+                &listener,
+                &bind_attestation,
+                options.parent_owner_policy,
+            ) {
                 cleanup_listener_owned_socket(
                     &socket_path,
                     &listener,

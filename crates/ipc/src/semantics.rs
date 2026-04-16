@@ -2,9 +2,9 @@
 //!
 //! Each gate corresponds to one row in the **Versioned Behavior
 //! Matrix** in `docs/IPC_PROTOCOL.md` § Versioning. The matrix and this
-//! file are locked together by
-//! [`tests::semantics_matrix_matches_documented_gates`] — adding a new
-//! gate without updating the spec (or vice versa) fails CI.
+//! file are locked together by the
+//! `semantics_matrix_matches_documented_gates` test below — adding a
+//! new gate without updating the spec (or vice versa) fails CI.
 
 use crate::error::{IpcError, ProtocolError};
 use crate::message::command::{ClassifiedCommand, PrivilegedCommand};
@@ -12,8 +12,12 @@ use crate::message::{ContainerToHost, HostToContainer};
 use crate::version::NegotiatedProtocolVersion;
 
 /// Version-selected protocol behavior profile.
+///
+/// Exposed publicly so downstream callers (containers, adapters) may
+/// query the live semantics for a connection without having to
+/// re-derive the classification from [`NegotiatedProtocolVersion`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProtocolSemantics {
+pub enum ProtocolSemantics {
     /// Protocol 1.0 baseline semantics. No additional gates beyond the
     /// shared wire constraints.
     V1_0,
@@ -24,8 +28,10 @@ pub(crate) enum ProtocolSemantics {
 }
 
 impl ProtocolSemantics {
+    /// Classify a negotiated protocol version into its semantics
+    /// profile.
     #[must_use]
-    pub(crate) fn from_negotiated(version: NegotiatedProtocolVersion) -> Self {
+    pub fn from_negotiated(version: NegotiatedProtocolVersion) -> Self {
         match (version.major(), version.minor()) {
             (1, 0) => Self::V1_0,
             (1, _) => Self::V1_1Plus,
@@ -281,6 +287,33 @@ mod tests {
         });
         for sem in [ProtocolSemantics::V1_0, ProtocolSemantics::V1_1Plus] {
             validate_container_to_host(sem, &benign).expect("benign accepted on every minor");
+        }
+    }
+
+    /// Locks the forward-compat promotion row of the Versioned
+    /// Behavior Matrix: at 1.1+, `heartbeat` and `output_delta` resolve
+    /// to `ForwardCompatPolicy::Reject` regardless of their baseline
+    /// policy. This guard ensures a future relaxation of the baseline
+    /// does not silently leak through at 1.1+.
+    #[test]
+    fn semantics_matrix_promotes_forward_compat_at_v1_1plus() {
+        use crate::forward_compat::{ForwardCompatPolicy, promote_for_container};
+        use crate::message::{HeartbeatPayload, OutputDeltaPayload};
+
+        let heartbeat = ContainerToHost::Heartbeat(HeartbeatPayload {
+            timestamp: "2026-04-16T00:00:00Z".parse().expect("valid timestamp"),
+        });
+        let output_delta = ContainerToHost::OutputDelta(OutputDeltaPayload {
+            text: "x".parse().expect("valid text"),
+            job_id: JobId::new("j").expect("valid job id"),
+        });
+        for msg in [&heartbeat, &output_delta] {
+            assert_eq!(
+                promote_for_container(msg.forward_compat_base(), msg, ProtocolSemantics::V1_1Plus,),
+                ForwardCompatPolicy::Reject,
+                "1.1+ must resolve {} to Reject",
+                msg.type_name()
+            );
         }
     }
 }

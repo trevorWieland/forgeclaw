@@ -28,6 +28,7 @@
 //! is obvious at the call site rather than hidden in builder options.
 
 use crate::error::{FrameError, IpcError, ProtocolError};
+use crate::forward_compat::IgnoredFieldTally;
 use crate::message::{ContainerToHost, HostToContainer};
 use crate::outbound_validation::{
     validate_outbound_container_to_host, validate_outbound_host_to_container,
@@ -194,20 +195,93 @@ struct DiscriminatorOnly<'a> {
 
 /// Decode a frame payload into a typed protocol message.
 ///
-/// - Happy path: one full typed parse via `serde_json::from_slice::<T>`.
+/// Wraps [`decode_typed_with_tally`] and discards the tally — used by
+/// callers that have no interest in ignored-field accounting (e.g.
+/// test fixtures, benchmarks).
+pub(crate) fn decode_typed_message<T: serde::de::DeserializeOwned + Serialize>(
+    bytes: &[u8],
+    known_types: &[&str],
+) -> Result<T, IpcError> {
+    decode_typed_with_tally::<T>(bytes, known_types).map(|(msg, _)| msg)
+}
+
+/// Decode a frame payload into a typed protocol message and measure
+/// any ignored fields.
+///
+/// - Happy path: one typed parse via `serde_json::from_slice::<T>`.
 /// - Adversarial path: on typed-parse failure, the fallback consults a
 ///   narrow [`DiscriminatorOnly`] struct to classify the error as
 ///   [`FrameError::InvalidUtf8`], [`FrameError::MalformedJson`], or
 ///   [`ProtocolError::UnknownMessageType`]. The fallback never
 ///   materializes a full [`serde_json::Value`], so CPU and allocation
 ///   cost are bounded by the discriminator itself — not the frame size.
-pub(crate) fn decode_typed_message<T: serde::de::DeserializeOwned>(
+/// - Ignored-field measurement uses a **roundtrip diff**: the typed
+///   value is re-serialized to a canonical [`serde_json::Value`] and
+///   compared with the wire representation key-by-key. Keys present on
+///   the wire but missing in the canonical form are counted; their
+///   serialized byte size contributes to the tally. This avoids the
+///   known limitation of [`serde_ignored`] with internally-tagged
+///   enums (`#[serde(tag = "type")]`), which buffers variant content
+///   before the ignored-field callback fires.
+pub(crate) fn decode_typed_with_tally<T: serde::de::DeserializeOwned + Serialize>(
     bytes: &[u8],
     known_types: &[&str],
-) -> Result<T, IpcError> {
-    match serde_json::from_slice::<T>(bytes) {
-        Ok(message) => Ok(message),
-        Err(typed_err) => Err(classify_decode_failure(bytes, known_types, &typed_err)),
+) -> Result<(T, IgnoredFieldTally), IpcError> {
+    let message = match serde_json::from_slice::<T>(bytes) {
+        Ok(msg) => msg,
+        Err(err) => return Err(classify_decode_failure(bytes, known_types, &err)),
+    };
+    let tally = measure_ignored_by_roundtrip_diff(&message, bytes)?;
+    Ok((message, tally))
+}
+
+fn measure_ignored_by_roundtrip_diff<T: Serialize>(
+    msg: &T,
+    wire_bytes: &[u8],
+) -> Result<IgnoredFieldTally, IpcError> {
+    let wire: serde_json::Value = serde_json::from_slice(wire_bytes)
+        .map_err(|err| IpcError::Frame(FrameError::MalformedJson(err.to_string())))?;
+    let canonical = serde_json::to_value(msg).map_err(|err| IpcError::serialize(&err))?;
+    let mut tally = IgnoredFieldTally::default();
+    diff_tally(&canonical, &wire, &mut tally);
+    Ok(tally)
+}
+
+/// Walk `wire` relative to `canonical`; every wire key or array entry
+/// that is not mirrored in `canonical` contributes one tally leaf and
+/// its JSON byte length.
+fn diff_tally(
+    canonical: &serde_json::Value,
+    wire: &serde_json::Value,
+    tally: &mut IgnoredFieldTally,
+) {
+    use serde_json::Value;
+    match (canonical, wire) {
+        (Value::Object(known_map), Value::Object(wire_map)) => {
+            for (key, wire_value) in wire_map {
+                if let Some(known_value) = known_map.get(key) {
+                    diff_tally(known_value, wire_value, tally);
+                } else {
+                    let subtree_bytes =
+                        serde_json::to_vec(wire_value).map(|v| v.len()).unwrap_or(0);
+                    tally.push(subtree_bytes);
+                }
+            }
+        }
+        (Value::Array(known_arr), Value::Array(wire_arr)) => {
+            // Array entries align 1:1 — any peer that adds an element
+            // beyond the typed length is adding wire data the typed
+            // shape dropped, so count the tail as ignored.
+            let common = known_arr.len().min(wire_arr.len());
+            for i in 0..common {
+                diff_tally(&known_arr[i], &wire_arr[i], tally);
+            }
+            for extra in wire_arr.iter().skip(common) {
+                let subtree_bytes = serde_json::to_vec(extra).map(|v| v.len()).unwrap_or(0);
+                tally.push(subtree_bytes);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -391,6 +465,20 @@ pub fn decode_container_to_host(bytes: &[u8]) -> Result<ContainerToHost, IpcErro
 /// Typed alias — turn a frame into a [`HostToContainer`].
 pub fn decode_host_to_container(bytes: &[u8]) -> Result<HostToContainer, IpcError> {
     decode_typed_message::<HostToContainer>(bytes, HostToContainer::KNOWN_TYPES)
+}
+
+/// Decode a [`ContainerToHost`] and report any ignored-field tally.
+pub fn decode_container_to_host_with_tally(
+    bytes: &[u8],
+) -> Result<(ContainerToHost, IgnoredFieldTally), IpcError> {
+    decode_typed_with_tally::<ContainerToHost>(bytes, ContainerToHost::KNOWN_TYPES)
+}
+
+/// Decode a [`HostToContainer`] and report any ignored-field tally.
+pub fn decode_host_to_container_with_tally(
+    bytes: &[u8],
+) -> Result<(HostToContainer, IgnoredFieldTally), IpcError> {
+    decode_typed_with_tally::<HostToContainer>(bytes, HostToContainer::KNOWN_TYPES)
 }
 
 #[cfg(test)]

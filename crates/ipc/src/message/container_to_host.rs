@@ -14,6 +14,7 @@ use super::semantic::{
     ProtocolVersionText, SessionIdText, ShortText, StageName,
 };
 use super::shared::{ErrorCode, StopReason, TokenUsage};
+use crate::forward_compat::{ForwardCompatPolicy, KnownMessage};
 
 /// Deserialize an `Option<T>` that must be present in the JSON (but
 /// may be `null`). Adding `deserialize_with` prevents serde's default
@@ -200,6 +201,32 @@ pub struct ErrorPayload {
 pub struct HeartbeatPayload {
     /// RFC3339 timestamp when the heartbeat was emitted.
     pub timestamp: IpcTimestamp,
+}
+
+impl KnownMessage for ReadyPayload {
+    const FORWARD_COMPAT: ForwardCompatPolicy = ForwardCompatPolicy::DEFAULT_BUDGET;
+}
+
+impl KnownMessage for OutputDeltaPayload {
+    // High-frequency streaming shape — forbid unknown fields at baseline.
+    const FORWARD_COMPAT: ForwardCompatPolicy = ForwardCompatPolicy::Reject;
+}
+
+impl KnownMessage for OutputCompletePayload {
+    const FORWARD_COMPAT: ForwardCompatPolicy = ForwardCompatPolicy::DEFAULT_BUDGET;
+}
+
+impl KnownMessage for ProgressPayload {
+    const FORWARD_COMPAT: ForwardCompatPolicy = ForwardCompatPolicy::DEFAULT_BUDGET;
+}
+
+impl KnownMessage for ErrorPayload {
+    const FORWARD_COMPAT: ForwardCompatPolicy = ForwardCompatPolicy::DEFAULT_BUDGET;
+}
+
+impl KnownMessage for HeartbeatPayload {
+    // Narrow liveness shape — forbid unknown fields at baseline.
+    const FORWARD_COMPAT: ForwardCompatPolicy = ForwardCompatPolicy::Reject;
 }
 
 #[cfg(test)]
