@@ -84,7 +84,6 @@ macro_rules! bounded_text_type {
             $(#[$meta])*
             $name,
             max = $max,
-            desc = $desc,
             new_body = |value: String, actual: usize| {
                 if actual > $name::MAX_LEN {
                     return Err(BoundedTextError::Length {
@@ -93,6 +92,11 @@ macro_rules! bounded_text_type {
                     });
                 }
                 Ok($name(value))
+            },
+            schema_body = {
+                "type": "string",
+                "maxLength": Self::MAX_LEN,
+                "description": $desc,
             }
         );
     };
@@ -107,7 +111,6 @@ macro_rules! bounded_text_type {
             $(#[$meta])*
             $name,
             max = $max,
-            desc = $desc,
             new_body = |value: String, actual: usize| {
                 if actual > $name::MAX_LEN {
                     return Err(BoundedTextError::Length {
@@ -117,7 +120,36 @@ macro_rules! bounded_text_type {
                 }
                 $validator(value.as_str())?;
                 Ok($name(value))
+            },
+            schema_body = {
+                "type": "string",
+                "maxLength": Self::MAX_LEN,
+                "description": $desc,
             }
+        );
+    };
+    (
+        $(#[$meta:meta])*
+        $name:ident,
+        max = $max:expr,
+        extra_validate = $validator:path,
+        schema_body = $body:tt $(,)?
+    ) => {
+        bounded_text_impl!(
+            $(#[$meta])*
+            $name,
+            max = $max,
+            new_body = |value: String, actual: usize| {
+                if actual > $name::MAX_LEN {
+                    return Err(BoundedTextError::Length {
+                        max: $name::MAX_LEN,
+                        actual,
+                    });
+                }
+                $validator(value.as_str())?;
+                Ok($name(value))
+            },
+            schema_body = $body
         );
     };
 }
@@ -127,8 +159,8 @@ macro_rules! bounded_text_impl {
         $(#[$meta:meta])*
         $name:ident,
         max = $max:expr,
-        desc = $desc:literal,
-        new_body = $new_body:expr $(,)?
+        new_body = $new_body:expr,
+        schema_body = $body:tt $(,)?
     ) => {
         $(#[$meta])*
         #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
@@ -237,11 +269,7 @@ macro_rules! bounded_text_impl {
             }
 
             fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
-                schemars::json_schema!({
-                    "type": "string",
-                    "maxLength": Self::MAX_LEN,
-                    "description": $desc,
-                })
+                schemars::json_schema!($body)
             }
         }
     };
@@ -265,13 +293,21 @@ bounded_text_type!(
     /// IPC protocol version advertised by an adapter at handshake time.
     ///
     /// Format is `<major>.<minor>` where both components are
-    /// non-negative integers. Strict numeric validation runs at
-    /// construction and deserialization time so malformed version
-    /// strings never reach the handshake negotiator.
+    /// non-negative integers. The numeric format is enforced both at
+    /// runtime construction/deserialization time AND in the published
+    /// JSON Schema via the `pattern` keyword, so polyglot adapters
+    /// generated from the schema cannot construct values that the
+    /// runtime then rejects.
     ProtocolVersionText,
     max = limits::MAX_IDENTIFIER_TEXT_CHARS,
-    desc = "IPC protocol version (`<major>.<minor>`) with maxLength 128.",
     extra_validate = validate_protocol_version_text,
+    schema_body = {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": Self::MAX_LEN,
+        "pattern": "^[0-9]+\\.[0-9]+$",
+        "description": "IPC protocol version (`<major>.<minor>`, both numeric, no extra segments). Enforced identically at runtime and in the JSON Schema. maxLength 128.",
+    },
 );
 
 bounded_text_type!(
@@ -307,12 +343,28 @@ bounded_text_type!(
     ///
     /// Layered advisory validator rejects obvious malformed refs
     /// (empty, whitespace, control characters, leading/trailing `/`,
-    /// consecutive `/`, `..`). Strict `git check-ref-format` semantics
-    /// remain the responsibility of the host/store layer.
+    /// consecutive `/`, `..`). The same advisory rules are encoded in
+    /// the published JSON Schema via `allOf` composition (positive
+    /// `pattern` plus `not`-pattern clauses) so polyglot adapters
+    /// generated from the schema accept and reject the same set of
+    /// values the runtime does. Strict `git check-ref-format`
+    /// semantics remain the responsibility of the host/store layer.
     BranchName,
     max = limits::MAX_IDENTIFIER_TEXT_CHARS,
-    desc = "Advisory git branch name with maxLength 128.",
     extra_validate = validate_branch_name,
+    schema_body = {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": Self::MAX_LEN,
+        "allOf": [
+            { "pattern": "^[^\\s\\u0000-\\u001f\\u007f]+$" },
+            { "not": { "pattern": "^/" } },
+            { "not": { "pattern": "/$" } },
+            { "not": { "pattern": "//" } },
+            { "not": { "pattern": "\\.\\." } }
+        ],
+        "description": "Advisory git branch name (no whitespace/control chars, no leading/trailing `/`, no consecutive `/`, no `..`). Enforced identically at runtime and in the JSON Schema. maxLength 128.",
+    },
 );
 
 bounded_text_type!(

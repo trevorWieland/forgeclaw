@@ -213,7 +213,23 @@ pub(crate) fn enforce_container_to_host(
                 )),
             }
         }
-        ContainerToHost::Heartbeat(_) => Ok(LifecycleAction::None),
+        ContainerToHost::Heartbeat(_) => match state.phase {
+            ConnectionPhase::Processing | ConnectionPhase::DrainingAwaitingCompletion => {
+                Ok(LifecycleAction::None)
+            }
+            ConnectionPhase::Idle => Err(lifecycle_violation(
+                state.phase,
+                "container_to_host",
+                msg.type_name(),
+                "heartbeat is only valid during processing or draining",
+            )),
+            ConnectionPhase::Closed => Err(lifecycle_violation(
+                state.phase,
+                "container_to_host",
+                msg.type_name(),
+                "connection is terminally closed",
+            )),
+        },
         ContainerToHost::Error(payload) => {
             if let Some(job_id) = &payload.job_id {
                 require_active_job("container_to_host", msg.type_name(), state, job_id)?;

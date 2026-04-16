@@ -1,4 +1,10 @@
 //! Centralized protocol semantics gates by negotiated version.
+//!
+//! Each gate corresponds to one row in the **Versioned Behavior
+//! Matrix** in `docs/IPC_PROTOCOL.md` § Versioning. The matrix and this
+//! file are locked together by
+//! [`tests::semantics_matrix_matches_documented_gates`] — adding a new
+//! gate without updating the spec (or vice versa) fails CI.
 
 use crate::error::{IpcError, ProtocolError};
 use crate::message::command::{ClassifiedCommand, PrivilegedCommand};
@@ -8,9 +14,12 @@ use crate::version::NegotiatedProtocolVersion;
 /// Version-selected protocol behavior profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProtocolSemantics {
-    /// Protocol 1.0 baseline semantics.
+    /// Protocol 1.0 baseline semantics. No additional gates beyond the
+    /// shared wire constraints.
     V1_0,
-    /// Protocol 1.x semantics for minor versions after 1.0.
+    /// Protocol 1.x semantics for minor versions ≥ 1.1. Layers
+    /// stricter rules on top of the baseline; see the Versioned
+    /// Behavior Matrix in `docs/IPC_PROTOCOL.md`.
     V1_1Plus,
 }
 
@@ -91,13 +100,18 @@ pub(crate) fn validate_classified_command(
 
 #[cfg(test)]
 mod tests {
-    use super::{ProtocolSemantics, validate_classified_command, validate_container_to_host};
+    use super::{
+        ProtocolSemantics, validate_classified_command, validate_container_to_host,
+        validate_host_to_container,
+    };
     use crate::error::{IpcError, ProtocolError};
+    use crate::message::command::{GroupExtensions, GroupExtensionsVersion, RegisterGroupPayload};
     use crate::message::{
-        CommandBody, CommandPayload, ContainerToHost, ErrorCode, ErrorPayload, SendMessagePayload,
+        CommandBody, CommandPayload, ContainerToHost, ErrorCode, ErrorPayload, HostToContainer,
+        SendMessagePayload, ShutdownPayload, ShutdownReason,
     };
     use crate::version::NegotiatedProtocolVersion;
-    use forgeclaw_core::GroupId;
+    use forgeclaw_core::{GroupId, JobId};
 
     #[test]
     fn semantics_resolves_v1_0() {
@@ -152,5 +166,121 @@ mod tests {
             err,
             IpcError::Protocol(ProtocolError::LifecycleViolation { .. })
         ));
+    }
+
+    /// Locks the **Versioned Behavior Matrix** in
+    /// `docs/IPC_PROTOCOL.md` § Versioning to the runtime gate
+    /// implementations. Every row must be reflected here. Adding a
+    /// new gate requires extending both the spec table and this
+    /// matrix; removing or relaxing one breaks this test.
+    #[test]
+    fn semantics_matrix_matches_documented_gates() {
+        // ── shutdown.deadline_ms gate ─────────────────────────────
+        let shutdown_zero = HostToContainer::Shutdown(ShutdownPayload {
+            reason: ShutdownReason::IdleTimeout,
+            deadline_ms: 0,
+        });
+        let shutdown_positive = HostToContainer::Shutdown(ShutdownPayload {
+            reason: ShutdownReason::IdleTimeout,
+            deadline_ms: 1,
+        });
+        // baseline: deadline_ms == 0 is allowed
+        validate_host_to_container(ProtocolSemantics::V1_0, &shutdown_zero)
+            .expect("baseline: deadline_ms=0 must be accepted");
+        // ≥1.1: deadline_ms == 0 is rejected with LifecycleViolation
+        let err = validate_host_to_container(ProtocolSemantics::V1_1Plus, &shutdown_zero)
+            .expect_err("v1.1+: deadline_ms=0 must be rejected");
+        assert!(matches!(
+            err,
+            IpcError::Protocol(ProtocolError::LifecycleViolation {
+                message_type: "shutdown",
+                ..
+            })
+        ));
+        // ≥1.1: positive deadline_ms is accepted
+        validate_host_to_container(ProtocolSemantics::V1_1Plus, &shutdown_positive)
+            .expect("v1.1+: deadline_ms>0 must be accepted");
+
+        // ── error.fatal requires job_id gate ──────────────────────
+        let fatal_no_job = ContainerToHost::Error(ErrorPayload {
+            code: ErrorCode::AdapterError,
+            message: "boom".parse().expect("valid message"),
+            fatal: true,
+            job_id: None,
+        });
+        let fatal_with_job = ContainerToHost::Error(ErrorPayload {
+            code: ErrorCode::AdapterError,
+            message: "boom".parse().expect("valid message"),
+            fatal: true,
+            job_id: Some(JobId::new("job-1").expect("valid job id")),
+        });
+        let nonfatal_no_job = ContainerToHost::Error(ErrorPayload {
+            code: ErrorCode::AdapterError,
+            message: "warn".parse().expect("valid message"),
+            fatal: false,
+            job_id: None,
+        });
+        // baseline: any combination accepted
+        validate_container_to_host(ProtocolSemantics::V1_0, &fatal_no_job)
+            .expect("baseline: fatal without job_id accepted");
+        // ≥1.1: fatal+no job rejected
+        let err = validate_container_to_host(ProtocolSemantics::V1_1Plus, &fatal_no_job)
+            .expect_err("v1.1+: fatal without job_id must be rejected");
+        assert!(matches!(
+            err,
+            IpcError::Protocol(ProtocolError::LifecycleViolation {
+                message_type: "error",
+                ..
+            })
+        ));
+        // ≥1.1: fatal with job accepted; non-fatal without job accepted
+        validate_container_to_host(ProtocolSemantics::V1_1Plus, &fatal_with_job)
+            .expect("v1.1+: fatal with job_id accepted");
+        validate_container_to_host(ProtocolSemantics::V1_1Plus, &nonfatal_no_job)
+            .expect("v1.1+: non-fatal without job_id accepted");
+
+        // ── register_group.extensions required gate ──────────────
+        let group_name = "Test Group".parse().expect("valid name");
+        let cmd_no_extensions = CommandBody::RegisterGroup(RegisterGroupPayload {
+            name: group_name,
+            extensions: None,
+        })
+        .classify();
+        let group_name_with = "Test Group".parse().expect("valid name");
+        let extensions = GroupExtensions::new(
+            GroupExtensionsVersion::new("1").expect("valid extensions version"),
+        );
+        let cmd_with_extensions = CommandBody::RegisterGroup(RegisterGroupPayload {
+            name: group_name_with,
+            extensions: Some(extensions),
+        })
+        .classify();
+        // baseline: extensions optional
+        validate_classified_command(ProtocolSemantics::V1_0, &cmd_no_extensions)
+            .expect("baseline: extensions optional");
+        // ≥1.1: extensions required
+        let err = validate_classified_command(ProtocolSemantics::V1_1Plus, &cmd_no_extensions)
+            .expect_err("v1.1+: missing extensions must be rejected");
+        assert!(matches!(
+            err,
+            IpcError::Protocol(ProtocolError::InvalidCommandPayload {
+                command: "register_group",
+                ..
+            })
+        ));
+        // ≥1.1: extensions present accepted
+        validate_classified_command(ProtocolSemantics::V1_1Plus, &cmd_with_extensions)
+            .expect("v1.1+: extensions present accepted");
+
+        // ── sanity: non-gated message types pass on every minor ──
+        let benign = ContainerToHost::Command(CommandPayload {
+            body: CommandBody::SendMessage(SendMessagePayload {
+                target_group: GroupId::new("group-main").expect("valid group id"),
+                text: "hello".parse().expect("valid text"),
+            }),
+        });
+        for sem in [ProtocolSemantics::V1_0, ProtocolSemantics::V1_1Plus] {
+            validate_container_to_host(sem, &benign).expect("benign accepted on every minor");
+        }
     }
 }

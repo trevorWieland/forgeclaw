@@ -1,19 +1,19 @@
-//! Runtime-vs-schema parity checks for the Phase A domain types with
-//! layered format validators.
+//! Strict runtime-vs-schema parity for the format-constrained domain
+//! types (`ProtocolVersionText`, `BranchName`).
 //!
-//! `ProtocolVersionText` and `BranchName` both extend the plain
-//! maxLength-128 envelope with format constraints. The exported JSON
-//! Schema for those types currently only expresses the length bound
-//! (all bounded-text types emit `{"type":"string","maxLength":128}`
-//! inline), so the schema is intentionally *more permissive* than the
-//! runtime.
+//! These are the only two bounded-text wire types that layer a format
+//! validator on top of the maxLength bound, and the published JSON
+//! Schema now carries that same constraint (regex `pattern` for
+//! `ProtocolVersionText`; `allOf` of positive `pattern` plus
+//! `not`-pattern clauses for `BranchName`).
 //!
-//! This test makes that relationship explicit: any value that passes
-//! the runtime validator MUST also pass the emitted JSON Schema.
-//! Format-invalid values must be rejected at runtime even when the
-//! schema accepts them. That way the Rust runtime is always at least
-//! as strict as the schema, and downstream tooling relying on the
-//! schema for sanity-check can never drift ahead of the runtime.
+//! The contract is **strict parity**: for every candidate value, the
+//! runtime constructor and the published JSON Schema agree on
+//! accept/reject. Polyglot adapters generated from the schema can
+//! never construct values the runtime then rejects, and the runtime
+//! never accepts values the schema would reject.
+//!
+//! These tests are the canonical regression bar for that contract.
 
 use forgeclaw_ipc::{BranchName, ProtocolVersionText};
 use jsonschema::Validator;
@@ -29,7 +29,7 @@ fn compile(schema: &serde_json::Value) -> Validator {
 }
 
 #[test]
-fn protocol_version_text_runtime_matches_or_exceeds_schema() {
+fn protocol_version_text_schema_matches_runtime_strictly() {
     let schema = json_schema_for::<ProtocolVersionText>();
     let compiled = compile(&schema);
 
@@ -45,13 +45,18 @@ fn protocol_version_text_runtime_matches_or_exceeds_schema() {
         );
     }
 
-    // Format-invalid samples — runtime must reject (the schema only
-    // bounds length, so it accepts these; that's the intended
-    // "runtime is stricter than schema" relationship).
-    for bad in ["", "1", "1.", "1.foo", "v1.0", "1.0.3"] {
+    // Format-invalid samples — runtime AND schema must both reject.
+    // (Previously the schema accepted these because it only carried
+    // maxLength; the new schema carries the same regex pattern as the
+    // runtime validator.)
+    for bad in ["", "1", "1.", "1.foo", "v1.0", "1.0.3", ".1"] {
         assert!(
             ProtocolVersionText::new(bad).is_err(),
             "runtime must reject invalid `{bad}`"
+        );
+        assert!(
+            !compiled.is_valid(&json!(bad)),
+            "schema must reject invalid `{bad}`"
         );
     }
 
@@ -68,7 +73,7 @@ fn protocol_version_text_runtime_matches_or_exceeds_schema() {
 }
 
 #[test]
-fn branch_name_runtime_matches_or_exceeds_schema() {
+fn branch_name_schema_matches_runtime_strictly() {
     let schema = json_schema_for::<BranchName>();
     let compiled = compile(&schema);
 
@@ -83,7 +88,7 @@ fn branch_name_runtime_matches_or_exceeds_schema() {
         );
     }
 
-    // Runtime-only rejections (length-bounded schema still accepts).
+    // Format-invalid samples — runtime AND schema must both reject.
     for bad in [
         "",
         "/main",
@@ -96,7 +101,11 @@ fn branch_name_runtime_matches_or_exceeds_schema() {
     ] {
         assert!(
             BranchName::new(bad).is_err(),
-            "runtime must reject advisory-invalid `{bad}`"
+            "runtime must reject advisory-invalid `{bad:?}`"
+        );
+        assert!(
+            !compiled.is_valid(&json!(bad)),
+            "schema must reject advisory-invalid `{bad:?}`"
         );
     }
 

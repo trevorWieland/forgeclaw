@@ -60,12 +60,12 @@ Runtime enforcement applies on both:
 | Core ID fields (`group`, `target_group`, `task_id`, `job_id`, etc.) | non-empty, maxLength 128 |
 | `adapter` (AdapterName) | maxLength 128 |
 | `adapter_version` (AdapterVersion) | maxLength 128 |
-| `protocol_version` (ProtocolVersionText) | `^[0-9]+\.[0-9]+$` numeric major.minor, maxLength 128 |
+| `protocol_version` (ProtocolVersionText) | `^[0-9]+\.[0-9]+$` numeric major.minor, maxLength 128 (enforced identically by runtime and JSON Schema) |
 | `stage` (StageName) | maxLength 128 |
 | `sender` (SenderName) | maxLength 128 |
 | `name` in `GroupInfo` / `register_group` (GroupName) | maxLength 128 |
 | `project` (ProjectName) | maxLength 128 |
-| `branch` (BranchName) | maxLength 128; advisory git-ref shape: non-empty, no whitespace, no control chars, no `..`, no leading/trailing `/`, no consecutive `/` |
+| `branch` (BranchName) | maxLength 128; advisory git-ref shape: non-empty, no whitespace, no control chars, no `..`, no leading/trailing `/`, no consecutive `/` (enforced identically by runtime and JSON Schema via `allOf` composition of positive `pattern` plus `not`-pattern clauses) |
 | `context_mode` (ContextModeText) | maxLength 128 |
 | `environment_profile` (EnvironmentProfileText) | maxLength 128 |
 | `model` | maxLength 256 |
@@ -395,7 +395,7 @@ Host                              Container
 The host enforces post-handshake phases at the IPC boundary:
 
 - **Processing**: default immediately after `init`; container may emit streaming/progress/commands/heartbeat/error and must eventually emit `output_complete`.
-- **Idle**: entered after `output_complete`; container must not continue streaming or sending commands until the host sends new `messages`.
+- **Idle**: entered after `output_complete`; container must not continue streaming, sending commands, or sending `heartbeat` until the host sends new `messages`. The host (and the typed client, symmetrically) rejects `heartbeat` frames in `Idle` as a `lifecycle_violation` so a buggy or malicious container cannot use heartbeat traffic to pin idle session resources.
 - **Draining**: entered after host `shutdown`; host rejects new `messages`, and container may only finish/heartbeat/error before close.
 - On the first `output_complete` observed while draining, IPC transitions
   to terminal closed state and closes the transport immediately.
@@ -404,16 +404,37 @@ Out-of-phase traffic is treated as a protocol error and the connection is closed
 
 ## Versioning
 
-The `protocol_version` field in `ready` allows the host to detect adapter capability:
+The `protocol_version` field in `ready` allows the host to detect
+adapter capability. Versions are `<major>.<minor>` strings (numeric
+both sides). The host rejects connections from adapters with an
+unsupported major version. After handshake, the host persists a
+**negotiated runtime version** per connection: `major` is unchanged
+(must match), `minor = min(local_minor, peer_minor)`. Minor-aware
+behavior gates branch on this negotiated minor and remain explicit and
+centralized in [`crates/ipc/src/semantics.rs`](../crates/ipc/src/semantics.rs).
 
-- **1.0**: Baseline protocol. `register_group.extensions.version` is
-  required whenever `extensions` is present.
-- Future versions add new message types or fields. Existing fields are never removed or retyped (additive-only changes within a major version).
+### Versioned Behavior Matrix
 
-The host rejects connections from adapters with an unsupported major version.
-After handshake, the host persists a negotiated runtime version
-(`major` unchanged, `minor = min(local, peer)`) per connection so
-minor-aware behavior gates can remain explicit and centralized.
+The following table is **normative**: every gate is enforced by the
+host and (symmetrically, where applicable) by the typed client. The
+implementation is the canonical source of truth and lives in
+`crates/ipc/src/semantics.rs`; the matrix here mirrors it 1:1 and is
+locked together by the `semantics_matrix_matches_documented_gates`
+test.
+
+| Negotiated minor | Direction | Message | Rule | Rejection error |
+|---|---|---|---|---|
+| 1.0 (baseline) | host→container | `shutdown` | `deadline_ms` MAY be 0 (interpreted as "kill immediately"). | — |
+| 1.0 (baseline) | container→host | `error` | `job_id` is OPTIONAL even when `fatal=true`. | — |
+| 1.0 (baseline) | container→host | `command:register_group` | `payload.extensions` is OPTIONAL. | — |
+| ≥1.1 | host→container | `shutdown` | `deadline_ms` MUST be `> 0`. | `LifecycleViolation { reason: "protocol >=1.1 requires shutdown.deadline_ms > 0" }` |
+| ≥1.1 | container→host | `error` | `fatal=true` MUST include a `job_id`. | `LifecycleViolation { reason: "protocol >=1.1 requires fatal errors to include job_id" }` |
+| ≥1.1 | container→host | `command:register_group` | `payload.extensions` is REQUIRED. | `InvalidCommandPayload { reason: "protocol >=1.1 requires payload.extensions" }` |
+
+Existing fields are never removed or retyped within a major version
+(additive-only). New gates may tighten existing fields starting at a
+specific minor, in which case they MUST appear in this matrix and in
+`crates/ipc/src/semantics.rs` simultaneously.
 
 ## Error Handling
 
@@ -432,6 +453,7 @@ minor-aware behavior gates can remain explicit and centralized.
 - **Socket disconnect without `output_complete`**: Host treats the in-progress job as failed. Container transitioned to `Exited` with error status.
 - **Heartbeat timeout** (no heartbeat for 60 seconds during `Processing`): Host sends `shutdown` with a short deadline, then kills the container if it doesn't respond.
 - **Idle read timeout** (no complete inbound frame for 60 seconds during `Idle`): Host closes the connection with an `idle_read_timeout` protocol error. This guard also applies to trickled partial frames that never complete.
+- **Idle heartbeat**: A `heartbeat` frame received during `Idle` is immediately rejected with `LifecycleViolation { phase: "idle", message_type: "heartbeat" }` and the connection is closed. Heartbeats are a `Processing`/`Draining` liveness signal only; rejecting them in `Idle` prevents containers from holding idle session resources open with cheap liveness traffic.
 - **Blocked post-handshake write** (peer not reading): sender applies a
   per-connection write deadline (default 5 seconds). Timeout is fatal:
   connection is poisoned and closed.

@@ -311,7 +311,33 @@ expression: json
         "branch": {
           "description": "Git branch to work on.",
           "type": "string",
-          "maxLength": 128
+          "allOf": [
+            {
+              "pattern": "^[^\\s\\u0000-\\u001f\\u007f]+$"
+            },
+            {
+              "not": {
+                "pattern": "^/"
+              }
+            },
+            {
+              "not": {
+                "pattern": "/$"
+              }
+            },
+            {
+              "not": {
+                "pattern": "//"
+              }
+            },
+            {
+              "not": {
+                "pattern": "\\.\\."
+              }
+            }
+          ],
+          "maxLength": 128,
+          "minLength": 1
         },
         "environment_profile": {
           "description": "Optional environment profile override.",
@@ -571,7 +597,9 @@ expression: json
         "protocol_version": {
           "description": "IPC protocol version the adapter supports (e.g. `\"1.0\"`).",
           "type": "string",
-          "maxLength": 128
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[0-9]+\\.[0-9]+$"
         }
       },
       "required": [
