@@ -5,15 +5,72 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::message::limits;
+use crate::version::parse_version_text;
 
-/// Error returned when a bounded text value exceeds its max length.
+/// Error returned when a bounded text value fails validation.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("text length {actual} exceeds maximum {max}")]
-pub struct BoundedTextError {
-    /// Maximum allowed character length.
-    pub max: usize,
-    /// Actual character length seen.
-    pub actual: usize,
+pub enum BoundedTextError {
+    /// The value exceeded the maximum allowed Unicode scalar length.
+    #[error("text length {actual} exceeds maximum {max}")]
+    Length {
+        /// Maximum allowed character length.
+        max: usize,
+        /// Actual character length seen.
+        actual: usize,
+    },
+    /// The value failed a format-specific validator layered on top of the
+    /// length check.
+    #[error("invalid format: {reason}")]
+    Format {
+        /// Static reason describing why the format check failed.
+        reason: &'static str,
+    },
+}
+
+/// Format validator for `ProtocolVersionText`. Delegates to
+/// [`crate::version::parse_version_text`] so the runtime contract stays
+/// byte-identical to the handshake negotiation logic.
+pub(crate) fn validate_protocol_version_text(value: &str) -> Result<(), BoundedTextError> {
+    parse_version_text(value)
+        .map(|_| ())
+        .ok_or(BoundedTextError::Format {
+            reason: "protocol version must match `<major>.<minor>` with non-negative integers",
+        })
+}
+
+/// Advisory format validator for `BranchName`. Rejects obviously
+/// invalid git refs — strict `git check-ref-format` validation remains
+/// the responsibility of the host/store layer that owns git state.
+pub(crate) fn validate_branch_name(value: &str) -> Result<(), BoundedTextError> {
+    if value.is_empty() {
+        return Err(BoundedTextError::Format {
+            reason: "branch name must not be empty",
+        });
+    }
+    if value.starts_with('/') || value.ends_with('/') {
+        return Err(BoundedTextError::Format {
+            reason: "branch name must not begin or end with `/`",
+        });
+    }
+    if value.contains("//") {
+        return Err(BoundedTextError::Format {
+            reason: "branch name must not contain consecutive `/` segments",
+        });
+    }
+    if value.contains("..") {
+        return Err(BoundedTextError::Format {
+            reason: "branch name must not contain `..`",
+        });
+    }
+    if value
+        .chars()
+        .any(|c| c.is_ascii_control() || c.is_whitespace())
+    {
+        return Err(BoundedTextError::Format {
+            reason: "branch name must not contain whitespace or ASCII control characters",
+        });
+    }
+    Ok(())
 }
 
 macro_rules! bounded_text_type {
@@ -21,7 +78,57 @@ macro_rules! bounded_text_type {
         $(#[$meta:meta])*
         $name:ident,
         max = $max:expr,
-        desc = $desc:literal
+        desc = $desc:literal $(,)?
+    ) => {
+        bounded_text_impl!(
+            $(#[$meta])*
+            $name,
+            max = $max,
+            desc = $desc,
+            new_body = |value: String, actual: usize| {
+                if actual > $name::MAX_LEN {
+                    return Err(BoundedTextError::Length {
+                        max: $name::MAX_LEN,
+                        actual,
+                    });
+                }
+                Ok($name(value))
+            }
+        );
+    };
+    (
+        $(#[$meta:meta])*
+        $name:ident,
+        max = $max:expr,
+        desc = $desc:literal,
+        extra_validate = $validator:path $(,)?
+    ) => {
+        bounded_text_impl!(
+            $(#[$meta])*
+            $name,
+            max = $max,
+            desc = $desc,
+            new_body = |value: String, actual: usize| {
+                if actual > $name::MAX_LEN {
+                    return Err(BoundedTextError::Length {
+                        max: $name::MAX_LEN,
+                        actual,
+                    });
+                }
+                $validator(value.as_str())?;
+                Ok($name(value))
+            }
+        );
+    };
+}
+
+macro_rules! bounded_text_impl {
+    (
+        $(#[$meta:meta])*
+        $name:ident,
+        max = $max:expr,
+        desc = $desc:literal,
+        new_body = $new_body:expr $(,)?
     ) => {
         $(#[$meta])*
         #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
@@ -36,13 +143,8 @@ macro_rules! bounded_text_type {
             pub fn new(value: impl Into<String>) -> Result<Self, BoundedTextError> {
                 let value = value.into();
                 let actual = value.chars().count();
-                if actual > Self::MAX_LEN {
-                    return Err(BoundedTextError {
-                        max: Self::MAX_LEN,
-                        actual,
-                    });
-                }
-                Ok(Self(value))
+                let body: fn(String, usize) -> Result<$name, BoundedTextError> = $new_body;
+                body(value, actual)
             }
 
             /// Access the wire value.
@@ -146,78 +248,153 @@ macro_rules! bounded_text_type {
 }
 
 bounded_text_type!(
-    /// Identifier-like text value (adapter, stage, branch, group names, etc.).
-    IdentifierText,
+    /// Adapter name identifying an agent runtime (e.g. `claude-code`).
+    AdapterName,
     max = limits::MAX_IDENTIFIER_TEXT_CHARS,
-    desc = "Identifier-like IPC text field with maxLength 128."
+    desc = "Adapter runtime identifier with maxLength 128.",
+);
+
+bounded_text_type!(
+    /// Adapter implementation version string (opaque to the protocol).
+    AdapterVersion,
+    max = limits::MAX_IDENTIFIER_TEXT_CHARS,
+    desc = "Adapter implementation version with maxLength 128.",
+);
+
+bounded_text_type!(
+    /// IPC protocol version advertised by an adapter at handshake time.
+    ///
+    /// Format is `<major>.<minor>` where both components are
+    /// non-negative integers. Strict numeric validation runs at
+    /// construction and deserialization time so malformed version
+    /// strings never reach the handshake negotiator.
+    ProtocolVersionText,
+    max = limits::MAX_IDENTIFIER_TEXT_CHARS,
+    desc = "IPC protocol version (`<major>.<minor>`) with maxLength 128.",
+    extra_validate = validate_protocol_version_text,
+);
+
+bounded_text_type!(
+    /// Logical stage name emitted on progress updates.
+    StageName,
+    max = limits::MAX_IDENTIFIER_TEXT_CHARS,
+    desc = "Progress stage identifier with maxLength 128.",
+);
+
+bounded_text_type!(
+    /// Display name of the author of a historical message.
+    SenderName,
+    max = limits::MAX_IDENTIFIER_TEXT_CHARS,
+    desc = "Historical message sender display name with maxLength 128.",
+);
+
+bounded_text_type!(
+    /// Human-readable group name bound to a session identity.
+    GroupName,
+    max = limits::MAX_IDENTIFIER_TEXT_CHARS,
+    desc = "Group display name with maxLength 128.",
+);
+
+bounded_text_type!(
+    /// Target project name for a Tanren dispatch.
+    ProjectName,
+    max = limits::MAX_IDENTIFIER_TEXT_CHARS,
+    desc = "Tanren target project name with maxLength 128.",
+);
+
+bounded_text_type!(
+    /// Git branch name for a Tanren dispatch.
+    ///
+    /// Layered advisory validator rejects obvious malformed refs
+    /// (empty, whitespace, control characters, leading/trailing `/`,
+    /// consecutive `/`, `..`). Strict `git check-ref-format` semantics
+    /// remain the responsibility of the host/store layer.
+    BranchName,
+    max = limits::MAX_IDENTIFIER_TEXT_CHARS,
+    desc = "Advisory git branch name with maxLength 128.",
+    extra_validate = validate_branch_name,
+);
+
+bounded_text_type!(
+    /// Optional context mode override for scheduled tasks.
+    ContextModeText,
+    max = limits::MAX_IDENTIFIER_TEXT_CHARS,
+    desc = "Scheduled task context-mode override with maxLength 128.",
+);
+
+bounded_text_type!(
+    /// Optional environment profile for a Tanren dispatch.
+    EnvironmentProfileText,
+    max = limits::MAX_IDENTIFIER_TEXT_CHARS,
+    desc = "Tanren environment profile with maxLength 128.",
 );
 
 bounded_text_type!(
     /// Model identifier text.
     ModelText,
     max = limits::MAX_MODEL_TEXT_CHARS,
-    desc = "Model identifier with maxLength 256."
+    desc = "Model identifier with maxLength 256.",
 );
 
 bounded_text_type!(
     /// Token or credential text value.
     TokenText,
     max = limits::MAX_TOKEN_TEXT_CHARS,
-    desc = "Token-like IPC text field with maxLength 2048."
+    desc = "Token-like IPC text field with maxLength 2048.",
 );
 
 bounded_text_type!(
     /// Generic short freeform text.
     ShortText,
     max = limits::MAX_SHORT_TEXT_CHARS,
-    desc = "Short IPC text field with maxLength 1024."
+    desc = "Short IPC text field with maxLength 1024.",
 );
 
 bounded_text_type!(
     /// Schedule expression/value text.
     ScheduleValueText,
     max = limits::MAX_SCHEDULE_VALUE_TEXT_CHARS,
-    desc = "Schedule value with maxLength 512."
+    desc = "Schedule value with maxLength 512.",
 );
 
 bounded_text_type!(
     /// Message-sized text value.
     MessageText,
     max = limits::MAX_MESSAGE_TEXT_CHARS,
-    desc = "Message text with maxLength 32768."
+    desc = "Message text with maxLength 32768.",
 );
 
 bounded_text_type!(
     /// Prompt/objective text value.
     PromptText,
     max = limits::MAX_PROMPT_TEXT_CHARS,
-    desc = "Prompt/objective text with maxLength 32768."
+    desc = "Prompt/objective text with maxLength 32768.",
 );
 
 bounded_text_type!(
     /// Incremental streamed output chunk.
     OutputDeltaText,
     max = limits::MAX_OUTPUT_DELTA_TEXT_CHARS,
-    desc = "Output delta text with maxLength 65536."
+    desc = "Output delta text with maxLength 65536.",
 );
 
 bounded_text_type!(
     /// Final result text payload.
     OutputResultText,
     max = limits::MAX_OUTPUT_RESULT_TEXT_CHARS,
-    desc = "Output completion result text with maxLength 262144."
+    desc = "Output completion result text with maxLength 262144.",
 );
 
 bounded_text_type!(
     /// Session identifier text.
     SessionIdText,
     max = limits::MAX_SESSION_ID_TEXT_CHARS,
-    desc = "Session identifier text with maxLength 128."
+    desc = "Session identifier text with maxLength 128.",
 );
 
 bounded_text_type!(
     /// Self-improvement scope/acceptance list item text.
     ListItemText,
     max = limits::MAX_LIST_ITEM_TEXT_CHARS,
-    desc = "Self-improvement list item text with maxLength 1024."
+    desc = "Self-improvement list item text with maxLength 1024.",
 );

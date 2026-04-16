@@ -1,5 +1,7 @@
 //! Internal utilities for the IPC crate.
 
+pub(crate) mod sampler;
+
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};

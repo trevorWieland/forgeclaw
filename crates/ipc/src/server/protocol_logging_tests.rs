@@ -6,13 +6,17 @@ use tokio::time::Instant;
 use tracing_subscriber::fmt::MakeWriter;
 
 use super::{
-    ConnectionState, log_fatal_protocol_error, log_unauthorized_command,
+    ConnectionState, log_fatal_protocol_error, log_unauthorized_command, log_unknown_message,
     record_unauthorized_rejection,
 };
 use crate::error::{FrameError, IpcError, ProtocolError};
 use crate::message::shared::{GroupCapabilities, GroupInfo};
 use crate::peer_cred::SessionIdentity;
+use crate::policy::{
+    UNKNOWN_LOG_BURST, UNKNOWN_LOG_EVERY, UnknownTrafficBudget, UnknownTrafficLimitConfig,
+};
 use crate::server::UnauthorizedCommandLimitConfig;
+use crate::util::sampler::SampledCounter;
 use crate::version::{PROTOCOL_VERSION, negotiate};
 
 fn parse_job_id(value: &str) -> JobId {
@@ -175,6 +179,38 @@ fn fatal_logging_truncates_peer_controlled_protocol_version() {
         !output.contains(&long_peer),
         "full peer value leaked to logs"
     );
+}
+
+#[test]
+fn unknown_message_logging_emits_audit_per_attempt_and_sampled_warns() {
+    let capture = CaptureWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .without_time()
+        .with_writer(capture.clone())
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let identity = sample_identity();
+
+    let now = Instant::now();
+    let mut budget = UnknownTrafficBudget::new(now, UnknownTrafficLimitConfig::default());
+    let mut sampler = SampledCounter::new(UNKNOWN_LOG_BURST, UNKNOWN_LOG_EVERY);
+
+    tracing::dispatcher::with_default(&dispatch, || {
+        for _ in 0..12 {
+            budget.on_unknown(16, now).expect("budget accepts unknown");
+            let decision = sampler.observe();
+            log_unknown_message(&identity, "future_message_type", &budget, decision);
+        }
+    });
+
+    let output = capture.output();
+    // Every observed attempt emits the audit/debug line.
+    assert_eq!(output.matches("audit unknown IPC message skip").count(), 12);
+    // Burst of 5 + every-10th = 5 (attempts 1..=5) + 1 (attempt 10) = 6.
+    assert_eq!(output.matches("ignoring unknown message type").count(), 6);
 }
 
 #[test]

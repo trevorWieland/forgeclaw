@@ -12,12 +12,13 @@ use crate::lifecycle::{
 use crate::message::{ContainerToHost, HostToContainer};
 use crate::policy::DEFAULT_HEARTBEAT_TIMEOUT;
 use crate::semantics::{ProtocolSemantics, validate_container_to_host, validate_host_to_container};
+use crate::util::sampler::SampledCounter;
 use crate::version::NegotiatedProtocolVersion;
 
 use super::listener::UnauthorizedCommandLimitConfig;
 
-const UNAUTHORIZED_LOG_BURST: u64 = 5;
-const UNAUTHORIZED_LOG_EVERY: u64 = 10;
+pub(super) const UNAUTHORIZED_LOG_BURST: u64 = 5;
+pub(super) const UNAUTHORIZED_LOG_EVERY: u64 = 10;
 
 #[path = "protocol_logging.rs"]
 mod logging;
@@ -28,6 +29,47 @@ pub(super) use logging::{
 };
 
 /// Per-connection runtime protocol state.
+///
+/// # Concurrency invariants
+///
+/// All fields are guarded by a single [`AsyncMutex`](tokio::sync::Mutex)
+/// held by the owning [`crate::server::IpcConnection`] (and its split
+/// reader/writer halves). Consolidating them behind one lock keeps the
+/// following invariants atomic:
+///
+/// 1. **Linear phase progression.** `lifecycle.phase()` only advances
+///    forward (Idle → Processing → Draining → Closed). No path
+///    observes an intermediate phase without the mutex because every
+///    transition happens inside a critical section that also mutates
+///    the deadline/timeout fields bound to that phase.
+/// 2. **Heartbeat / draining deadlines are phase-consistent.**
+///    `heartbeat_deadline` is only valid while `phase == Processing`,
+///    `draining_deadline` only while `phase == DrainingAwaitingCompletion`.
+///    Updates to the deadline and the phase happen under the same
+///    lock acquisition so readers never see a stale deadline from a
+///    previous phase.
+/// 3. **Unauthorized budget ⇔ strike counter ⇔ backoff window are
+///    co-updated.** Token refill, decrement, strike increment, and
+///    backoff-until stamps are all touched by
+///    [`record_unauthorized_rejection_at`] inside the same critical
+///    section so enforcement decisions never race against refill.
+/// 4. **Sampler monotonicity.** `unauthorized_log_sampler` is only
+///    advanced by `record_unauthorized_rejection_at`, which holds the
+///    mutex. The sampler's `attempt` counter is therefore monotonic
+///    and aligned with the actual rejection count.
+/// 5. **Poisoning happens outside this struct.** The `poisoned`
+///    [`AtomicBool`](std::sync::atomic::AtomicBool) on
+///    [`crate::server::IpcConnection`] is intentionally NOT stored
+///    here; readers may observe `poisoned = true` without holding the
+///    mutex so the write-side teardown path short-circuits instantly.
+///    Callers must treat a `true` poisoned flag as authoritative
+///    regardless of what this struct's phase says.
+///
+/// Any future refactor that splits this state across multiple locks
+/// MUST preserve invariants 1–4 (the poisoned flag is already split).
+/// A lock-free phase atomic may be layered on top, but it must
+/// update *after* the mutex-protected transition so reads lagging by
+/// one transition cannot see a phase ahead of the mutex view.
 #[derive(Debug, Clone)]
 pub(super) struct ConnectionState {
     lifecycle: LifecycleState,
@@ -37,10 +79,9 @@ pub(super) struct ConnectionState {
     draining_timeout_ms: Option<u64>,
     idle_read_timeout: Option<Duration>,
     unauthorized_limit: UnauthorizedCommandLimitConfig,
-    unauthorized_rejections: u64,
     unauthorized_tokens: f64,
     unauthorized_last_refill: Instant,
-    unauthorized_last_logged_attempt: Option<u64>,
+    unauthorized_log_sampler: SampledCounter,
     unauthorized_strikes: u32,
     unauthorized_backoff_until: Option<Instant>,
 }
@@ -62,10 +103,12 @@ impl ConnectionState {
             draining_timeout_ms: None,
             idle_read_timeout,
             unauthorized_limit,
-            unauthorized_rejections: 0,
             unauthorized_tokens: f64::from(unauthorized_limit.burst_capacity),
             unauthorized_last_refill: now,
-            unauthorized_last_logged_attempt: None,
+            unauthorized_log_sampler: SampledCounter::new(
+                UNAUTHORIZED_LOG_BURST,
+                UNAUTHORIZED_LOG_EVERY,
+            ),
             unauthorized_strikes: 0,
             unauthorized_backoff_until: None,
         }
@@ -169,26 +212,14 @@ pub(super) fn record_unauthorized_rejection_at(
     state: &mut ConnectionState,
     now: Instant,
 ) -> UnauthorizedRejectionOutcome {
-    state.unauthorized_rejections = state.unauthorized_rejections.saturating_add(1);
-    let attempt = state.unauthorized_rejections;
+    let sample = state.unauthorized_log_sampler.observe();
     refill_unauthorized_tokens(state, now);
     let (action, backoff) = unauthorized_enforcement_action(state, now);
-    let should_log = attempt <= UNAUTHORIZED_LOG_BURST || attempt % UNAUTHORIZED_LOG_EVERY == 0;
-    let suppressed_since_last = if should_log {
-        state
-            .unauthorized_last_logged_attempt
-            .map_or(0, |last| attempt.saturating_sub(last + 1))
-    } else {
-        0
-    };
-    if should_log {
-        state.unauthorized_last_logged_attempt = Some(attempt);
-    }
     UnauthorizedRejectionOutcome {
         log: UnauthorizedLogDecision {
-            attempt,
-            should_log,
-            suppressed_since_last,
+            attempt: sample.attempt,
+            should_log: sample.should_log,
+            suppressed_since_last: sample.suppressed_since_last,
             action,
             strikes: state.unauthorized_strikes,
             disconnect_after_strikes: state.unauthorized_limit.disconnect_after_strikes,

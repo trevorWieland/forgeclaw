@@ -6,12 +6,13 @@ use std::time::Duration;
 
 use tokio::net::UnixListener;
 
-use crate::error::{IpcError, ProtocolError};
+use crate::error::IpcError;
 use crate::message::shared::GroupInfo;
-use crate::peer_cred::{self, PeerCredentials, SessionIdentity};
+use crate::peer_cred::{self, SessionIdentity};
 use crate::policy::UnknownTrafficLimitConfig;
 
 use super::PendingConnection;
+pub use super::peer_credential_policy::{PeerCredentialPolicy, PeerCredentialPolicyError};
 
 /// Per-connection unauthorized-command abuse controls.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -37,112 +38,6 @@ impl Default for UnauthorizedCommandLimitConfig {
     }
 }
 
-/// Error returned when peer-credential policy rejects an accepted peer.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{reason}")]
-pub struct PeerCredentialPolicyError {
-    /// Human-readable reason for policy rejection.
-    pub reason: String,
-}
-
-impl PeerCredentialPolicyError {
-    /// Create a new policy rejection reason.
-    #[must_use]
-    pub fn new(reason: impl Into<String>) -> Self {
-        Self {
-            reason: reason.into(),
-        }
-    }
-}
-
-/// Peer-credential authorization policy for accepted connections.
-type PeerCredentialPolicyCallback = dyn Fn(Option<PeerCredentials>, &GroupInfo) -> Result<(), PeerCredentialPolicyError>
-    + Send
-    + Sync;
-
-/// Peer-credential authorization policy for accepted connections.
-#[derive(Default)]
-pub enum PeerCredentialPolicy {
-    /// Capture credentials for audit context but do not gate accept.
-    #[default]
-    CaptureOnly,
-    /// Require exact UID/GID match when provided.
-    RequireExact {
-        /// Expected peer UID, if configured.
-        uid: Option<u32>,
-        /// Expected peer GID, if configured.
-        gid: Option<u32>,
-    },
-    /// Custom caller-provided authorization callback.
-    Custom(Arc<PeerCredentialPolicyCallback>),
-}
-
-impl std::fmt::Debug for PeerCredentialPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::CaptureOnly => f.write_str("CaptureOnly"),
-            Self::RequireExact { uid, gid } => f
-                .debug_struct("RequireExact")
-                .field("uid", uid)
-                .field("gid", gid)
-                .finish(),
-            Self::Custom(_) => f.write_str("Custom(..)"),
-        }
-    }
-}
-
-impl Clone for PeerCredentialPolicy {
-    fn clone(&self) -> Self {
-        match self {
-            Self::CaptureOnly => Self::CaptureOnly,
-            Self::RequireExact { uid, gid } => Self::RequireExact {
-                uid: *uid,
-                gid: *gid,
-            },
-            Self::Custom(callback) => Self::Custom(Arc::clone(callback)),
-        }
-    }
-}
-
-impl PeerCredentialPolicy {
-    fn enforce(&self, creds: Option<PeerCredentials>, group: &GroupInfo) -> Result<(), IpcError> {
-        match self {
-            Self::CaptureOnly => Ok(()),
-            Self::RequireExact { uid, gid } => {
-                let observed = creds.map(|cred| (cred.uid, cred.gid));
-                if uid.is_some() && *uid != observed.map(|(value, _)| value) {
-                    return Err(IpcError::Protocol(ProtocolError::PeerCredentialRejected {
-                        reason: "peer uid mismatch".to_owned(),
-                        expected_uid: *uid,
-                        expected_gid: *gid,
-                        actual_uid: observed.map(|(value, _)| value),
-                        actual_gid: observed.map(|(_, value)| value),
-                    }));
-                }
-                if gid.is_some() && *gid != observed.map(|(_, value)| value) {
-                    return Err(IpcError::Protocol(ProtocolError::PeerCredentialRejected {
-                        reason: "peer gid mismatch".to_owned(),
-                        expected_uid: *uid,
-                        expected_gid: *gid,
-                        actual_uid: observed.map(|(value, _)| value),
-                        actual_gid: observed.map(|(_, value)| value),
-                    }));
-                }
-                Ok(())
-            }
-            Self::Custom(callback) => callback(creds, group).map_err(|e| {
-                IpcError::Protocol(ProtocolError::PeerCredentialRejected {
-                    reason: e.reason,
-                    expected_uid: None,
-                    expected_gid: None,
-                    actual_uid: creds.map(|c| c.uid),
-                    actual_gid: creds.map(|c| c.gid),
-                })
-            }),
-        }
-    }
-}
-
 /// Host-side server options.
 #[derive(Debug, Clone)]
 pub struct IpcServerOptions {
@@ -162,24 +57,64 @@ pub struct IpcServerOptions {
 }
 
 impl IpcServerOptions {
-    /// Hardened option preset with strict peer credential matching.
+    /// Hardened option preset that binds to the running process's
+    /// UID/GID at call time. This is the fail-closed default selected
+    /// by [`IpcServer::bind`]; peers with mismatched credentials are
+    /// rejected at accept time.
+    ///
+    /// Fails if the platform cannot report our own credentials —
+    /// operators must then pick an explicit policy rather than
+    /// silently running permissive.
+    #[cfg(unix)]
+    pub fn hardened_current_process() -> Result<Self, IpcError> {
+        Ok(Self {
+            unauthorized_limit: UnauthorizedCommandLimitConfig::default(),
+            unknown_traffic_limit: UnknownTrafficLimitConfig::default(),
+            peer_credential_policy: PeerCredentialPolicy::match_current_process()?,
+            write_timeout: Duration::from_secs(5),
+            idle_read_timeout: Some(Duration::from_secs(60)),
+        })
+    }
+
+    /// Hardened option preset with caller-supplied strict UID/GID
+    /// matching. Use this when the peer identity is known ahead of
+    /// time and differs from the running process.
     #[must_use]
     pub fn hardened(uid: Option<u32>, gid: Option<u32>) -> Self {
         Self {
+            unauthorized_limit: UnauthorizedCommandLimitConfig::default(),
+            unknown_traffic_limit: UnknownTrafficLimitConfig::default(),
             peer_credential_policy: PeerCredentialPolicy::RequireExact { uid, gid },
-            ..Self::default()
+            write_timeout: Duration::from_secs(5),
+            idle_read_timeout: Some(Duration::from_secs(60)),
         }
     }
-}
 
-impl Default for IpcServerOptions {
-    fn default() -> Self {
+    /// Audit-visible insecure-mode preset. This is the **only**
+    /// construction path that yields [`PeerCredentialPolicy::CaptureOnly`];
+    /// the name is deliberate so a code-search for "insecure" always
+    /// surfaces callers that opted out of peer credential enforcement.
+    #[must_use]
+    pub fn insecure_capture_only() -> Self {
         Self {
             unauthorized_limit: UnauthorizedCommandLimitConfig::default(),
             unknown_traffic_limit: UnknownTrafficLimitConfig::default(),
-            peer_credential_policy: PeerCredentialPolicy::default(),
+            peer_credential_policy: PeerCredentialPolicy::CaptureOnly,
             write_timeout: Duration::from_secs(5),
             idle_read_timeout: Some(Duration::from_secs(60)),
+        }
+    }
+
+    /// Returns the policy variant name in effect — useful for tests
+    /// asserting the server's security posture without inspecting the
+    /// (non-`Eq`) enum directly.
+    #[must_use]
+    pub fn peer_credential_policy_name(&self) -> &'static str {
+        match &self.peer_credential_policy {
+            PeerCredentialPolicy::CaptureOnly => "capture_only",
+            PeerCredentialPolicy::RequireExact { .. } => "require_exact",
+            PeerCredentialPolicy::MatchCapturedProcess { .. } => "match_captured_process",
+            PeerCredentialPolicy::Custom(_) => "custom",
         }
     }
 }
@@ -223,7 +158,12 @@ impl IpcServer {
     /// Post-bind listener/path attestation is fail-closed: mismatch or
     /// inconclusive identity evidence is treated as a bind-race error.
     pub fn bind(path: impl AsRef<Path>) -> Result<Self, IpcError> {
-        Self::bind_with_options(path, IpcServerOptions::default())
+        // Fail-closed by default: snap the current process's UID/GID
+        // at bind time and reject any peer whose credentials differ.
+        // Callers that need different semantics construct
+        // [`IpcServerOptions`] explicitly and pass them to
+        // [`bind_with_options`].
+        Self::bind_with_options(path, IpcServerOptions::hardened_current_process()?)
     }
 
     /// Bind a Unix socket at `path` with explicit server options.

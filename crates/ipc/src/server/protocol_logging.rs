@@ -3,7 +3,10 @@ use std::sync::Arc;
 use crate::codec::DEFAULT_MAX_UNKNOWN_SKIPS;
 use crate::error::{FrameError, IpcError, ProtocolError};
 use crate::peer_cred::SessionIdentity;
-use crate::policy::{DEFAULT_MAX_UNKNOWN_BYTES, UnknownTrafficBudget};
+use crate::policy::{
+    DEFAULT_MAX_UNKNOWN_BYTES, UNKNOWN_LOG_BURST, UNKNOWN_LOG_EVERY, UnknownTrafficBudget,
+};
+use crate::util::sampler::SampleDecision;
 use crate::util::truncate_for_log;
 
 use super::{UNAUTHORIZED_LOG_BURST, UNAUTHORIZED_LOG_EVERY, UnauthorizedLogDecision};
@@ -12,9 +15,43 @@ pub(crate) fn log_unknown_message(
     identity: &Arc<SessionIdentity>,
     message_type: &str,
     budget: &UnknownTrafficBudget,
+    decision: SampleDecision,
 ) {
     let group = identity_fields(identity);
     let limits = budget.limits();
+    // Debug-level audit line always fires so the rate-limit budget
+    // remains fully observable even when the warn-level line is
+    // suppressed by the sampler.
+    tracing::debug!(
+        target: "forgeclaw_ipc::server",
+        message_type = %truncate_for_log(message_type),
+        skip_count = budget.count(),
+        skip_count_limit = DEFAULT_MAX_UNKNOWN_SKIPS,
+        skip_bytes = budget.bytes(),
+        skip_bytes_limit = DEFAULT_MAX_UNKNOWN_BYTES,
+        lifetime_skip_count = budget.total_count(),
+        lifetime_skip_count_limit = limits.lifetime_message_limit,
+        lifetime_skip_bytes = budget.total_bytes(),
+        lifetime_skip_bytes_limit = limits.lifetime_byte_limit,
+        rate_limit_enabled = limits.rate_limiter_enabled(),
+        rate_limit_burst_capacity = limits.rate_limit_burst_capacity,
+        rate_limit_refill_per_second = limits.rate_limit_refill_per_second,
+        attempt = decision.attempt,
+        sampled_warn = decision.should_log,
+        suppressed_since_last = decision.suppressed_since_last,
+        sample_burst = UNKNOWN_LOG_BURST,
+        sample_every = UNKNOWN_LOG_EVERY,
+        group_id = %group.group_id,
+        group_name = %group.group_name,
+        is_main = group.is_main,
+        peer_uid = group.peer_uid,
+        peer_gid = group.peer_gid,
+        peer_pid = group.peer_pid,
+        "audit unknown IPC message skip"
+    );
+    if !decision.should_log {
+        return;
+    }
     tracing::warn!(
         target: "forgeclaw_ipc::server",
         message_type = %truncate_for_log(message_type),
@@ -29,6 +66,10 @@ pub(crate) fn log_unknown_message(
         rate_limit_enabled = limits.rate_limiter_enabled(),
         rate_limit_burst_capacity = limits.rate_limit_burst_capacity,
         rate_limit_refill_per_second = limits.rate_limit_refill_per_second,
+        attempt = decision.attempt,
+        suppressed_since_last = decision.suppressed_since_last,
+        sample_burst = UNKNOWN_LOG_BURST,
+        sample_every = UNKNOWN_LOG_EVERY,
         group_id = %group.group_id,
         group_name = %group.group_name,
         is_main = group.is_main,

@@ -4,7 +4,10 @@ use forgeclaw_core::{GroupId, TaskId};
 use serde::{Deserialize, Serialize};
 
 use super::collections::SelfImprovementListItems;
-use super::semantic::{IdentifierText, MessageText, PromptText, ScheduleValueText};
+use super::semantic::{
+    BranchName, ContextModeText, EnvironmentProfileText, GroupName, MessageText, ProjectName,
+    PromptText, ScheduleValueText,
+};
 
 mod extensions;
 
@@ -73,7 +76,7 @@ pub struct ScheduleTaskPayload {
     pub prompt: PromptText,
     /// Optional context mode override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_mode: Option<IdentifierText>,
+    pub context_mode: Option<ContextModeText>,
 }
 
 /// Pause a previously scheduled task.
@@ -97,7 +100,7 @@ pub struct CancelTaskPayload {
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct RegisterGroupPayload {
     /// Human-readable group name.
-    pub name: IdentifierText,
+    pub name: GroupName,
     /// Additional group configuration, versioned and typed as a
     /// JSON object. See [`GroupExtensions`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -113,16 +116,16 @@ pub struct RegisterGroupPayload {
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct DispatchTanrenPayload {
     /// Target project name.
-    pub project: IdentifierText,
+    pub project: ProjectName,
     /// Git branch to work on.
-    pub branch: IdentifierText,
+    pub branch: BranchName,
     /// Tanren execution phase.
     pub phase: TanrenPhase,
     /// Prompt / instructions for the dispatch.
     pub prompt: PromptText,
     /// Optional environment profile override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub environment_profile: Option<IdentifierText>,
+    pub environment_profile: Option<EnvironmentProfileText>,
 }
 
 /// Dispatch a self-improvement job.

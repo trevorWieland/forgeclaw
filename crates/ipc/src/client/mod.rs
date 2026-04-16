@@ -8,6 +8,7 @@
 //! underlying socket is shut down and all subsequent calls return
 //! [`IpcError::Closed`].
 
+mod path_validation;
 mod pending;
 mod protocol;
 mod transport_core;
@@ -27,9 +28,13 @@ use tokio::time::Instant;
 use crate::codec::{DEFAULT_MAX_UNKNOWN_SKIPS, encode_container_to_host_frame};
 use crate::error::{IpcError, ProtocolError};
 use crate::message::{ContainerToHost, HostToContainer};
-use crate::policy::{DEFAULT_MAX_UNKNOWN_BYTES, UnknownTrafficBudget, UnknownTrafficLimitConfig};
+use crate::policy::{
+    DEFAULT_MAX_UNKNOWN_BYTES, UNKNOWN_LOG_BURST, UNKNOWN_LOG_EVERY, UnknownTrafficBudget,
+    UnknownTrafficLimitConfig,
+};
 use crate::recv_policy::UnknownTypePolicy;
 use crate::transport::{FrameReader, FrameWriter};
+use crate::util::sampler::SampledCounter;
 use crate::util::{SharedWriteHalf, ShutdownHandle, truncate_for_log};
 
 use self::protocol::ClientConnectionState;
@@ -95,11 +100,35 @@ impl IpcClient {
     }
 
     /// Connect to an IPC server using explicit client options.
+    ///
+    /// Validates the target path fail-closed before opening the socket:
+    ///
+    /// - Lexical shape (absolute, no `.`/`..`, no unsupported prefix),
+    ///   shared with the server via the crate-internal `path_policy`
+    ///   validator.
+    /// - Target-type check: if the path already exists, its
+    ///   [`std::fs::symlink_metadata`] must report a Unix socket (or a
+    ///   symlink, which the kernel will resolve during `connect`).
+    ///   Regular files and directories at the path are rejected
+    ///   immediately so adapter-side path confusion cannot send us
+    ///   through an unrelated filesystem object. This check is
+    ///   deliberately advisory — the connect syscall remains the
+    ///   source of truth, but gross misconfiguration is caught before
+    ///   I/O.
+    ///
+    /// Parent-directory mode and symlink-chain enforcement live
+    /// server-side and are intentionally NOT mirrored here: the
+    /// client has no authority to claim those invariants, and
+    /// rejecting based on them would break legitimate deployments
+    /// that use tighter or looser modes.
     pub async fn connect_with_options(
         path: impl AsRef<Path>,
         options: IpcClientOptions,
     ) -> Result<PendingClient, IpcError> {
-        let stream = UnixStream::connect(path.as_ref()).await?;
+        let path_ref = path.as_ref();
+        crate::path_policy::validate_socket_path_shape(path_ref)?;
+        path_validation::validate_client_target_type(path_ref)?;
+        let stream = UnixStream::connect(path_ref).await?;
         Ok(PendingClient::from_stream(stream, options))
     }
 
@@ -128,6 +157,7 @@ impl IpcClient {
                 Instant::now(),
                 options.unknown_traffic_limit,
             ),
+            unknown_log_sampler: SampledCounter::new(UNKNOWN_LOG_BURST, UNKNOWN_LOG_EVERY),
             last_frame_len: 0,
             state,
         };
@@ -291,6 +321,7 @@ pub struct IpcClientReader {
     poisoned: Arc<AtomicBool>,
     shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
     unknown_budget: UnknownTrafficBudget,
+    unknown_log_sampler: SampledCounter,
     last_frame_len: usize,
     state: Arc<AsyncMutex<ClientConnectionState>>,
 }
@@ -363,7 +394,11 @@ impl IpcClientReader {
                             self.poison().await;
                             return Err(err);
                         }
-                        tracing::warn!(
+                        // The budget is authoritative for rate-limit
+                        // enforcement; the sampler only decides whether
+                        // to emit the higher-severity warn line.
+                        let decision = self.unknown_log_sampler.observe();
+                        tracing::debug!(
                             target: "forgeclaw_ipc::client",
                             message_type = %truncate_for_log(&ty),
                             skip_count = self.unknown_budget.count(),
@@ -372,8 +407,30 @@ impl IpcClientReader {
                             skip_bytes_limit = DEFAULT_MAX_UNKNOWN_BYTES,
                             total_skip_count = self.unknown_budget.total_count(),
                             total_skip_bytes = self.unknown_budget.total_bytes(),
-                            "ignoring unknown message type (forward compatibility)"
+                            attempt = decision.attempt,
+                            sampled_warn = decision.should_log,
+                            suppressed_since_last = decision.suppressed_since_last,
+                            sample_burst = UNKNOWN_LOG_BURST,
+                            sample_every = UNKNOWN_LOG_EVERY,
+                            "audit unknown IPC message skip"
                         );
+                        if decision.should_log {
+                            tracing::warn!(
+                                target: "forgeclaw_ipc::client",
+                                message_type = %truncate_for_log(&ty),
+                                skip_count = self.unknown_budget.count(),
+                                skip_count_limit = DEFAULT_MAX_UNKNOWN_SKIPS,
+                                skip_bytes = self.unknown_budget.bytes(),
+                                skip_bytes_limit = DEFAULT_MAX_UNKNOWN_BYTES,
+                                total_skip_count = self.unknown_budget.total_count(),
+                                total_skip_bytes = self.unknown_budget.total_bytes(),
+                                attempt = decision.attempt,
+                                suppressed_since_last = decision.suppressed_since_last,
+                                sample_burst = UNKNOWN_LOG_BURST,
+                                sample_every = UNKNOWN_LOG_EVERY,
+                                "ignoring unknown message type (forward compatibility)"
+                            );
+                        }
                     }
                     Err(e) => return Err(e),
                 }

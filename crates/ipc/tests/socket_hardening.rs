@@ -342,7 +342,7 @@ async fn custom_peer_credential_policy_can_allow_or_deny() {
                 Err(PeerCredentialPolicyError::new("missing credentials"))
             }
         })),
-        ..IpcServerOptions::default()
+        ..IpcServerOptions::insecure_capture_only()
     };
     let allow_server =
         IpcServer::bind_with_options(&path_allow, allow_options).expect("bind allow");
@@ -363,7 +363,7 @@ async fn custom_peer_credential_policy_can_allow_or_deny() {
         peer_credential_policy: PeerCredentialPolicy::Custom(Arc::new(|_creds, _group| {
             Err(PeerCredentialPolicyError::new("blocked by custom policy"))
         })),
-        ..IpcServerOptions::default()
+        ..IpcServerOptions::insecure_capture_only()
     };
     let deny_server = IpcServer::bind_with_options(&path_deny, deny_options).expect("bind deny");
     let deny_group = GroupInfo {
@@ -383,5 +383,69 @@ async fn custom_peer_credential_policy_can_allow_or_deny() {
             ))
         ),
         "custom deny policy should reject, got {deny_result:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bind_default_uses_hardened_current_process_policy() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().expect("tempdir");
+    let sub = dir.path().join("default-hardened");
+    std::fs::create_dir(&sub).expect("mkdir");
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let path = sub.join("ipc.sock");
+
+    // `IpcServer::bind` must default to the hardened MatchCapturedProcess
+    // policy, not the (formerly default) CaptureOnly policy.
+    let server = IpcServer::bind(&path).expect("bind");
+    drop(server);
+
+    // A freshly-built hardened options struct should report the same
+    // policy variant so callers can audit the posture without peeking
+    // at the (non-`Eq`) enum directly.
+    let options = IpcServerOptions::hardened_current_process()
+        .expect("hardened_current_process on the test runtime");
+    assert_eq!(
+        options.peer_credential_policy_name(),
+        "match_captured_process"
+    );
+
+    // And `insecure_capture_only` must still be available for callers
+    // that explicitly opt out.
+    let insecure = IpcServerOptions::insecure_capture_only();
+    assert_eq!(insecure.peer_credential_policy_name(), "capture_only");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hardened_current_process_accepts_matching_peer() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().expect("tempdir");
+    let sub = dir.path().join("hardened-accept");
+    std::fs::create_dir(&sub).expect("mkdir");
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let path = sub.join("ipc.sock");
+
+    // Default `bind` picks MatchCapturedProcess — accept must succeed
+    // when the peer is this same process.
+    let server = IpcServer::bind(&path).expect("bind");
+    let group = GroupInfo {
+        id: GroupId::new("group-hardened").expect("valid group id"),
+        name: "Hardened".parse().expect("valid name"),
+        is_main: true,
+        capabilities: GroupCapabilities::default(),
+    };
+    let accept_task = tokio::spawn(async move { server.accept(group).await });
+    let _client = IpcClient::connect(&path).await.expect("connect");
+    let pending = accept_task
+        .await
+        .expect("join")
+        .expect("same-process accept");
+    assert!(
+        pending.identity().peer_credentials().is_some(),
+        "hardened accept must still capture credentials"
     );
 }

@@ -181,34 +181,76 @@ impl Decoder for FrameCodec {
     }
 }
 
+/// Narrow helper struct used by the adversarial decode fallback to
+/// extract the `type` discriminator without materializing the rest of
+/// the payload as a [`serde_json::Value`]. Absent fields and unknown
+/// siblings are skipped cheaply by `serde_json`, so adversarial paths
+/// avoid the `Value` allocation amplification the audit flagged.
+#[derive(serde::Deserialize)]
+struct DiscriminatorOnly<'a> {
+    #[serde(borrow, rename = "type")]
+    ty: Option<std::borrow::Cow<'a, str>>,
+}
+
 /// Decode a frame payload into a typed protocol message.
 ///
-/// Performs:
-/// - one JSON parse on the success path (`serde_json::from_slice::<T>`),
-/// - fallback discriminator classification (`type`) only when typed
-///   decoding fails, to preserve unknown-vs-malformed semantics.
+/// - Happy path: one full typed parse via `serde_json::from_slice::<T>`.
+/// - Adversarial path: on typed-parse failure, the fallback consults a
+///   narrow [`DiscriminatorOnly`] struct to classify the error as
+///   [`FrameError::InvalidUtf8`], [`FrameError::MalformedJson`], or
+///   [`ProtocolError::UnknownMessageType`]. The fallback never
+///   materializes a full [`serde_json::Value`], so CPU and allocation
+///   cost are bounded by the discriminator itself — not the frame size.
 pub(crate) fn decode_typed_message<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
     known_types: &[&str],
 ) -> Result<T, IpcError> {
-    std::str::from_utf8(bytes).map_err(|_| IpcError::Frame(FrameError::InvalidUtf8))?;
     match serde_json::from_slice::<T>(bytes) {
         Ok(message) => Ok(message),
-        Err(typed_err) => {
-            let value: serde_json::Value = serde_json::from_slice(bytes)
-                .map_err(|e| IpcError::Frame(FrameError::MalformedJson(e.to_string())))?;
-            if let Some(ty) = value
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-            {
-                if !known_types.contains(&ty.as_str()) {
-                    return Err(IpcError::Protocol(ProtocolError::UnknownMessageType(ty)));
-                }
+        Err(typed_err) => Err(classify_decode_failure(bytes, known_types, &typed_err)),
+    }
+}
+
+/// Classifier for typed-parse failures. Chooses between
+/// `InvalidUtf8`, `MalformedJson`, and `UnknownMessageType` using a
+/// single cheap `DiscriminatorOnly` pre-parse — no full `Value`
+/// materialization ever occurs.
+fn classify_decode_failure(
+    bytes: &[u8],
+    known_types: &[&str],
+    typed_err: &serde_json::Error,
+) -> IpcError {
+    // On any typed-parse failure, first distinguish UTF-8 from JSON
+    // syntax. The typed parse itself would already have failed on
+    // invalid UTF-8, but we surface it as the precise
+    // `FrameError::InvalidUtf8` rather than an opaque malformed-JSON
+    // error so operators can tell them apart.
+    if std::str::from_utf8(bytes).is_err() {
+        return IpcError::Frame(FrameError::InvalidUtf8);
+    }
+
+    match serde_json::from_slice::<DiscriminatorOnly<'_>>(bytes) {
+        Ok(DiscriminatorOnly { ty: Some(ty) }) => {
+            if known_types.contains(&ty.as_ref()) {
+                // Known variant with bad payload — surface the typed
+                // parser's error message so callers can see which
+                // field failed.
+                IpcError::Frame(FrameError::MalformedJson(typed_err.to_string()))
+            } else {
+                IpcError::Protocol(ProtocolError::UnknownMessageType(ty.into_owned()))
             }
-            Err(IpcError::Frame(FrameError::MalformedJson(
-                typed_err.to_string(),
-            )))
+        }
+        Ok(DiscriminatorOnly { ty: None }) => {
+            // The payload is structurally valid JSON but missing the
+            // required `type` discriminator — malformed per our spec.
+            IpcError::Frame(FrameError::MalformedJson(
+                "missing required field `type`".to_owned(),
+            ))
+        }
+        Err(discriminator_err) => {
+            // Structurally invalid JSON (syntax error / EOF / wrong
+            // shape) or `type` present with a non-string value.
+            IpcError::Frame(FrameError::MalformedJson(discriminator_err.to_string()))
         }
     }
 }

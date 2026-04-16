@@ -10,7 +10,8 @@ use forgeclaw_core::JobId;
 use serde::{Deserialize, Serialize};
 
 use super::semantic::{
-    IdentifierText, IpcTimestamp, OutputDeltaText, OutputResultText, SessionIdText, ShortText,
+    AdapterName, AdapterVersion, IpcTimestamp, OutputDeltaText, OutputResultText,
+    ProtocolVersionText, SessionIdText, ShortText, StageName,
 };
 use super::shared::{ErrorCode, StopReason, TokenUsage};
 
@@ -119,11 +120,11 @@ impl schemars::JsonSchema for Percent {
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct ReadyPayload {
     /// Name of the agent adapter (e.g. `claude-code`).
-    pub adapter: IdentifierText,
+    pub adapter: AdapterName,
     /// Adapter implementation version.
-    pub adapter_version: IdentifierText,
+    pub adapter_version: AdapterVersion,
     /// IPC protocol version the adapter supports (e.g. `"1.0"`).
-    pub protocol_version: IdentifierText,
+    pub protocol_version: ProtocolVersionText,
 }
 
 /// `output_delta` — incremental text chunk streamed from the model.
@@ -169,7 +170,7 @@ pub struct ProgressPayload {
     /// Job this progress signal belongs to.
     pub job_id: JobId,
     /// Logical stage name (e.g. `tool_execution`).
-    pub stage: IdentifierText,
+    pub stage: StageName,
     /// Optional human-readable detail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<ShortText>,
@@ -208,7 +209,8 @@ mod tests {
         ReadyPayload,
     };
     use crate::message::semantic::{
-        IdentifierText, OutputDeltaText, OutputResultText, SessionIdText, ShortText,
+        AdapterName, AdapterVersion, OutputDeltaText, OutputResultText, ProtocolVersionText,
+        SessionIdText, ShortText, StageName,
     };
     use crate::message::shared::{ErrorCode, StopReason, TokenUsage};
     use forgeclaw_core::JobId;
@@ -217,9 +219,9 @@ mod tests {
     #[test]
     fn ready_roundtrip() {
         let r = ReadyPayload {
-            adapter: IdentifierText::new("claude-code").expect("valid adapter"),
-            adapter_version: IdentifierText::new("1.0.0").expect("valid version"),
-            protocol_version: IdentifierText::new("1.0").expect("valid protocol version"),
+            adapter: AdapterName::new("claude-code").expect("valid adapter"),
+            adapter_version: AdapterVersion::new("1.0.0").expect("valid version"),
+            protocol_version: ProtocolVersionText::new("1.0").expect("valid protocol version"),
         };
         let json = serde_json::to_value(&r).expect("serialize");
         assert_eq!(
@@ -283,7 +285,7 @@ mod tests {
     fn progress_optionals_omitted_when_none() {
         let p = ProgressPayload {
             job_id: JobId::new("job-1").expect("valid job id"),
-            stage: IdentifierText::new("tool_execution").expect("valid stage"),
+            stage: StageName::new("tool_execution").expect("valid stage"),
             detail: None,
             percent: None,
         };

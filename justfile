@@ -327,6 +327,12 @@ check-suppression:
 bench:
     {{ cargo }} bench --workspace
 
+# Compile all benchmarks without running them (fast regression gate
+# for CI: catches bench build failures without the wall-clock
+# flakiness of criterion baseline comparisons).
+bench-compile:
+    @{{ cargo }} bench --workspace --no-run --quiet
+
 # ============================================================================
 # Maintenance
 # ============================================================================
@@ -340,5 +346,5 @@ clean:
 # ============================================================================
 
 # Run full CI check locally
-ci: fmt lint check check-lines check-suppression check-deps deny test doc machete
+ci: fmt lint check check-lines check-suppression check-deps deny test bench-compile doc machete
     @echo "==> All CI checks passed!"

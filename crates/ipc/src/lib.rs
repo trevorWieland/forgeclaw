@@ -46,17 +46,32 @@
 //!
 //! # Security Boundaries
 //!
-//! - **Trusted bind-path source**: callers must provide a host-owned
-//!   absolute socket path. Path normalization is fail-closed: `.`/`..`
-//!   traversal segments are rejected before any directory creation.
+//! - **Fail-closed socket path**: both [`server::IpcServer`] and
+//!   [`client::IpcClient`] apply a shared lexical policy — absolute
+//!   paths only, no `.`/`..` traversal, no unsupported prefix. The
+//!   server layers its additional directory-metadata checks (mode
+//!   0o700, symlink chain) on top; the client additionally rejects
+//!   non-socket targets before attempting `connect`.
 //! - **Peer credentials**: accepted peers always have credentials
-//!   captured (when available). Authorization policy is explicit via
-//!   [`PeerCredentialPolicy`], with
-//!   [`IpcServerOptions::hardened`](crate::server::IpcServerOptions::hardened)
-//!   providing strict UID/GID matching defaults.
+//!   captured (when available). [`server::IpcServer::bind`] defaults
+//!   to [`PeerCredentialPolicy::MatchCapturedProcess`], snapping the
+//!   host's UID/GID at bind time and rejecting mismatched peers at
+//!   accept. [`IpcServerOptions::hardened`] lets callers pass explicit
+//!   UID/GID; [`IpcServerOptions::insecure_capture_only`] is the only
+//!   audit-visible path to permissive mode.
 //! - **Liveness semantics**: processing heartbeat timeout is extended by
 //!   inbound container liveness (`heartbeat`) only; host outbound
 //!   follow-up `messages` do not refresh the heartbeat deadline.
+//!
+//! # Domain-Specific Wire Types
+//!
+//! The crate exposes per-field newtypes (`AdapterName`, `AdapterVersion`,
+//! `ProtocolVersionText`, `StageName`, `SenderName`, `GroupName`,
+//! `ProjectName`, `BranchName`, `ContextModeText`,
+//! `EnvironmentProfileText`) so semantically distinct 128-character
+//! fields are compile-time distinguishable. `ProtocolVersionText` and
+//! `BranchName` layer format validators on top of the length bound;
+//! the remaining types enforce length only.
 
 pub mod client;
 pub mod codec;
@@ -64,6 +79,7 @@ pub mod error;
 pub(crate) mod lifecycle;
 pub mod message;
 pub(crate) mod outbound_validation;
+pub(crate) mod path_policy;
 pub mod peer_cred;
 pub(crate) mod policy;
 pub mod recv_policy;
@@ -80,17 +96,18 @@ pub use codec::{
 };
 pub use error::{FrameError, IpcError, ProtocolError};
 pub use message::{
-    AuthorizedCommand, BoundedCollectionError, BranchPolicy, CancelTaskPayload, CommandBody,
-    CommandPayload, ContainerToHost, DispatchSelfImprovementPayload, DispatchTanrenPayload,
-    ErrorCode, ErrorPayload, GroupCapabilities, GroupCommand, GroupExtensions,
-    GroupExtensionsError, GroupExtensionsVersion, GroupExtensionsVersionError, GroupInfo,
-    HeartbeatPayload, HistoricalMessage, HistoricalMessages, HostToContainer, IanaTimezone,
-    InitConfig, InitContext, InitPayload, IpcTimestamp, MainGroupCommand, MessagesPayload,
-    OutputCompletePayload, OutputDeltaPayload, OwnershipPending, PauseTaskPayload, Percent,
-    PercentError, PrivilegedAuthorizedCommand, ProgressPayload, ReadyPayload, RegisterGroupPayload,
-    ScheduleTaskPayload, ScheduleType, ScopedAuthorizedCommand, SelfImprovementListItems,
-    SendMessagePayload, ShutdownPayload, ShutdownReason, StopReason, TanrenPhase, TimestampError,
-    TimezoneError, TokenUsage,
+    AdapterName, AdapterVersion, AuthorizedCommand, BoundedCollectionError, BranchName,
+    BranchPolicy, CancelTaskPayload, CommandBody, CommandPayload, ContainerToHost, ContextModeText,
+    DispatchSelfImprovementPayload, DispatchTanrenPayload, EnvironmentProfileText, ErrorCode,
+    ErrorPayload, GroupCapabilities, GroupCommand, GroupExtensions, GroupExtensionsError,
+    GroupExtensionsVersion, GroupExtensionsVersionError, GroupInfo, GroupName, HeartbeatPayload,
+    HistoricalMessage, HistoricalMessages, HostToContainer, IanaTimezone, InitConfig, InitContext,
+    InitPayload, IpcTimestamp, MainGroupCommand, MessagesPayload, OutputCompletePayload,
+    OutputDeltaPayload, OwnershipPending, PauseTaskPayload, Percent, PercentError,
+    PrivilegedAuthorizedCommand, ProgressPayload, ProjectName, ProtocolVersionText, ReadyPayload,
+    RegisterGroupPayload, ScheduleTaskPayload, ScheduleType, ScopedAuthorizedCommand,
+    SelfImprovementListItems, SendMessagePayload, SenderName, ShutdownPayload, ShutdownReason,
+    StageName, StopReason, TanrenPhase, TimestampError, TimezoneError, TokenUsage,
 };
 pub use peer_cred::{PeerCredentials, SessionIdentity};
 pub use recv_policy::UnknownTypePolicy;

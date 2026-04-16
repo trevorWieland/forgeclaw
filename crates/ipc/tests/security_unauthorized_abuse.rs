@@ -80,7 +80,7 @@ async fn run_unauthorized_abuse_sequence(path: &std::path::Path, split: bool) ->
                 backoff: Duration::from_millis(5),
                 disconnect_after_strikes: 2,
             },
-            ..IpcServerOptions::default()
+            ..IpcServerOptions::insecure_capture_only()
         },
     )
     .expect("bind");

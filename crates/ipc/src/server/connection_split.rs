@@ -151,6 +151,7 @@ pub struct IpcConnectionReader {
     pub(super) reader: FrameReader<tokio::net::unix::OwnedReadHalf>,
     pub(super) poisoned: Arc<AtomicBool>,
     pub(super) unknown_budget: UnknownTrafficBudget,
+    pub(super) unknown_log_sampler: crate::util::sampler::SampledCounter,
     pub(super) last_frame_len: usize,
     pub(super) state: Arc<AsyncMutex<ConnectionState>>,
     pub(super) identity: Arc<SessionIdentity>,
@@ -241,6 +242,7 @@ impl IpcConnectionReader {
                         if let Err(e) = handle_unknown_inbound(
                             &self.identity,
                             &mut self.unknown_budget,
+                            &mut self.unknown_log_sampler,
                             self.last_frame_len,
                             &ty,
                         ) {

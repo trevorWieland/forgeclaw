@@ -122,7 +122,16 @@ fn protocol_docs_publish_wire_constraints() {
 
 #[test]
 fn bounded_text_limits_are_explicit_on_public_types() {
-    assert_eq!(forgeclaw_ipc::message::IdentifierText::MAX_LEN, 128);
+    assert_eq!(forgeclaw_ipc::message::AdapterName::MAX_LEN, 128);
+    assert_eq!(forgeclaw_ipc::message::AdapterVersion::MAX_LEN, 128);
+    assert_eq!(forgeclaw_ipc::message::ProtocolVersionText::MAX_LEN, 128);
+    assert_eq!(forgeclaw_ipc::message::StageName::MAX_LEN, 128);
+    assert_eq!(forgeclaw_ipc::message::SenderName::MAX_LEN, 128);
+    assert_eq!(forgeclaw_ipc::message::GroupName::MAX_LEN, 128);
+    assert_eq!(forgeclaw_ipc::message::ProjectName::MAX_LEN, 128);
+    assert_eq!(forgeclaw_ipc::message::BranchName::MAX_LEN, 128);
+    assert_eq!(forgeclaw_ipc::message::ContextModeText::MAX_LEN, 128);
+    assert_eq!(forgeclaw_ipc::message::EnvironmentProfileText::MAX_LEN, 128);
     assert_eq!(forgeclaw_ipc::message::ModelText::MAX_LEN, 256);
     assert_eq!(forgeclaw_ipc::message::TokenText::MAX_LEN, 2048);
     assert_eq!(forgeclaw_ipc::message::ShortText::MAX_LEN, 1024);

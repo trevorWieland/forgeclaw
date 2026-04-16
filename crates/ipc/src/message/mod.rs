@@ -50,9 +50,10 @@ pub use host_to_container::{
     InitConfig, InitContext, InitPayload, MessagesPayload, ShutdownPayload,
 };
 pub use semantic::{
-    AbsoluteHttpUrl, AbsoluteHttpUrlError, BoundedTextError, IdentifierText, ListItemText,
-    MessageText, ModelText, OutputDeltaText, OutputResultText, PromptText, ScheduleValueText,
-    SessionIdText, ShortText, TokenText,
+    AbsoluteHttpUrl, AbsoluteHttpUrlError, AdapterName, AdapterVersion, BoundedTextError,
+    BranchName, ContextModeText, EnvironmentProfileText, GroupName, ListItemText, MessageText,
+    ModelText, OutputDeltaText, OutputResultText, ProjectName, PromptText, ProtocolVersionText,
+    ScheduleValueText, SenderName, SessionIdText, ShortText, StageName, TokenText,
 };
 pub use semantic::{IanaTimezone, IpcTimestamp, TimestampError, TimezoneError};
 pub use shared::{

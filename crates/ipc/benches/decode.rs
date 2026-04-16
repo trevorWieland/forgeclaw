@@ -86,11 +86,45 @@ fn bench_decode_invalid_utf8(c: &mut Criterion) {
     });
 }
 
+fn bench_decode_unknown_large(c: &mut Criterion) {
+    // Adversarial: unknown type with a very large bogus body. The
+    // discriminator-first fallback must classify this as
+    // UnknownMessageType without allocating an intermediate Value.
+    let mut payload = String::from(r#"{"type":"future_message","junk":""#);
+    payload.extend(std::iter::repeat_n('x', 256 * 1024));
+    payload.push_str(r#""}"#);
+    c.bench_function("decode_unknown_type_256kib", |b| {
+        b.iter(|| {
+            let err = decode_container_to_host(black_box(payload.as_bytes()))
+                .expect_err("unknown large should fail");
+            black_box(err)
+        });
+    });
+}
+
+fn bench_decode_malformed_large(c: &mut Criterion) {
+    // Adversarial: known type but malformed payload with a very large
+    // unused body. Bounded-cost classification should not blow up
+    // proportionally to the body size.
+    let mut payload = String::from(r#"{"type":"output_delta","text":["not a string "#);
+    payload.push_str(&"x".repeat(256 * 1024));
+    payload.push_str(r#""]}"#);
+    c.bench_function("decode_malformed_known_256kib", |b| {
+        b.iter(|| {
+            let err = decode_container_to_host(black_box(payload.as_bytes()))
+                .expect_err("malformed large should fail");
+            black_box(err)
+        });
+    });
+}
+
 fn criterion_benchmark(c: &mut Criterion) {
     bench_decode_known(c);
     bench_decode_unknown(c);
     bench_decode_malformed(c);
     bench_decode_invalid_utf8(c);
+    bench_decode_unknown_large(c);
+    bench_decode_malformed_large(c);
 }
 
 criterion_group!(benches, criterion_benchmark);

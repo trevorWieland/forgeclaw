@@ -2,10 +2,11 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::IpcError;
+use crate::path_policy::validate_socket_path_shape;
 
 /// Validate that the socket directory is safe for binding.
 pub(crate) fn validate_socket_dir(socket_path: &Path) -> Result<(), IpcError> {
-    validate_socket_path_input(socket_path)?;
+    validate_socket_path_shape(socket_path)?;
     let parent = socket_path.parent().ok_or_else(|| {
         IpcError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -21,69 +22,6 @@ pub(crate) fn validate_socket_dir(socket_path: &Path) -> Result<(), IpcError> {
     validate_parent_directory_shape(&canonical_parent)?;
     validate_parent_directory_mode(&canonical_parent)?;
     validate_parent_canonical_identity(parent, &canonical_parent)
-}
-
-fn validate_socket_path_input(socket_path: &Path) -> Result<(), IpcError> {
-    if !socket_path.is_absolute() {
-        return Err(IpcError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("socket path must be absolute: {}", socket_path.display()),
-        )));
-    }
-    if socket_path_contains_explicit_traversal_segment(socket_path) {
-        return Err(IpcError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "socket path must not contain traversal component `.` or `..`: {}",
-                socket_path.display()
-            ),
-        )));
-    }
-    for component in socket_path.components() {
-        match component {
-            Component::ParentDir | Component::CurDir => {
-                return Err(IpcError::Io(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "socket path must not contain traversal component `{}`: {}",
-                        component.as_os_str().to_string_lossy(),
-                        socket_path.display()
-                    ),
-                )));
-            }
-            Component::Prefix(_) => {
-                return Err(IpcError::Io(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unsupported socket path prefix: {}", socket_path.display()),
-                )));
-            }
-            Component::RootDir | Component::Normal(_) => {}
-        }
-    }
-    Ok(())
-}
-
-fn socket_path_contains_explicit_traversal_segment(socket_path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-
-        socket_path
-            .as_os_str()
-            .as_bytes()
-            .split(|byte| *byte == b'/')
-            .any(|segment| segment == b"." || segment == b"..")
-    }
-
-    #[cfg(not(unix))]
-    {
-        // Windows paths are not supported by this socket hardening module,
-        // but keep behavior deterministic for tests.
-        socket_path
-            .to_string_lossy()
-            .split('/')
-            .any(|segment| segment == "." || segment == "..")
-    }
 }
 
 fn nearest_existing_ancestor(path: &Path) -> Result<(PathBuf, PathBuf), IpcError> {

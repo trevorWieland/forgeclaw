@@ -44,6 +44,7 @@ pub struct PendingConnection {
     shutdown_handle: ShutdownHandle<tokio::net::unix::OwnedWriteHalf>,
     poisoned: bool,
     unknown_budget: UnknownTrafficBudget,
+    unknown_log_sampler: crate::util::sampler::SampledCounter,
     last_frame_len: usize,
     identity: Arc<SessionIdentity>,
     unauthorized_limit: UnauthorizedCommandLimitConfig,
@@ -69,6 +70,10 @@ impl PendingConnection {
             shutdown_handle,
             poisoned: false,
             unknown_budget: UnknownTrafficBudget::new(Instant::now(), unknown_traffic_limit),
+            unknown_log_sampler: crate::util::sampler::SampledCounter::new(
+                crate::policy::UNKNOWN_LOG_BURST,
+                crate::policy::UNKNOWN_LOG_EVERY,
+            ),
             last_frame_len: 0,
             identity,
             unauthorized_limit,
@@ -280,7 +285,8 @@ impl PendingConnection {
                         self.poison().await;
                         return Err(e);
                     }
-                    log_unknown_message(&self.identity, &ty, &self.unknown_budget);
+                    let decision = self.unknown_log_sampler.observe();
+                    log_unknown_message(&self.identity, &ty, &self.unknown_budget, decision);
                 }
                 Err(e) => return Err(e),
             }

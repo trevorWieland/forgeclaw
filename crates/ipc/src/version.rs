@@ -89,6 +89,14 @@ pub fn negotiate(peer: &str) -> Option<NegotiatedProtocolVersion> {
 /// Returns `None` if either component is non-numeric, empty, or if
 /// extra segments (dots) are present.
 fn parse_version(version: &str) -> Option<(u32, u32)> {
+    parse_version_text(version)
+}
+
+/// Shared `"major.minor"` parser used by both the handshake negotiator
+/// and the `ProtocolVersionText` wire-type validator. Keeping a single
+/// implementation prevents drift between runtime validation and
+/// handshake acceptance.
+pub(crate) fn parse_version_text(version: &str) -> Option<(u32, u32)> {
     let (major_str, minor_str) = version.split_once('.')?;
     // Reject extra dots (e.g. "1.0.3").
     if minor_str.contains('.') {

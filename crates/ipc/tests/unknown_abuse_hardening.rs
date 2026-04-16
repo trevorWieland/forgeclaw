@@ -72,7 +72,7 @@ fn sample_init() -> InitPayload {
 fn server_options(unknown: UnknownTrafficLimitConfig) -> IpcServerOptions {
     IpcServerOptions {
         unknown_traffic_limit: unknown,
-        ..IpcServerOptions::default()
+        ..IpcServerOptions::insecure_capture_only()
     }
 }
 

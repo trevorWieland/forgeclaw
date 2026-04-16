@@ -119,7 +119,7 @@ async fn server_unsplit_send_times_out_and_poisons() {
         &path,
         IpcServerOptions {
             write_timeout,
-            ..IpcServerOptions::default()
+            ..IpcServerOptions::insecure_capture_only()
         },
     )
     .expect("bind");
@@ -179,7 +179,7 @@ async fn server_split_writer_send_times_out_and_poisons() {
         &path,
         IpcServerOptions {
             write_timeout,
-            ..IpcServerOptions::default()
+            ..IpcServerOptions::insecure_capture_only()
         },
     )
     .expect("bind");

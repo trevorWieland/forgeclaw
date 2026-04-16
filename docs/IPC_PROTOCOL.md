@@ -58,7 +58,16 @@ Runtime enforcement applies on both:
 | `dispatch_self_improvement.payload.scopes` | max 64 entries |
 | `dispatch_self_improvement.payload.acceptance_tests` | max 64 entries |
 | Core ID fields (`group`, `target_group`, `task_id`, `job_id`, etc.) | non-empty, maxLength 128 |
-| `IdentifierText` fields (`adapter`, `adapter_version`, `protocol_version`, `stage`, `name`, `project`, `branch`, etc.) | maxLength 128 |
+| `adapter` (AdapterName) | maxLength 128 |
+| `adapter_version` (AdapterVersion) | maxLength 128 |
+| `protocol_version` (ProtocolVersionText) | `^[0-9]+\.[0-9]+$` numeric major.minor, maxLength 128 |
+| `stage` (StageName) | maxLength 128 |
+| `sender` (SenderName) | maxLength 128 |
+| `name` in `GroupInfo` / `register_group` (GroupName) | maxLength 128 |
+| `project` (ProjectName) | maxLength 128 |
+| `branch` (BranchName) | maxLength 128; advisory git-ref shape: non-empty, no whitespace, no control chars, no `..`, no leading/trailing `/`, no consecutive `/` |
+| `context_mode` (ContextModeText) | maxLength 128 |
+| `environment_profile` (EnvironmentProfileText) | maxLength 128 |
 | `model` | maxLength 256 |
 | token-like fields (`provider_proxy_token`) | maxLength 2048 |
 | short freeform fields (`error.message`, `progress.detail`) | maxLength 1024 |

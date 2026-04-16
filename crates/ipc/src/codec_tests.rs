@@ -257,6 +257,54 @@ fn encode_message_rejects_oversize_before_full_buffer_materialization() {
 }
 
 #[test]
+fn decode_unknown_type_with_large_bogus_body_is_unknown() {
+    // Adversarial path: unknown message type with a very large garbage
+    // body. The fallback classifier must not allocate a full Value —
+    // it must identify the discriminator and bail as UnknownMessageType.
+    let mut payload = String::from(r#"{"type":"future_message","junk":""#);
+    payload.extend(std::iter::repeat_n('x', 256 * 1024));
+    payload.push_str(r#""}"#);
+    let err = decode_container_to_host(payload.as_bytes())
+        .expect_err("unknown with huge body should error");
+    assert!(
+        matches!(
+            &err,
+            IpcError::Protocol(ProtocolError::UnknownMessageType(n)) if n == "future_message"
+        ),
+        "expected UnknownMessageType, got {err:?}"
+    );
+}
+
+#[test]
+fn decode_known_type_with_large_malformed_body_is_malformed() {
+    // Adversarial path: known type but malformed payload (wrong shape).
+    // The classifier must preserve MalformedJson semantics without
+    // constructing an intermediate Value.
+    let mut payload = String::from(r#"{"type":"output_delta","text":["not a string but an array "#);
+    payload.push_str(&"x".repeat(64 * 1024));
+    payload.push_str(r#""]}"#);
+    let err = decode_container_to_host(payload.as_bytes())
+        .expect_err("malformed known payload should error");
+    assert!(
+        matches!(err, IpcError::Frame(FrameError::MalformedJson(_))),
+        "expected MalformedJson, got {err:?}"
+    );
+}
+
+#[test]
+fn decode_type_field_as_number_is_malformed() {
+    // "type" present but not a string — should classify as malformed,
+    // never as UnknownMessageType.
+    let bytes = br#"{"type":42,"other":"data"}"#;
+    let err =
+        decode_container_to_host(bytes).expect_err("non-string type discriminator should error");
+    assert!(
+        matches!(err, IpcError::Frame(FrameError::MalformedJson(_))),
+        "non-string type should be MalformedJson, got {err:?}"
+    );
+}
+
+#[test]
 fn single_pass_classification_keeps_known_type_payload_malformed() {
     // Verify structural detection: type "ready" is known, so a
     // missing field classifies as MalformedJson (not UnknownMessageType),

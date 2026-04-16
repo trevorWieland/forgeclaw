@@ -6,7 +6,7 @@
 use forgeclaw_core::GroupId;
 use serde::{Deserialize, Serialize};
 
-use super::semantic::{IdentifierText, IpcTimestamp, MessageText};
+use super::semantic::{GroupName, IpcTimestamp, MessageText, SenderName};
 
 /// A historical chat message included in the `init.context.messages`
 /// array or the `messages` follow-up envelope.
@@ -14,7 +14,7 @@ use super::semantic::{IdentifierText, IpcTimestamp, MessageText};
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct HistoricalMessage {
     /// Display name of the message sender.
-    pub sender: IdentifierText,
+    pub sender: SenderName,
     /// Raw message text.
     pub text: MessageText,
     /// RFC3339 timestamp for when this historical message was emitted.
@@ -38,7 +38,7 @@ pub struct GroupInfo {
     /// Stable group identifier (e.g. `group-main`).
     pub id: GroupId,
     /// Human-readable group name.
-    pub name: IdentifierText,
+    pub name: GroupName,
     /// Whether this group is the `main` group with elevated privileges.
     pub is_main: bool,
     /// Capabilities granted to this group. Determines which command

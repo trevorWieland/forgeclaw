@@ -20,6 +20,15 @@ pub(crate) const DEFAULT_UNKNOWN_RATE_REFILL_PER_SECOND: u32 = 16;
 /// Processing-phase heartbeat timeout per protocol spec.
 pub(crate) const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Sampler burst count for unknown-message warnings: the first N
+/// unknown messages on any connection always emit a sampled warn line
+/// so operators see the initial incursion unambiguously.
+pub(crate) const UNKNOWN_LOG_BURST: u64 = 5;
+/// Sampler periodic interval for unknown-message warnings after the
+/// burst is exhausted: every Nth unknown message emits a sampled warn
+/// line. Debug-level audit logging is unaffected.
+pub(crate) const UNKNOWN_LOG_EVERY: u64 = 10;
+
 /// Per-connection unknown-frame accounting.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct UnknownFrameBudget {

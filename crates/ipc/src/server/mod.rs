@@ -13,6 +13,7 @@
 mod auth;
 mod connection_split;
 mod listener;
+mod peer_credential_policy;
 mod pending;
 mod protocol;
 mod transport_core;
@@ -90,11 +91,16 @@ pub(super) fn authorized_result_to_event(
 pub(super) fn handle_unknown_inbound(
     identity: &Arc<SessionIdentity>,
     unknown_budget: &mut UnknownTrafficBudget,
+    unknown_log_sampler: &mut crate::util::sampler::SampledCounter,
     last_frame_len: usize,
     ty: &str,
 ) -> Result<(), IpcError> {
+    // The budget must account for every unknown frame regardless of
+    // the log sampling decision — otherwise a peer could evade the
+    // rate limit by staying under the sample rate.
     unknown_budget.on_unknown(last_frame_len, Instant::now())?;
-    log_unknown_message(identity, ty, unknown_budget);
+    let decision = unknown_log_sampler.observe();
+    log_unknown_message(identity, ty, unknown_budget, decision);
     Ok(())
 }
 
@@ -190,6 +196,10 @@ impl IpcConnection {
             unknown_budget: UnknownTrafficBudget::new(
                 Instant::now(),
                 options.unknown_traffic_limit,
+            ),
+            unknown_log_sampler: crate::util::sampler::SampledCounter::new(
+                crate::policy::UNKNOWN_LOG_BURST,
+                crate::policy::UNKNOWN_LOG_EVERY,
             ),
             last_frame_len: 0,
             state,
